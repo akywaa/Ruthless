@@ -177,3 +177,29 @@ fn generate_castling_moves(board: &Board, us: Color, all_occ: Bitboard, list: &m
         }
     }
 }
+
+pub fn generate_noisy_moves(board: &mut Board) -> MoveList {
+    let mut list = MoveList::new();
+    let mut pseudo_list = MoveList::new();
+    generate_pseudo_moves(board, &mut pseudo_list);
+
+    for &m in pseudo_list.as_slice() {
+        let is_noisy = board.piece_on[m.to()] != Piece::None
+            || m.move_type() == MoveType::EnPassant
+            || m.move_type() == MoveType::Promotion;
+
+        if !is_noisy {
+            continue;
+        }
+
+        let us = board.side_to_move;
+        let undo = board.make_move(m);
+        let ksq = board.king_square(us);
+        if !board.is_square_attacked(ksq, board.side_to_move) {
+            list.push(m);
+        }
+        board.undo_move(m, undo);
+    }
+
+    list
+}

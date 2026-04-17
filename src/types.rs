@@ -2,6 +2,7 @@ use std::ops::{Index, IndexMut, Not};
 
 pub const SQUARE_NB: usize = 64;
 pub const PIECE_NB: usize = 12;
+#[allow(dead_code)]
 pub const PIECE_TYPE_NB: usize = 6;
 pub const COLOR_NB: usize = 2;
 
@@ -145,7 +146,11 @@ pub enum Square {
 impl Square {
     #[inline(always)]
     pub const fn new(val: u8) -> Self {
-        unsafe { std::mem::transmute(val) }
+        if val < 64 {
+            unsafe { std::mem::transmute(val) }
+        } else {
+            Square::None
+        }
     }
 
     #[inline(always)]
@@ -161,6 +166,36 @@ impl Square {
     #[inline(always)]
     pub const fn rank(self) -> u8 {
         (self as u8) >> 3
+    }
+
+    #[inline(always)]
+    pub const fn is_valid(self) -> bool {
+        (self as u8) < 64
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        let b = s.as_bytes();
+        if b.len() != 2 {
+            return None;
+        }
+        let file = b[0].wrapping_sub(b'a');
+        let rank = b[1].wrapping_sub(b'1');
+        if file < 8 && rank < 8 {
+            Some(Self::from_coords(file, rank))
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for Square {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.is_valid() {
+            return write!(f, "-");
+        }
+        let file = (b'a' + self.file()) as char;
+        let rank = (b'1' + self.rank()) as char;
+        write!(f, "{file}{rank}")
     }
 }
 
@@ -242,31 +277,19 @@ impl Move {
     }
 }
 
-impl Square {
-    #[inline(always)]
-    pub const fn is_valid(self) -> bool {
-        (self as u8) < 64
-    }
-}
-
-impl std::fmt::Display for Square {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if !self.is_valid() {
-            return write!(f, "-");
-        }
-        let file = (b'a' + self.file()) as char;
-        let rank = (b'1' + self.rank()) as char;
-        write!(f, "{file}{rank}")
-    }
-}
-
 impl std::fmt::Display for Move {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let promo = match self.promo_type() {
-            PieceType::Knight => "n",
-            PieceType::Bishop => "b",
-            PieceType::Rook => "r",
-            PieceType::Queen => "q",
+        if *self == Move::NULL {
+            return write!(f, "0000");
+        }
+        let promo = match self.move_type() {
+            MoveType::Promotion => match self.promo_type() {
+                PieceType::Knight => "n",
+                PieceType::Bishop => "b",
+                PieceType::Rook => "r",
+                PieceType::Queen => "q",
+                _ => "",
+            },
             _ => "",
         };
         write!(f, "{}{}{}", self.from(), self.to(), promo)

@@ -1,6 +1,7 @@
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, queen_attacks, rook_attacks};
+use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
 use crate::bitboard::Bitboard;
 use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB};
+use crate::zobrist::{castling_key, ep_key, piece_key, side_key};
 
 pub const STARTING_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -21,6 +22,7 @@ pub struct UndoState {
     pub ep_square: Square,
     pub halfmove_clock: u8,
     pub captured: Piece,
+    pub hash: u64,
 }
 
 #[derive(Clone)]
@@ -34,6 +36,8 @@ pub struct Board {
     pub ep_square: Square,
     pub halfmove_clock: u8,
     pub fullmove_number: u16,
+    pub hash: u64,
+    pub history: Vec<u64>,
 }
 
 impl Board {
@@ -53,6 +57,8 @@ impl Board {
             ep_square: Square::None,
             halfmove_clock: 0,
             fullmove_number: 1,
+            hash: 0,
+            history: Vec::with_capacity(256),
         }
     }
 
@@ -126,16 +132,7 @@ impl Board {
         if parts.len() > 3 {
             board.ep_square = match parts[3] {
                 "-" => Square::None,
-                s if s.len() == 2 => {
-                    let bytes = s.as_bytes();
-                    let file = bytes[0].wrapping_sub(b'a');
-                    let rank = bytes[1].wrapping_sub(b'1');
-                    if file < 8 && rank < 8 {
-                        Square::from_coords(file, rank)
-                    } else {
-                        Square::None
-                    }
-                }
+                s if s.len() == 2 => Square::from_str(s).unwrap_or(Square::None),
                 _ => Square::None,
             };
         }
@@ -148,7 +145,26 @@ impl Board {
             board.fullmove_number = parts[5].parse().unwrap_or(1);
         }
 
+        board.hash = board.compute_hash();
         Ok(board)
+    }
+
+    pub fn compute_hash(&self) -> u64 {
+        let mut h = 0u64;
+        for sq in 0..64 {
+            let p = self.piece_on[sq];
+            if p != Piece::None {
+                h ^= piece_key(p, Square::new(sq as u8));
+            }
+        }
+        if self.side_to_move == Color::Black {
+            h ^= side_key();
+        }
+        h ^= castling_key(self.castling_rights);
+        if self.ep_square.is_valid() {
+            h ^= ep_key(self.ep_square.file());
+        }
+        h
     }
 
     #[inline(always)]
@@ -157,6 +173,7 @@ impl Board {
         self.occupied_co[piece.color()].set(sq);
         self.occupied.set(sq);
         self.piece_on[sq] = piece;
+        self.hash ^= piece_key(piece, sq);
     }
 
     #[inline(always)]
@@ -167,6 +184,7 @@ impl Board {
             self.occupied_co[piece.color()].clear(sq);
             self.occupied.clear(sq);
             self.piece_on[sq] = Piece::None;
+            self.hash ^= piece_key(piece, sq);
         }
         piece
     }
@@ -211,6 +229,25 @@ impl Board {
         self.is_square_attacked(ksq, !self.side_to_move)
     }
 
+    #[inline(always)]
+    pub fn is_repetition(&self) -> bool {
+        let count = self.history.len();
+        if count < 4 || self.halfmove_clock < 4 {
+            return false;
+        }
+
+        let max_steps = (self.halfmove_clock as usize).min(count);
+        let mut i = 2;
+        while i <= max_steps {
+            if self.history[count - i] == self.hash {
+                return true;
+            }
+            i += 2;
+        }
+
+        false
+    }
+
     pub fn make_move(&mut self, m: Move) -> UndoState {
         let from = m.from();
         let to = m.to();
@@ -224,11 +261,17 @@ impl Board {
             ep_square: self.ep_square,
             halfmove_clock: self.halfmove_clock,
             captured: self.piece_on[to],
+            hash: self.hash,
         };
 
-        self.ep_square = Square::None;
-        self.halfmove_clock += 1;
+        self.history.push(self.hash);
 
+        if self.ep_square.is_valid() {
+            self.hash ^= ep_key(self.ep_square.file());
+            self.ep_square = Square::None;
+        }
+
+        self.halfmove_clock += 1;
         if moving_piece.piece_type() == PieceType::Pawn || undo.captured != Piece::None {
             self.halfmove_clock = 0;
         }
@@ -244,6 +287,7 @@ impl Board {
 
                 if moving_piece.piece_type() == PieceType::Pawn && ((from as i8) - (to as i8)).abs() == 16 {
                     self.ep_square = Square::new(((from as u8) + (to as u8)) / 2);
+                    self.hash ^= ep_key(self.ep_square.file());
                 }
             }
             MoveType::Castling => {
@@ -272,17 +316,24 @@ impl Board {
             }
         }
 
-        self.castling_rights &= CASTLING_RIGHTS_MASK[from as usize] & CASTLING_RIGHTS_MASK[to as usize];
+        let new_castling = self.castling_rights & CASTLING_RIGHTS_MASK[from as usize] & CASTLING_RIGHTS_MASK[to as usize];
+        if new_castling != self.castling_rights {
+            self.hash ^= castling_key(self.castling_rights);
+            self.hash ^= castling_key(new_castling);
+            self.castling_rights = new_castling;
+        }
 
         if us == Color::Black {
             self.fullmove_number += 1;
         }
         self.side_to_move = them;
+        self.hash ^= side_key();
 
         undo
     }
 
     pub fn undo_move(&mut self, m: Move, undo: UndoState) {
+        self.history.pop();
         self.side_to_move = !self.side_to_move;
         let us = self.side_to_move;
 
@@ -331,6 +382,7 @@ impl Board {
         self.castling_rights = undo.castling_rights;
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
+        self.hash = undo.hash;
     }
 }
 

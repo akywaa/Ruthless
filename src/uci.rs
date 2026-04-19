@@ -1,4 +1,4 @@
-use crate::board::{Board, STARTING_FEN};
+use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::search::Searcher;
 use crate::types::Color;
@@ -29,7 +29,7 @@ pub fn uci_loop() {
                 println!("readyok");
             }
             "ucinewgame" => {
-                searcher.tt.clear();
+                searcher.clear();
                 board = Board::default();
             }
             "position" => {

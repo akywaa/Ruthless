@@ -3,6 +3,7 @@ mod bitboard;
 mod board;
 mod eval;
 mod movegen;
+mod nnue;
 mod search;
 mod tt;
 mod types;

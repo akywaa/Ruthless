@@ -19,6 +19,26 @@ pub struct Searcher {
     history: [[[i32; 64]; 64]; 2],
 }
 
+fn score_to_tt(score: i32, ply: u8) -> i32 {
+    if score >= MATE_SCORE - 100 {
+        score + ply as i32
+    } else if score <= -MATE_SCORE + 100 {
+        score - ply as i32
+    } else {
+        score
+    }
+}
+
+fn score_from_tt(score: i32, ply: u8) -> i32 {
+    if score >= MATE_SCORE - 100 {
+        score - ply as i32
+    } else if score <= -MATE_SCORE + 100 {
+        score + ply as i32
+    } else {
+        score
+    }
+}
+
 impl Searcher {
     pub fn new(tt_mb: usize) -> Self {
         Self {
@@ -48,7 +68,7 @@ impl Searcher {
 
         for depth in 1..=max_depth {
             let score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true);
-            if self.stop && depth > 1 {
+            if self.stop {
                 break;
             }
 
@@ -81,10 +101,6 @@ impl Searcher {
                     "info depth {} score cp {} nodes {} nps {} time {} pv {}",
                     depth, score, self.nodes, nps, elapsed, pv_str
                 );
-            }
-
-            if self.stop {
-                break;
             }
         }
 
@@ -162,7 +178,7 @@ impl Searcher {
         }
 
         if depth == 0 {
-            return self.quiescence(board, alpha, beta);
+            return self.quiescence(board, alpha, beta, ply);
         }
 
         self.nodes += 1;
@@ -171,18 +187,19 @@ impl Searcher {
         let mut tt_move = Move::NULL;
 
         if let Some(entry) = self.tt.probe(board.hash) {
+            let tt_score = score_from_tt(entry.score, ply);
             if entry.depth >= depth && ply > 0 && !is_pv {
                 match entry.flag {
-                    TTFlag::Exact => return entry.score,
-                    TTFlag::LowerBound => alpha = alpha.max(entry.score),
+                    TTFlag::Exact => return tt_score,
+                    TTFlag::LowerBound => alpha = alpha.max(tt_score),
                     TTFlag::UpperBound => {
-                        if entry.score <= alpha {
-                            return entry.score;
+                        if tt_score <= alpha {
+                            return tt_score;
                         }
                     }
                 }
                 if alpha >= beta {
-                    return entry.score;
+                    return tt_score;
                 }
             }
             tt_move = entry.best_move;
@@ -289,30 +306,41 @@ impl Searcher {
             TTFlag::Exact
         };
 
-        self.tt.store(board.hash, best_score, depth, flag, best_move);
+        self.tt.store(board.hash, score_to_tt(best_score, ply), depth, flag, best_move);
         best_score
     }
 
-    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32) -> i32 {
+    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u8) -> i32 {
         self.check_time();
         if self.stop {
             return 0;
         }
 
         self.nodes += 1;
-        let stand_pat = evaluate(board);
-        if stand_pat >= beta {
-            return beta;
-        }
-        alpha = alpha.max(stand_pat);
 
-        let mut moves = generate_noisy_moves(board);
-        self.order_moves(board, &mut moves, Move::NULL, 0);
+        let in_check = board.in_check();
+
+        let mut moves = if in_check {
+            let legal = generate_legal_moves(board);
+            if legal.count == 0 {
+                return -MATE_SCORE + ply as i32;
+            }
+            legal
+        } else {
+            let stand_pat = evaluate(board);
+            if stand_pat >= beta {
+                return beta;
+            }
+            alpha = alpha.max(stand_pat);
+            generate_noisy_moves(board)
+        };
+
+        self.order_moves(board, &mut moves, Move::NULL, ply);
 
         for i in 0..moves.count {
             let m = moves.moves[i];
             let undo = board.make_move(m);
-            let score = -self.quiescence(board, -beta, -alpha);
+            let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             board.undo_move(m, undo);
 
             if self.stop {

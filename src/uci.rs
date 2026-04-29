@@ -125,17 +125,22 @@ fn handle_go(board: &mut Board, searcher: &mut Searcher, tokens: &[&str]) {
         i += 1;
     }
 
-    let time_budget = if let Some(mt) = movetime {
-        Some(mt)
-    } else {
-        let (my_time, my_inc) = if board.side_to_move == Color::White {
-            (wtime, winc)
-        } else {
-            (btime, binc)
-        };
+    let time_overhead_ms = 30;
 
-        my_time.map(|t| (t / 25 + my_inc / 2).max(10))
+let time_budget = if let Some(mt) = movetime {
+    Some(mt.saturating_sub(time_overhead_ms).max(10))
+} else {
+    let (my_time, my_inc) = if board.side_to_move == Color::White {
+        (wtime, winc)
+    } else {
+        (btime, binc)
     };
+
+    my_time.map(|t| {
+        let target = (t / 25 + my_inc / 2).saturating_sub(time_overhead_ms);
+        target.max(10)
+    })
+};
 
     let best_move = searcher.search(board, depth, time_budget);
     println!("bestmove {}", best_move);

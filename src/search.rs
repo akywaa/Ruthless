@@ -102,6 +102,14 @@ impl Searcher {
                     depth, score, self.nodes, nps, elapsed, pv_str
                 );
             }
+
+            if let Some(limit) = self.time_limit_ms {
+                // Если уже потратили половину лимита,
+                // следующую глубину с большой вероятностью не закончим вовремя.
+                if elapsed * 2 >= limit {
+                    break;
+                }
+            }
         }
 
         if best_move == Move::NULL {
@@ -144,7 +152,7 @@ impl Searcher {
 
     fn check_time(&mut self) {
         if let Some(limit) = self.time_limit_ms {
-            if (self.nodes & 2047) == 0 && self.start_time.elapsed().as_millis() >= limit {
+            if (self.nodes & 1023) == 0 && self.start_time.elapsed().as_millis() >= limit {
                 self.stop = true;
             }
         }

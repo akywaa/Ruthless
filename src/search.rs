@@ -1,6 +1,7 @@
 use crate::board::Board;
 use crate::eval::{evaluate, PIECE_VALUES};
 use crate::movegen::{generate_legal_moves, generate_noisy_moves};
+use crate::see::see;
 use crate::tt::{TTFlag, TranspositionTable};
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType};
 use std::time::Instant;
@@ -347,6 +348,11 @@ impl Searcher {
 
         for i in 0..moves.count {
             let m = moves.moves[i];
+
+            if !in_check && !see(board, m, 0) {
+                continue;
+            }
+
             let undo = board.make_move(m);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             board.undo_move(m, undo);
@@ -370,10 +376,20 @@ impl Searcher {
         }
 
         let captured = board.piece_on[m.to()];
-        if captured != Piece::None {
-            let victim = PIECE_VALUES[captured.piece_type() as usize];
+        if captured != Piece::None || m.move_type() == MoveType::EnPassant {
+            let victim = if m.move_type() == MoveType::EnPassant {
+                PIECE_VALUES[PieceType::Pawn as usize]
+            } else {
+                PIECE_VALUES[captured.piece_type() as usize]
+            };
             let attacker = PIECE_VALUES[board.piece_on[m.from()].piece_type() as usize];
-            return 1_000_000 + victim * 10 - attacker;
+            let mvv_lva = victim * 10 - attacker;
+
+            if see(board, m, 0) {
+                return 1_000_000 + mvv_lva;
+            } else {
+                return -500_000 + mvv_lva;
+            }
         }
 
         if (ply as usize) < MAX_PLY {

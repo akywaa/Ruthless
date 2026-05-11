@@ -18,6 +18,10 @@ pub struct Searcher {
     time_limit_ms: Option<u128>,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    counter_moves: [[Move; 64]; 64],
+    conthist: [[[i32; 64]; 64]; 12],
+    played_moves: [Move; MAX_PLY],
+    played_pieces: [Piece; MAX_PLY],
 }
 
 fn score_to_tt(score: i32, ply: u8) -> i32 {
@@ -40,6 +44,12 @@ fn score_from_tt(score: i32, ply: u8) -> i32 {
     }
 }
 
+#[inline(always)]
+fn update_history(val: &mut i32, bonus: i32) {
+    let clamped = bonus.clamp(-1600, 1600);
+    *val += clamped - (*val * clamped.abs()) / 16384;
+}
+
 impl Searcher {
     pub fn new(tt_mb: usize) -> Self {
         Self {
@@ -50,6 +60,10 @@ impl Searcher {
             time_limit_ms: None,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            counter_moves: [[Move::NULL; 64]; 64],
+            conthist: [[[0; 64]; 64]; 12],
+            played_moves: [Move::NULL; MAX_PLY],
+            played_pieces: [Piece::None; MAX_PLY],
         }
     }
 
@@ -57,6 +71,10 @@ impl Searcher {
         self.tt.clear();
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
+        self.counter_moves = [[Move::NULL; 64]; 64];
+        self.conthist = [[[0; 64]; 64]; 12];
+        self.played_moves = [Move::NULL; MAX_PLY];
+        self.played_pieces = [Piece::None; MAX_PLY];
     }
 
     pub fn search(&mut self, board: &mut Board, max_depth: u8, time_ms: Option<u128>) -> Move {
@@ -277,10 +295,23 @@ impl Searcher {
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
 
+        let mut quiet_moves = [Move::NULL; 64];
+        let mut quiet_count = 0;
+
         for i in 0..moves.count {
             let m = moves.moves[i];
             let is_capture = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
             let is_quiet = !is_capture && m.move_type() != MoveType::Promotion;
+
+            if is_quiet && quiet_count < 64 {
+                quiet_moves[quiet_count] = m;
+                quiet_count += 1;
+            }
+
+            if (ply as usize) < MAX_PLY {
+                self.played_moves[ply as usize] = m;
+                self.played_pieces[ply as usize] = board.piece_on[m.from()];
+            }
 
             let undo = board.make_move(m);
 
@@ -325,12 +356,42 @@ impl Searcher {
                         self.killers[ply as usize][1] = self.killers[ply as usize][0];
                         self.killers[ply as usize][0] = m;
                     }
+
+                    let prev_move = if ply > 0 {
+                        self.played_moves[(ply - 1) as usize]
+                    } else {
+                        Move::NULL
+                    };
+                    let prev_piece = if ply > 0 {
+                        self.played_pieces[(ply - 1) as usize]
+                    } else {
+                        Piece::None
+                    };
+
+                    if prev_move != Move::NULL {
+                        self.counter_moves[prev_move.from() as usize][prev_move.to() as usize] = m;
+                    }
+
+                    let bonus = ((depth as i32) * (depth as i32)).min(1600);
                     let us = board.side_to_move as usize;
-                    let from = m.from() as usize;
-                    let to = m.to() as usize;
-                    self.history[us][from][to] += (depth as i32) * (depth as i32);
-                    if self.history[us][from][to] > 16000 {
-                        self.history[us][from][to] /= 2;
+
+                    update_history(&mut self.history[us][m.from() as usize][m.to() as usize], bonus);
+                    if prev_piece != Piece::None {
+                        update_history(
+                            &mut self.conthist[prev_piece as usize][prev_move.to() as usize][m.to() as usize],
+                            bonus,
+                        );
+                    }
+
+                    for j in 0..quiet_count.saturating_sub(1) {
+                        let qm = quiet_moves[j];
+                        update_history(&mut self.history[us][qm.from() as usize][qm.to() as usize], -bonus);
+                        if prev_piece != Piece::None {
+                            update_history(
+                                &mut self.conthist[prev_piece as usize][prev_move.to() as usize][qm.to() as usize],
+                                -bonus,
+                            );
+                        }
                     }
                 }
                 break;
@@ -431,8 +492,29 @@ impl Searcher {
             }
         }
 
+        let prev_move = if ply > 0 && (ply as usize) < MAX_PLY {
+            self.played_moves[(ply - 1) as usize]
+        } else {
+            Move::NULL
+        };
+
+        if prev_move != Move::NULL
+            && m == self.counter_moves[prev_move.from() as usize][prev_move.to() as usize]
+        {
+            return 700_000;
+        }
+
         let us = board.side_to_move as usize;
-        self.history[us][m.from() as usize][m.to() as usize]
+        let mut score = self.history[us][m.from() as usize][m.to() as usize];
+
+        if ply > 0 && (ply as usize) < MAX_PLY {
+            let prev_piece = self.played_pieces[(ply - 1) as usize];
+            if prev_piece != Piece::None {
+                score += self.conthist[prev_piece as usize][prev_move.to() as usize][m.to() as usize];
+            }
+        }
+
+        score
     }
 
     fn order_moves(&self, board: &Board, list: &mut MoveList, tt_move: Move, ply: u8) {

@@ -93,7 +93,7 @@ impl Searcher {
                 let mut beta = (score + delta).min(INFINITY);
 
                 loop {
-                    score = self.negamax(board, depth, 0, alpha, beta, true);
+                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL);
                     if self.stop {
                         break;
                     }
@@ -114,7 +114,7 @@ impl Searcher {
                     }
                 }
             } else {
-                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true);
+                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL);
             }
 
             if self.stop {
@@ -153,8 +153,6 @@ impl Searcher {
             }
 
             if let Some(limit) = self.time_limit_ms {
-                // Если уже потратили половину лимита,
-                // следующую глубину с большой вероятностью не закончим вовремя.
                 if elapsed * 2 >= limit {
                     break;
                 }
@@ -215,6 +213,7 @@ impl Searcher {
         mut alpha: i32,
         beta: i32,
         is_pv: bool,
+        excluded_move: Move,
     ) -> i32 {
         self.check_time();
         if self.stop {
@@ -242,10 +241,19 @@ impl Searcher {
 
         let alpha_orig = alpha;
         let mut tt_move = Move::NULL;
+        let mut tt_score = 0;
+        let mut tt_depth = 0;
+        let mut tt_flag = TTFlag::Exact;
+        let mut has_tt = false;
 
         if let Some(entry) = self.tt.probe(board.hash) {
-            let tt_score = score_from_tt(entry.score, ply);
-            if entry.depth >= depth && ply > 0 && !is_pv {
+            has_tt = true;
+            tt_score = score_from_tt(entry.score, ply);
+            tt_depth = entry.depth;
+            tt_flag = entry.flag;
+            tt_move = entry.best_move;
+
+            if excluded_move == Move::NULL && entry.depth >= depth && ply > 0 && !is_pv {
                 match entry.flag {
                     TTFlag::Exact => return tt_score,
                     TTFlag::LowerBound => alpha = alpha.max(tt_score),
@@ -259,7 +267,6 @@ impl Searcher {
                     return tt_score;
                 }
             }
-            tt_move = entry.best_move;
         }
 
         let static_eval = evaluate(board);
@@ -272,12 +279,42 @@ impl Searcher {
             if depth >= 3 && static_eval >= beta && board.has_non_pawn_material(board.side_to_move) {
                 let r = 2 + depth / 4;
                 let undo = board.make_null_move();
-                let score = -self.negamax(board, depth.saturating_sub(r + 1), ply + 1, -beta, -beta + 1, false);
+                let score = -self.negamax(board, depth.saturating_sub(r + 1), ply + 1, -beta, -beta + 1, false, Move::NULL);
                 board.undo_null_move(undo);
 
                 if score >= beta {
                     return if score >= MATE_SCORE - 100 { beta } else { score };
                 }
+            }
+        }
+
+        let mut extension = 0;
+
+        if depth >= 7
+            && has_tt
+            && tt_move != Move::NULL
+            && excluded_move == Move::NULL
+            && (ply as usize) < MAX_PLY
+            && !in_check
+            && tt_depth >= depth - 3
+            && (tt_flag == TTFlag::Exact || tt_flag == TTFlag::LowerBound)
+            && tt_score.abs() < MATE_SCORE - 100
+        {
+            let singular_beta = tt_score - (depth as i32) * 2;
+            let singular_depth = (depth - 1) / 2;
+
+            let score = self.negamax(
+                board,
+                singular_depth,
+                ply,
+                singular_beta - 1,
+                singular_beta,
+                false,
+                tt_move,
+            );
+
+            if score < singular_beta {
+                extension = 1;
             }
         }
 
@@ -300,6 +337,11 @@ impl Searcher {
 
         for i in 0..moves.count {
             let m = moves.moves[i];
+
+            if m == excluded_move {
+                continue;
+            }
+
             let is_capture = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
             let is_quiet = !is_capture && m.move_type() != MoveType::Promotion;
 
@@ -316,7 +358,7 @@ impl Searcher {
             let undo = board.make_move(m);
 
             let score = if moves_searched == 0 {
-                -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, is_pv)
+                -self.negamax(board, depth - 1 + extension, ply + 1, -beta, -alpha, is_pv, Move::NULL)
             } else {
                 let mut reduced = depth - 1;
                 if moves_searched >= 3 && depth >= 3 && is_quiet {
@@ -324,12 +366,12 @@ impl Searcher {
                     reduced = depth.saturating_sub(1 + r).max(1);
                 }
 
-                let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false);
+                let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL);
                 if s > alpha && reduced < depth - 1 {
-                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false);
+                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL);
                 }
                 if s > alpha && s < beta {
-                    s = -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, true);
+                    s = -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, true, Move::NULL);
                 }
                 s
             };
@@ -406,7 +448,9 @@ impl Searcher {
             TTFlag::Exact
         };
 
-        self.tt.store(board.hash, score_to_tt(best_score, ply), depth, flag, best_move);
+        if excluded_move == Move::NULL {
+            self.tt.store(board.hash, score_to_tt(best_score, ply), depth, flag, best_move);
+        }
         best_score
     }
 

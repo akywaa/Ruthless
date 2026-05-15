@@ -15,7 +15,8 @@ pub struct Searcher {
     pub nodes: u64,
     pub stop: bool,
     start_time: Instant,
-    time_limit_ms: Option<u128>,
+    soft_time_ms: Option<u128>,
+    hard_time_ms: Option<u128>,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     counter_moves: [[Move; 64]; 64],
@@ -57,7 +58,8 @@ impl Searcher {
             nodes: 0,
             stop: false,
             start_time: Instant::now(),
-            time_limit_ms: None,
+            soft_time_ms: None,
+            hard_time_ms: None,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             counter_moves: [[Move::NULL; 64]; 64],
@@ -77,14 +79,32 @@ impl Searcher {
         self.played_pieces = [Piece::None; MAX_PLY];
     }
 
-    pub fn search(&mut self, board: &mut Board, max_depth: u8, time_ms: Option<u128>) -> Move {
+    pub fn search(
+        &mut self,
+        board: &mut Board,
+        max_depth: u8,
+        soft_time: Option<u128>,
+        hard_time: Option<u128>,
+    ) -> Move {
+        let legal_moves = generate_legal_moves(board);
+        if legal_moves.count == 0 {
+            return Move::NULL;
+        }
+        if legal_moves.count == 1 {
+            return legal_moves.moves[0];
+        }
+
         self.nodes = 0;
         self.stop = false;
         self.start_time = Instant::now();
-        self.time_limit_ms = time_ms;
+        self.soft_time_ms = soft_time;
+        self.hard_time_ms = hard_time;
 
-        let mut best_move = Move::NULL;
+        let mut best_move = legal_moves.moves[0];
+        let mut prev_best_move = Move::NULL;
         let mut score = 0;
+        let mut prev_score = 0;
+        let mut stable_iterations = 0;
 
         for depth in 1..=max_depth {
             if depth >= 4 {
@@ -152,18 +172,33 @@ impl Searcher {
                 );
             }
 
-            if let Some(limit) = self.time_limit_ms {
-                if elapsed * 2 >= limit {
+            if best_move == prev_best_move {
+                stable_iterations += 1;
+            } else {
+                stable_iterations = 0;
+            }
+
+            if let Some(soft_limit) = self.soft_time_ms {
+                let mut time_scale = 1.0f32;
+
+                if best_move != prev_best_move && depth >= 6 {
+                    time_scale *= 1.5;
+                }
+                if score < prev_score - 30 && depth >= 6 {
+                    time_scale *= 1.3;
+                }
+                if stable_iterations >= 4 && depth >= 8 {
+                    time_scale *= 0.7;
+                }
+
+                let dynamic_soft = ((soft_limit as f32) * time_scale) as u128;
+                if elapsed >= dynamic_soft || elapsed * 2 >= self.hard_time_ms.unwrap_or(u128::MAX) {
                     break;
                 }
             }
-        }
 
-        if best_move == Move::NULL {
-            let moves = generate_legal_moves(board);
-            if moves.count > 0 {
-                best_move = moves.moves[0];
-            }
+            prev_best_move = best_move;
+            prev_score = score;
         }
 
         best_move
@@ -198,8 +233,8 @@ impl Searcher {
     }
 
     fn check_time(&mut self) {
-        if let Some(limit) = self.time_limit_ms {
-            if (self.nodes & 1023) == 0 && self.start_time.elapsed().as_millis() >= limit {
+        if let Some(hard_limit) = self.hard_time_ms {
+            if (self.nodes & 2047) == 0 && self.start_time.elapsed().as_millis() >= hard_limit {
                 self.stop = true;
             }
         }

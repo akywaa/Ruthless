@@ -367,6 +367,11 @@ impl Searcher {
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
 
+        let lmp_threshold = 3 + 3 * (depth as usize) * (depth as usize);
+        let futility_margin = 120 * (depth as i32);
+        let futility_pruning =
+            !is_pv && !in_check && depth <= 3 && static_eval + futility_margin <= alpha;
+
         let mut quiet_moves = [Move::NULL; 64];
         let mut quiet_count = 0;
 
@@ -379,6 +384,23 @@ impl Searcher {
 
             let is_capture = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
             let is_quiet = !is_capture && m.move_type() != MoveType::Promotion;
+
+            if !is_pv && !in_check && moves_searched > 0 {
+                // Late Move Pruning
+                if is_quiet && depth <= 4 && moves_searched >= lmp_threshold {
+                    continue;
+                }
+
+                // Futility Pruning
+                if is_quiet && futility_pruning {
+                    continue;
+                }
+
+                // Prune quiet moves with negative SEE
+                if is_quiet && depth <= 3 && !see(board, m, -30 * (depth as i32)) {
+                    continue;
+                }
+            }
 
             if is_quiet && quiet_count < 64 {
                 quiet_moves[quiet_count] = m;

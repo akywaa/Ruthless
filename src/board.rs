@@ -68,10 +68,13 @@ impl Board {
 
     pub fn refresh_accumulator(&mut self) {
         self.accumulator = Accumulator::new();
+        let w_ksq = self.king_square(Color::White);
+        let b_ksq = self.king_square(Color::Black);
         for sq in 0..64 {
             let piece = self.piece_on[sq];
             if piece != Piece::None {
-                self.accumulator.add_feature(piece, Square::new(sq as u8));
+                self.accumulator
+                    .add_feature(piece, Square::new(sq as u8), w_ksq, b_ksq);
             }
         }
     }
@@ -313,6 +316,9 @@ impl Board {
         let us = self.side_to_move;
         let them = !us;
         let moving_piece = self.piece_on[from];
+        let is_king_move = moving_piece.piece_type() == PieceType::King;
+        let w_ksq = self.king_square(Color::White);
+        let b_ksq = self.king_square(Color::Black);
 
         let undo = UndoState {
             castling_rights: self.castling_rights,
@@ -336,16 +342,22 @@ impl Board {
         }
 
         self.remove_piece(from);
-        self.accumulator.remove_feature(moving_piece, from);
+        if !is_king_move {
+            self.accumulator.remove_feature(moving_piece, from, w_ksq, b_ksq);
+        }
 
         match move_type {
             MoveType::Normal => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
-                    self.accumulator.remove_feature(undo.captured, to);
+                    if !is_king_move {
+                        self.accumulator.remove_feature(undo.captured, to, w_ksq, b_ksq);
+                    }
                 }
                 self.put_piece(moving_piece, to);
-                self.accumulator.add_feature(moving_piece, to);
+                if !is_king_move {
+                    self.accumulator.add_feature(moving_piece, to, w_ksq, b_ksq);
+                }
 
                 if moving_piece.piece_type() == PieceType::Pawn && ((from as i8) - (to as i8)).abs() == 16 {
                     self.ep_square = Square::new(((from as u8) + (to as u8)) / 2);
@@ -354,7 +366,6 @@ impl Board {
             }
             MoveType::Castling => {
                 self.put_piece(moving_piece, to);
-                self.accumulator.add_feature(moving_piece, to);
 
                 let (rook_from, rook_to) = match to {
                     Square::G1 => (Square::H1, Square::F1),
@@ -364,27 +375,29 @@ impl Board {
                     _ => unreachable!(),
                 };
                 let rook = self.remove_piece(rook_from);
-                self.accumulator.remove_feature(rook, rook_from);
                 self.put_piece(rook, rook_to);
-                self.accumulator.add_feature(rook, rook_to);
             }
             MoveType::EnPassant => {
                 let cap_sq = Square::from_coords(to.file(), from.rank());
                 let cap_pawn = self.remove_piece(cap_sq);
-                self.accumulator.remove_feature(cap_pawn, cap_sq);
+                self.accumulator.remove_feature(cap_pawn, cap_sq, w_ksq, b_ksq);
 
                 self.put_piece(moving_piece, to);
-                self.accumulator.add_feature(moving_piece, to);
+                self.accumulator.add_feature(moving_piece, to, w_ksq, b_ksq);
             }
             MoveType::Promotion => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
-                    self.accumulator.remove_feature(undo.captured, to);
+                    self.accumulator.remove_feature(undo.captured, to, w_ksq, b_ksq);
                 }
                 let promo_piece = Piece::new(us, m.promo_type());
                 self.put_piece(promo_piece, to);
-                self.accumulator.add_feature(promo_piece, to);
+                self.accumulator.add_feature(promo_piece, to, w_ksq, b_ksq);
             }
+        }
+
+        if is_king_move {
+            self.refresh_accumulator();
         }
 
         let new_castling = self.castling_rights & CASTLING_RIGHTS_MASK[from as usize] & CASTLING_RIGHTS_MASK[to as usize];

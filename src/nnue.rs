@@ -1,9 +1,24 @@
-use crate::types::{Color, Piece, Square};
+use crate::board::Board;
+use crate::types::{Color, Piece, PieceType, Square};
 
-pub const HIDDEN_SIZE: usize = 128;
+pub const HIDDEN_SIZE: usize = 1024;
+pub const NUM_INPUT_BUCKETS: usize = 10;
+pub const NUM_OUTPUT_BUCKETS: usize = 8;
 pub const SCALE: i32 = 400;
 pub const QA: i16 = 255;
 pub const QB: i16 = 64;
+
+#[rustfmt::skip]
+const BUCKET_LAYOUT: [usize; 32] = [
+    0, 1, 2, 3,
+    4, 4, 5, 5,
+    6, 6, 6, 6,
+    7, 7, 7, 7,
+    8, 8, 8, 8,
+    8, 8, 8, 8,
+    9, 9, 9, 9,
+    9, 9, 9, 9,
+];
 
 #[repr(C, align(64))]
 pub struct AccumulatorRaw {
@@ -12,10 +27,10 @@ pub struct AccumulatorRaw {
 
 #[repr(C)]
 pub struct Network {
-    feature_weights: [AccumulatorRaw; 768],
+    feature_weights: [AccumulatorRaw; 768 * NUM_INPUT_BUCKETS],
     feature_bias: AccumulatorRaw,
-    output_weights: [i16; 2 * HIDDEN_SIZE],
-    output_bias: i16,
+    output_weights: [[i16; 2 * HIDDEN_SIZE]; NUM_OUTPUT_BUCKETS],
+    output_bias: [i16; NUM_OUTPUT_BUCKETS],
 }
 
 static NETWORK_BYTES: &[u8] = include_bytes!("../resources/ruthless.bin");
@@ -54,9 +69,9 @@ impl Accumulator {
     }
 
     #[inline(always)]
-    pub fn add_feature(&mut self, piece: Piece, sq: Square) {
+    pub fn add_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
         let net = network();
-        let (w_idx, b_idx) = feature_indices(piece, sq);
+        let (w_idx, b_idx) = feature_indices(piece, sq, w_ksq, b_ksq);
 
         let w_weights = &net.feature_weights[w_idx].vals;
         let b_weights = &net.feature_weights[b_idx].vals;
@@ -79,9 +94,9 @@ impl Accumulator {
     }
 
     #[inline(always)]
-    pub fn remove_feature(&mut self, piece: Piece, sq: Square) {
+    pub fn remove_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
         let net = network();
-        let (w_idx, b_idx) = feature_indices(piece, sq);
+        let (w_idx, b_idx) = feature_indices(piece, sq, w_ksq, b_ksq);
 
         let w_weights = &net.feature_weights[w_idx].vals;
         let b_weights = &net.feature_weights[b_idx].vals;
@@ -105,10 +120,28 @@ impl Accumulator {
 }
 
 #[inline(always)]
-fn feature_indices(piece: Piece, sq: Square) -> (usize, usize) {
+fn king_bucket(sq: Square) -> usize {
+    let file = sq.file();
+    let rank = sq.rank();
+    let mirrored_file = if file > 3 { 7 - file } else { file };
+    BUCKET_LAYOUT[(rank * 4 + mirrored_file) as usize]
+}
+
+#[inline(always)]
+fn feature_indices(
+    piece: Piece,
+    sq: Square,
+    w_ksq: Square,
+    b_ksq: Square,
+) -> (usize, usize) {
     let p_idx = piece as usize;
     let sq_idx = sq as usize;
-    let white_idx = p_idx * 64 + sq_idx;
+
+    let w_bucket = king_bucket(w_ksq);
+    let white_idx = w_bucket * 768 + p_idx * 64 + sq_idx;
+
+    let flipped_b_ksq = Square::new((b_ksq as u8) ^ 56);
+    let b_bucket = king_bucket(flipped_b_ksq);
 
     let flipped_piece = match piece {
         Piece::WhitePawn => Piece::BlackPawn,
@@ -127,9 +160,27 @@ fn feature_indices(piece: Piece, sq: Square) -> (usize, usize) {
     } as usize;
 
     let flipped_sq = sq_idx ^ 56;
-    let black_idx = flipped_piece * 64 + flipped_sq;
+    let black_idx = b_bucket * 768 + flipped_piece * 64 + flipped_sq;
 
     (white_idx, black_idx)
+}
+
+#[inline(always)]
+pub fn output_bucket(board: &Board) -> usize {
+    let mut material_count = 0;
+    for pt in [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+        let count = board.pieces[Piece::new(Color::White, pt)].count()
+            + board.pieces[Piece::new(Color::Black, pt)].count();
+        let val = match pt {
+            PieceType::Pawn => 0,
+            PieceType::Knight | PieceType::Bishop => 1,
+            PieceType::Rook => 2,
+            PieceType::Queen => 4,
+            _ => 0,
+        };
+        material_count += (count as usize) * val;
+    }
+    (material_count * NUM_OUTPUT_BUCKETS / 32).min(NUM_OUTPUT_BUCKETS - 1)
 }
 
 #[inline(always)]
@@ -139,16 +190,17 @@ fn screlu(x: i16) -> i32 {
 }
 
 #[inline(always)]
-pub fn evaluate(acc: &Accumulator, side_to_move: Color) -> i32 {
+pub fn evaluate(board: &Board) -> i32 {
     let net = network();
-    let us = side_to_move as usize;
-    let them = (!side_to_move) as usize;
+    let us = board.side_to_move as usize;
+    let them = (!board.side_to_move) as usize;
+    let bucket = output_bucket(board);
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
             unsafe {
-                return evaluate_avx2(acc, us, them, net);
+                return evaluate_avx2(&board.accumulator, us, them, bucket, net);
             }
         }
     }
@@ -156,15 +208,15 @@ pub fn evaluate(acc: &Accumulator, side_to_move: Color) -> i32 {
     let mut output = 0i32;
 
     for i in 0..HIDDEN_SIZE {
-        output += screlu(acc.vals[us][i]) * i32::from(net.output_weights[i]);
+        output += screlu(board.accumulator.vals[us][i]) * i32::from(net.output_weights[bucket][i]);
     }
 
     for i in 0..HIDDEN_SIZE {
-        output += screlu(acc.vals[them][i]) * i32::from(net.output_weights[HIDDEN_SIZE + i]);
+        output += screlu(board.accumulator.vals[them][i]) * i32::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
     }
 
     output /= i32::from(QA);
-    output += i32::from(net.output_bias);
+    output += i32::from(net.output_bias[bucket]);
     output *= SCALE;
     output /= i32::from(QA) * i32::from(QB);
 
@@ -199,7 +251,13 @@ unsafe fn vec_sub_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn evaluate_avx2(acc: &Accumulator, us: usize, them: usize, net: &'static Network) -> i32 {
+unsafe fn evaluate_avx2(
+    acc: &Accumulator,
+    us: usize,
+    them: usize,
+    bucket: usize,
+    net: &'static Network,
+) -> i32 {
     use std::arch::x86_64::*;
 
     let zero = _mm256_setzero_si256();
@@ -207,8 +265,8 @@ unsafe fn evaluate_avx2(acc: &Accumulator, us: usize, them: usize, net: &'static
 
     let mut sum_vec = _mm256_setzero_si256();
 
-    forward_side_avx2(&acc.vals[us], &net.output_weights[0..HIDDEN_SIZE], zero, qa, &mut sum_vec);
-    forward_side_avx2(&acc.vals[them], &net.output_weights[HIDDEN_SIZE..2 * HIDDEN_SIZE], zero, qa, &mut sum_vec);
+    forward_side_avx2(&acc.vals[us], &net.output_weights[bucket][0..HIDDEN_SIZE], zero, qa, &mut sum_vec);
+    forward_side_avx2(&acc.vals[them], &net.output_weights[bucket][HIDDEN_SIZE..2 * HIDDEN_SIZE], zero, qa, &mut sum_vec);
 
     let low128 = _mm256_castsi256_si128(sum_vec);
     let high128 = _mm256_extracti128_si256(sum_vec, 1);
@@ -218,7 +276,7 @@ unsafe fn evaluate_avx2(acc: &Accumulator, us: usize, them: usize, net: &'static
     let mut output = _mm_cvtsi128_si32(sum32);
 
     output /= i32::from(QA);
-    output += i32::from(net.output_bias);
+    output += i32::from(net.output_bias[bucket]);
     output *= SCALE;
     output /= i32::from(QA) * i32::from(QB);
 
@@ -249,7 +307,6 @@ unsafe fn forward_side_avx2(
         let y_low = _mm256_cvtepi16_epi32(low_16);
         let y_high = _mm256_cvtepi16_epi32(high_16);
 
-        // SCReLU: y * y
         let sq_low = _mm256_mullo_epi32(y_low, y_low);
         let sq_high = _mm256_mullo_epi32(y_high, y_high);
 
@@ -257,7 +314,6 @@ unsafe fn forward_side_avx2(
         let w_low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(w));
         let w_high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(w, 1));
 
-        // (y * y) * weight
         let p_low = _mm256_mullo_epi32(sq_low, w_low);
         let p_high = _mm256_mullo_epi32(sq_high, w_high);
 

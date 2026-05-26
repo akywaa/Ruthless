@@ -12,6 +12,8 @@ pub fn uci_loop() {
     let mut tt_size_mb = 32;
     let mut num_threads = 1;
     let mut tt = Arc::new(TranspositionTable::new(tt_size_mb));
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let mut searcher = Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal));
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -34,19 +36,20 @@ pub fn uci_loop() {
             }
             "setoption" => {
                 handle_setoption(&tokens[1..], &mut tt_size_mb, &mut num_threads, &mut tt);
+                searcher.tt = Arc::clone(&tt);
             }
             "isready" => {
                 println!("readyok");
             }
             "ucinewgame" => {
-                tt.clear();
+                searcher.clear();
                 board = Board::default();
             }
             "position" => {
                 handle_position(&mut board, &tokens[1..]);
             }
             "go" => {
-                handle_go(&mut board, &Arc::clone(&tt), num_threads, &tokens[1..]);
+                handle_go(&mut board, &mut searcher, num_threads, &tokens[1..]);
             }
             "quit" => break,
             _ => {}
@@ -137,7 +140,7 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
 
 fn handle_go(
     board: &mut Board,
-    tt: &Arc<TranspositionTable>,
+    main_searcher: &mut Searcher,
     threads: usize,
     tokens: &[&str],
 ) {
@@ -215,14 +218,14 @@ fn handle_go(
         }
     };
 
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    let mut main_searcher = Searcher::new(Arc::clone(tt), Arc::clone(&stop_signal));
+    let stop_signal = Arc::clone(&main_searcher.stop);
+    let tt = Arc::clone(&main_searcher.tt);
 
     let best_move = if threads > 1 {
         std::thread::scope(|s| {
             for _ in 1..threads {
                 let mut helper_searcher =
-                    Searcher::new(Arc::clone(tt), Arc::clone(&stop_signal));
+                    Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal));
                 let mut helper_board = board.clone();
                 s.spawn(move || {
                     helper_searcher.search_helper(&mut helper_board, depth);

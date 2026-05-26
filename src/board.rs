@@ -39,6 +39,7 @@ pub struct Board {
     pub halfmove_clock: u8,
     pub fullmove_number: u16,
     pub hash: u64,
+    pub pawn_hash: u64,
     pub history: Vec<u64>,
     pub accumulator: Accumulator,
 }
@@ -61,6 +62,7 @@ impl Board {
             halfmove_clock: 0,
             fullmove_number: 1,
             hash: 0,
+            pawn_hash: 0,
             history: Vec::with_capacity(256),
             accumulator: Accumulator::new(),
         }
@@ -163,6 +165,7 @@ impl Board {
         }
 
         board.hash = board.compute_hash();
+        board.pawn_hash = board.compute_pawn_hash();
         board.refresh_accumulator();
         Ok(board)
     }
@@ -192,6 +195,9 @@ impl Board {
         self.occupied.set(sq);
         self.piece_on[sq] = piece;
         self.hash ^= piece_key(piece, sq);
+        if piece.piece_type() == PieceType::Pawn {
+            self.pawn_hash ^= piece_key(piece, sq);
+        }
     }
 
     #[inline(always)]
@@ -203,8 +209,22 @@ impl Board {
             self.occupied.clear(sq);
             self.piece_on[sq] = Piece::None;
             self.hash ^= piece_key(piece, sq);
+            if piece.piece_type() == PieceType::Pawn {
+                self.pawn_hash ^= piece_key(piece, sq);
+            }
         }
         piece
+    }
+
+    pub fn compute_pawn_hash(&self) -> u64 {
+        let mut h = 0u64;
+        for sq in 0..64 {
+            let p = self.piece_on[sq];
+            if p != Piece::None && p.piece_type() == PieceType::Pawn {
+                h ^= piece_key(p, Square::new(sq as u8));
+            }
+        }
+        h
     }
 
     #[inline(always)]

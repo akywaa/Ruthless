@@ -6,12 +6,32 @@ use crate::tt::{TTFlag, TranspositionTable};
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 pub const INFINITY: i32 = 1_000_000;
 pub const MATE_SCORE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 pub const PAWN_CORR_ENTRIES: usize = 16384;
+
+static LMR: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
+
+fn init_lmr() -> [[i32; 64]; 64] {
+    let mut table = [[0; 64]; 64];
+    for d in 1..64 {
+        for m in 1..64 {
+            let base = 0.75 + ((d as f64).ln() * (m as f64).ln()) / 2.25;
+            table[d][m] = base as i32;
+        }
+    }
+    table
+}
+
+#[inline(always)]
+fn lmr(depth: usize, move_count: usize) -> i32 {
+    let table = LMR.get_or_init(init_lmr);
+    table[depth.min(63)][move_count.min(63)]
+}
 
 pub struct Searcher {
     pub tt: Arc<TranspositionTable>,
@@ -473,19 +493,50 @@ impl Searcher {
             let score = if moves_searched == 0 {
                 -self.negamax(board, depth - 1 + extension, ply + 1, -beta, -alpha, is_pv, Move::NULL)
             } else {
-                let mut reduced = depth - 1;
-                if moves_searched >= 3 && depth >= 3 && is_quiet {
-                    let r = 1 + (moves_searched >= 6) as u8 + (depth >= 6) as u8;
-                    reduced = depth.saturating_sub(1 + r).max(1);
+                let mut r = 0;
+
+                // Dynamic late move reduction
+                if depth >= 3 && moves_searched >= 1 && (is_quiet || moves_searched >= 6) {
+                    r = lmr(depth as usize, moves_searched);
+
+                    if !is_quiet {
+                        r /= 2;
+                    }
+
+                    // Adjust by move history
+                    let us = board.side_to_move as usize;
+                    let mut hist = self.history[us][m.from() as usize][m.to() as usize];
+                    if ply > 0 && (ply as usize) < MAX_PLY {
+                        let prev_piece = self.played_pieces[(ply - 1) as usize];
+                        let prev_move = self.played_moves[(ply - 1) as usize];
+                        if prev_piece != Piece::None && prev_move != Move::NULL {
+                            hist += self.conthist[prev_piece as usize][prev_move.to() as usize][m.to() as usize];
+                        }
+                    }
+
+                    r -= hist / 512;
+
+                    if is_pv {
+                        r -= 1;
+                    }
+
+                    r = r.clamp(0, depth as i32 - 2);
                 }
 
+                let reduced = (depth as i32 - 1 - r).max(1) as u8;
+
                 let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL);
+
+                // Re-search at full depth if reduced search fails high
                 if s > alpha && reduced < depth - 1 {
                     s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL);
                 }
+
+                // Full PV search
                 if s > alpha && s < beta {
                     s = -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, true, Move::NULL);
                 }
+
                 s
             };
 

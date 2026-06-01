@@ -42,6 +42,7 @@ pub struct Searcher {
     hard_time_ms: Option<u128>,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    capture_history: [[[i32; 64]; 6]; 2],
     counter_moves: [[Move; 64]; 64],
     conthist: [[[i32; 64]; 64]; 12],
     pawn_corr: Box<[[i32; PAWN_CORR_ENTRIES]; 2]>,
@@ -86,6 +87,7 @@ impl Searcher {
             hard_time_ms: None,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            capture_history: [[[0; 64]; 6]; 2],
             counter_moves: [[Move::NULL; 64]; 64],
             conthist: [[[0; 64]; 64]; 12],
             pawn_corr: vec![[0; PAWN_CORR_ENTRIES]; 2].into_boxed_slice().try_into().unwrap(),
@@ -98,6 +100,7 @@ impl Searcher {
         self.tt.clear();
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
+        self.capture_history = [[[0; 64]; 6]; 2];
         self.counter_moves = [[Move::NULL; 64]; 64];
         self.conthist = [[[0; 64]; 64]; 12];
         self.pawn_corr.fill([0; PAWN_CORR_ENTRIES]);
@@ -132,6 +135,7 @@ impl Searcher {
         self.nodes = 0;
         self.stop.store(false, Ordering::Relaxed);
         self.start_time = Instant::now();
+        self.tt.new_search();
         self.soft_time_ms = soft_time;
         self.hard_time_ms = hard_time;
 
@@ -437,7 +441,11 @@ impl Searcher {
             return 0;
         }
 
-        self.order_moves(board, &mut moves, tt_move, ply);
+        // Score all moves upfront without sorting
+        let mut move_scores = [0i32; 256];
+        for i in 0..moves.count {
+            move_scores[i] = self.score_move(board, moves.moves[i], tt_move, ply);
+        }
 
         let mut best_score = -INFINITY;
         let mut best_move = Move::NULL;
@@ -450,8 +458,20 @@ impl Searcher {
 
         let mut quiet_moves = [Move::NULL; 64];
         let mut quiet_count = 0;
+        let mut noisy_moves = [Move::NULL; 32];
+        let mut noisy_count = 0;
 
         for i in 0..moves.count {
+            // Incremental selection sort
+            let mut best_idx = i;
+            for j in (i + 1)..moves.count {
+                if move_scores[j] > move_scores[best_idx] {
+                    best_idx = j;
+                }
+            }
+            move_scores.swap(i, best_idx);
+            moves.moves.swap(i, best_idx);
+
             let m = moves.moves[i];
 
             if m == excluded_move {
@@ -481,6 +501,9 @@ impl Searcher {
             if is_quiet && quiet_count < 64 {
                 quiet_moves[quiet_count] = m;
                 quiet_count += 1;
+            } else if !is_quiet && noisy_count < 32 {
+                noisy_moves[noisy_count] = m;
+                noisy_count += 1;
             }
 
             if (ply as usize) < MAX_PLY {
@@ -690,18 +713,27 @@ impl Searcher {
             return 2_000_000;
         }
 
+        let us = board.side_to_move as usize;
+        let attacker_pt = board.piece_on[m.from()].piece_type();
         let captured = board.piece_on[m.to()];
-        if captured != Piece::None || m.move_type() == MoveType::EnPassant {
-            let victim = if m.move_type() == MoveType::EnPassant {
-                PIECE_VALUES[PieceType::Pawn as usize]
-            } else {
-                PIECE_VALUES[captured.piece_type() as usize]
-            };
-            let attacker = PIECE_VALUES[board.piece_on[m.from()].piece_type() as usize];
-            let mvv_lva = victim * 10 - attacker;
 
-            if see(board, m, 0) {
-                return 1_000_000 + mvv_lva;
+        if captured != Piece::None || m.move_type() == MoveType::EnPassant {
+            let victim_pt = if m.move_type() == MoveType::EnPassant {
+                PieceType::Pawn
+            } else {
+                captured.piece_type()
+            };
+
+            let victim_val = PIECE_VALUES[victim_pt as usize];
+            let attacker_val = PIECE_VALUES[attacker_pt as usize];
+            let mvv_lva = victim_val * 10 - attacker_val;
+
+            // Skip expensive SEE when capturing equal or higher value piece
+            let is_good = victim_val >= attacker_val || see(board, m, 0);
+
+            if is_good {
+                let cap_hist = self.capture_history[us][attacker_pt as usize][m.to() as usize];
+                return 1_000_000 + mvv_lva + cap_hist;
             } else {
                 return -500_000 + mvv_lva;
             }
@@ -728,7 +760,6 @@ impl Searcher {
             return 700_000;
         }
 
-        let us = board.side_to_move as usize;
         let mut score = self.history[us][m.from() as usize][m.to() as usize];
 
         if ply > 0 && (ply as usize) < MAX_PLY {
@@ -739,21 +770,5 @@ impl Searcher {
         }
 
         score
-    }
-
-    fn order_moves(&self, board: &Board, list: &mut MoveList, tt_move: Move, ply: u8) {
-        let mut scores = [0i32; 256];
-        for i in 0..list.count {
-            scores[i] = self.score_move(board, list.moves[i], tt_move, ply);
-        }
-
-        for i in 0..list.count {
-            for j in (i + 1)..list.count {
-                if scores[j] > scores[i] {
-                    scores.swap(i, j);
-                    list.moves.swap(i, j);
-                }
-            }
-        }
     }
 }

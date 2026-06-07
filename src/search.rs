@@ -45,7 +45,7 @@ pub struct Searcher {
     history: [[[i32; 64]; 64]; 2],
     capture_history: [[[i32; 64]; 6]; 2],
     counter_moves: [[Move; 64]; 64],
-    conthist: [[[i32; 64]; 64]; 12],
+    conthist: Box<[[[[i32; 64]; 64]; 12]; 4]>,
     pawn_corr: Box<[[i32; PAWN_CORR_ENTRIES]; 2]>,
     played_moves: [Move; MAX_PLY],
     played_pieces: [Piece; MAX_PLY],
@@ -90,7 +90,7 @@ impl Searcher {
             history: [[[0; 64]; 64]; 2],
             capture_history: [[[0; 64]; 6]; 2],
             counter_moves: [[Move::NULL; 64]; 64],
-            conthist: [[[0; 64]; 64]; 12],
+            conthist: vec![[[[0; 64]; 64]; 12]; 4].into_boxed_slice().try_into().unwrap(),
             pawn_corr: vec![[0; PAWN_CORR_ENTRIES]; 2].into_boxed_slice().try_into().unwrap(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
@@ -103,7 +103,7 @@ impl Searcher {
         self.history = [[[0; 64]; 64]; 2];
         self.capture_history = [[[0; 64]; 6]; 2];
         self.counter_moves = [[Move::NULL; 64]; 64];
-        self.conthist = [[[0; 64]; 64]; 12];
+        self.conthist.fill([[[0; 64]; 64]; 12]);
         self.pawn_corr.fill([0; PAWN_CORR_ENTRIES]);
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
@@ -116,6 +116,40 @@ impl Searcher {
         let idx = (board.pawn_hash as usize) & (PAWN_CORR_ENTRIES - 1);
         let bonus = self.pawn_corr[side][idx] / 64;
         (raw + bonus).clamp(-MATE_SCORE + 100, MATE_SCORE - 100)
+    }
+
+    const CONT_OFFSETS: [usize; 4] = [1, 2, 4, 6];
+
+    #[inline(always)]
+    fn get_conthist(&self, ply: u8, m: Move) -> i32 {
+        let mut score = 0;
+        let ply_idx = ply as usize;
+        for (layer, &offset) in Self::CONT_OFFSETS.iter().enumerate() {
+            if ply_idx >= offset {
+                let prev_piece = self.played_pieces[ply_idx - offset];
+                let prev_move = self.played_moves[ply_idx - offset];
+                if prev_piece != Piece::None && prev_move != Move::NULL {
+                    score += self.conthist[layer][prev_piece as usize][prev_move.to() as usize][m.to() as usize];
+                }
+            }
+        }
+        score
+    }
+
+    fn update_conthist(&mut self, ply: u8, m: Move, bonus: i32) {
+        let ply_idx = ply as usize;
+        for (layer, &offset) in Self::CONT_OFFSETS.iter().enumerate() {
+            if ply_idx >= offset {
+                let prev_piece = self.played_pieces[ply_idx - offset];
+                let prev_move = self.played_moves[ply_idx - offset];
+                if prev_piece != Piece::None && prev_move != Move::NULL {
+                    update_history(
+                        &mut self.conthist[layer][prev_piece as usize][prev_move.to() as usize][m.to() as usize],
+                        bonus,
+                    );
+                }
+            }
+        }
     }
 
     pub fn search(
@@ -451,11 +485,6 @@ impl Searcher {
         } else {
             Move::NULL
         };
-        let prev_piece = if ply > 0 && (ply as usize) < MAX_PLY {
-            self.played_pieces[(ply - 1) as usize]
-        } else {
-            Piece::None
-        };
         let counter_move = if prev_move != Move::NULL {
             self.counter_moves[prev_move.from() as usize][prev_move.to() as usize]
         } else {
@@ -475,8 +504,9 @@ impl Searcher {
             &self.history,
             &self.conthist,
             &self.capture_history,
-            prev_piece,
-            prev_move,
+            ply,
+            &self.played_pieces,
+            &self.played_moves,
         ) {
             if m == excluded_move {
                 continue;
@@ -529,14 +559,7 @@ impl Searcher {
 
                     // Adjust by move history
                     let us = board.side_to_move as usize;
-                    let mut hist = self.history[us][m.from() as usize][m.to() as usize];
-                    if ply > 0 && (ply as usize) < MAX_PLY {
-                        let prev_piece = self.played_pieces[(ply - 1) as usize];
-                        let prev_move = self.played_moves[(ply - 1) as usize];
-                        if prev_piece != Piece::None && prev_move != Move::NULL {
-                            hist += self.conthist[prev_piece as usize][prev_move.to() as usize][m.to() as usize];
-                        }
-                    }
+                    let hist = self.history[us][m.from() as usize][m.to() as usize] + self.get_conthist(ply, m);
 
                     r -= hist / 512;
 
@@ -592,11 +615,6 @@ impl Searcher {
                     } else {
                         Move::NULL
                     };
-                    let prev_piece = if ply > 0 {
-                        self.played_pieces[(ply - 1) as usize]
-                    } else {
-                        Piece::None
-                    };
 
                     if prev_move != Move::NULL {
                         self.counter_moves[prev_move.from() as usize][prev_move.to() as usize] = m;
@@ -606,22 +624,12 @@ impl Searcher {
                     let us = board.side_to_move as usize;
 
                     update_history(&mut self.history[us][m.from() as usize][m.to() as usize], bonus);
-                    if prev_piece != Piece::None {
-                        update_history(
-                            &mut self.conthist[prev_piece as usize][prev_move.to() as usize][m.to() as usize],
-                            bonus,
-                        );
-                    }
+                    self.update_conthist(ply, m, bonus);
 
                     for j in 0..quiet_count.saturating_sub(1) {
                         let qm = quiet_moves[j];
                         update_history(&mut self.history[us][qm.from() as usize][qm.to() as usize], -bonus);
-                        if prev_piece != Piece::None {
-                            update_history(
-                                &mut self.conthist[prev_piece as usize][prev_move.to() as usize][qm.to() as usize],
-                                -bonus,
-                            );
-                        }
+                        self.update_conthist(ply, qm, -bonus);
                     }
                 }
                 break;
@@ -693,8 +701,9 @@ impl Searcher {
             &self.history,
             &self.conthist,
             &self.capture_history,
-            Piece::None,
-            Move::NULL,
+            ply,
+            &self.played_pieces,
+            &self.played_moves,
         ) {
             moves_searched += 1;
             let undo = board.make_move(m);

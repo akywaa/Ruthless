@@ -66,10 +66,11 @@ impl MovePicker {
         &mut self,
         board: &mut Board,
         history: &[[[i32; 64]; 64]; 2],
-        conthist: &[[[i32; 64]; 64]; 12],
+        conthist: &[[[[i32; 64]; 64]; 12]; 4],
         cap_hist: &[[[i32; 64]; 6]; 2],
-        prev_piece: Piece,
-        prev_move: Move,
+        ply: u8,
+        played_pieces: &[Piece; 64],
+        played_moves: &[Move; 64],
     ) -> Option<Move> {
         loop {
             match self.stage {
@@ -133,7 +134,7 @@ impl MovePicker {
                 Stage::GenerateQuiets => {
                     self.moves.count = 0;
                     generate_quiet_pseudo(board, &mut self.moves);
-                    self.score_quiets(board, history, conthist, prev_piece, prev_move);
+                    self.score_quiets(board, history, conthist, ply, played_pieces, played_moves);
                     self.cur_idx = 0;
                     self.stage = Stage::Quiets;
                 }
@@ -206,17 +207,29 @@ impl MovePicker {
         &mut self,
         board: &Board,
         history: &[[[i32; 64]; 64]; 2],
-        conthist: &[[[i32; 64]; 64]; 12],
-        prev_piece: Piece,
-        prev_move: Move,
+        conthist: &[[[[i32; 64]; 64]; 12]; 4],
+        ply: u8,
+        played_pieces: &[Piece; 64],
+        played_moves: &[Move; 64],
     ) {
         let us = board.side_to_move as usize;
+        let offsets = [1usize, 2, 4, 6];
+        let ply_idx = ply as usize;
+
         for i in 0..self.moves.count {
             let m = self.moves.moves[i];
             let mut score = history[us][m.from() as usize][m.to() as usize];
-            if prev_piece != Piece::None && prev_move != Move::NULL {
-                score += conthist[prev_piece as usize][prev_move.to() as usize][m.to() as usize];
+
+            for (layer, &offset) in offsets.iter().enumerate() {
+                if ply_idx >= offset {
+                    let prev_piece = played_pieces[ply_idx - offset];
+                    let prev_move = played_moves[ply_idx - offset];
+                    if prev_piece != Piece::None && prev_move != Move::NULL {
+                        score += conthist[layer][prev_piece as usize][prev_move.to() as usize][m.to() as usize];
+                    }
+                }
             }
+
             self.scores[i] = score;
         }
     }

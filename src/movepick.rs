@@ -66,8 +66,9 @@ impl MovePicker {
         &mut self,
         board: &mut Board,
         history: &[[[i32; 64]; 64]; 2],
+        pawn_history: &[[[i32; 64]; 12]; 512],
         conthist: &[[[[i32; 64]; 64]; 12]; 4],
-        cap_hist: &[[[i32; 64]; 6]; 2],
+        noisy_history: &[[[i32; 6]; 64]; 12],
         ply: u8,
         played_pieces: &[Piece; 64],
         played_moves: &[Move; 64],
@@ -84,7 +85,7 @@ impl MovePicker {
                 Stage::GenerateNoisy => {
                     self.moves.count = 0;
                     generate_noisy_pseudo(board, &mut self.moves);
-                    self.score_noisy(board, cap_hist);
+                    self.score_noisy(board, noisy_history);
                     self.cur_idx = 0;
                     self.stage = Stage::GoodNoisy;
                 }
@@ -134,7 +135,7 @@ impl MovePicker {
                 Stage::GenerateQuiets => {
                     self.moves.count = 0;
                     generate_quiet_pseudo(board, &mut self.moves);
-                    self.score_quiets(board, history, conthist, ply, played_pieces, played_moves);
+                    self.score_quiets(board, history, pawn_history, conthist, ply, played_pieces, played_moves);
                     self.cur_idx = 0;
                     self.stage = Stage::Quiets;
                 }
@@ -185,11 +186,10 @@ impl MovePicker {
         m
     }
 
-    fn score_noisy(&mut self, board: &Board, cap_hist: &[[[i32; 64]; 6]; 2]) {
-        let us = board.side_to_move as usize;
+    fn score_noisy(&mut self, board: &Board, noisy_history: &[[[i32; 6]; 64]; 12]) {
         for i in 0..self.moves.count {
             let m = self.moves.moves[i];
-            let attacker_pt = board.piece_on[m.from()].piece_type();
+            let attacker = board.piece_on[m.from()];
             let captured = board.piece_on[m.to()];
             let victim_pt = if m.move_type() == MoveType::EnPassant {
                 PieceType::Pawn
@@ -197,9 +197,9 @@ impl MovePicker {
                 captured.piece_type()
             };
 
-            let mvv_lva = PIECE_VALUES[victim_pt as usize] * 10 - PIECE_VALUES[attacker_pt as usize];
-            let cap_score = cap_hist[us][attacker_pt as usize][m.to() as usize];
-            self.scores[i] = mvv_lva + cap_score;
+            let mvv_lva = PIECE_VALUES[victim_pt as usize] * 10 - PIECE_VALUES[attacker.piece_type() as usize];
+            let hist = noisy_history[attacker as usize][m.to() as usize][victim_pt as usize];
+            self.scores[i] = mvv_lva + hist;
         }
     }
 
@@ -207,18 +207,23 @@ impl MovePicker {
         &mut self,
         board: &Board,
         history: &[[[i32; 64]; 64]; 2],
+        pawn_history: &[[[i32; 64]; 12]; 512],
         conthist: &[[[[i32; 64]; 64]; 12]; 4],
         ply: u8,
         played_pieces: &[Piece; 64],
         played_moves: &[Move; 64],
     ) {
         let us = board.side_to_move as usize;
+        let p_idx = (board.pawn_hash as usize) & 511;
         let offsets = [1usize, 2, 4, 6];
         let ply_idx = ply as usize;
 
         for i in 0..self.moves.count {
             let m = self.moves.moves[i];
-            let mut score = history[us][m.from() as usize][m.to() as usize];
+            let piece = board.piece_on[m.from()] as usize;
+
+            let mut score = history[us][m.from() as usize][m.to() as usize]
+                + pawn_history[p_idx][piece][m.to() as usize];
 
             for (layer, &offset) in offsets.iter().enumerate() {
                 if ply_idx >= offset {

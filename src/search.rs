@@ -4,7 +4,7 @@ use crate::movegen::generate_legal_moves;
 use crate::movepick::MovePicker;
 use crate::see::see;
 use crate::tt::{TTFlag, TranspositionTable};
-use crate::types::{Color, Move, MoveType, Piece, PieceType};
+use crate::types::{Move, MoveType, Piece, PieceType};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -43,7 +43,8 @@ pub struct Searcher {
     hard_time_ms: Option<u128>,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
-    capture_history: [[[i32; 64]; 6]; 2],
+    pawn_history: Box<[[[i32; 64]; 12]; 512]>,
+    noisy_history: Box<[[[i32; 6]; 64]; 12]>,
     counter_moves: [[Move; 64]; 64],
     conthist: Box<[[[[i32; 64]; 64]; 12]; 4]>,
     pawn_corr: Box<[[i32; PAWN_CORR_ENTRIES]; 2]>,
@@ -88,7 +89,8 @@ impl Searcher {
             hard_time_ms: None,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
-            capture_history: [[[0; 64]; 6]; 2],
+            pawn_history: vec![[[0; 64]; 12]; 512].into_boxed_slice().try_into().unwrap(),
+            noisy_history: vec![[[0; 6]; 64]; 12].into_boxed_slice().try_into().unwrap(),
             counter_moves: [[Move::NULL; 64]; 64],
             conthist: vec![[[[0; 64]; 64]; 12]; 4].into_boxed_slice().try_into().unwrap(),
             pawn_corr: vec![[0; PAWN_CORR_ENTRIES]; 2].into_boxed_slice().try_into().unwrap(),
@@ -101,7 +103,8 @@ impl Searcher {
         self.tt.clear();
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
-        self.capture_history = [[[0; 64]; 6]; 2];
+        self.pawn_history.fill([[0; 64]; 12]);
+        self.noisy_history.fill([[0; 6]; 64]);
         self.counter_moves = [[Move::NULL; 64]; 64];
         self.conthist.fill([[[0; 64]; 64]; 12]);
         self.pawn_corr.fill([0; PAWN_CORR_ENTRIES]);
@@ -412,6 +415,7 @@ impl Searcher {
                             return tt_score;
                         }
                     }
+                    TTFlag::None => {}
                 }
                 if alpha >= beta {
                     return tt_score;
@@ -479,6 +483,8 @@ impl Searcher {
 
         let mut quiet_moves = [Move::NULL; 64];
         let mut quiet_count = 0;
+        let mut noisy_moves = [Move::NULL; 32];
+        let mut noisy_count = 0;
 
         let prev_move = if ply > 0 && (ply as usize) < MAX_PLY {
             self.played_moves[(ply - 1) as usize]
@@ -502,8 +508,9 @@ impl Searcher {
         while let Some(m) = picker.next(
             board,
             &self.history,
+            &self.pawn_history,
             &self.conthist,
-            &self.capture_history,
+            &self.noisy_history,
             ply,
             &self.played_pieces,
             &self.played_moves,
@@ -535,6 +542,9 @@ impl Searcher {
             if is_quiet && quiet_count < 64 {
                 quiet_moves[quiet_count] = m;
                 quiet_count += 1;
+            } else if !is_quiet && noisy_count < 32 {
+                noisy_moves[noisy_count] = m;
+                noisy_count += 1;
             }
 
             if (ply as usize) < MAX_PLY {
@@ -604,32 +614,54 @@ impl Searcher {
             }
 
             if alpha >= beta {
-                if is_quiet && (ply as usize) < MAX_PLY {
-                    if self.killers[ply as usize][0] != m {
-                        self.killers[ply as usize][1] = self.killers[ply as usize][0];
-                        self.killers[ply as usize][0] = m;
+                let bonus = ((depth as i32) * (depth as i32)).min(1600);
+
+                if is_quiet {
+                    if (ply as usize) < MAX_PLY {
+                        if self.killers[ply as usize][0] != m {
+                            self.killers[ply as usize][1] = self.killers[ply as usize][0];
+                            self.killers[ply as usize][0] = m;
+                        }
+
+                        if prev_move != Move::NULL {
+                            self.counter_moves[prev_move.from() as usize][prev_move.to() as usize] = m;
+                        }
                     }
 
-                    let prev_move = if ply > 0 {
-                        self.played_moves[(ply - 1) as usize]
-                    } else {
-                        Move::NULL
-                    };
-
-                    if prev_move != Move::NULL {
-                        self.counter_moves[prev_move.from() as usize][prev_move.to() as usize] = m;
-                    }
-
-                    let bonus = ((depth as i32) * (depth as i32)).min(1600);
                     let us = board.side_to_move as usize;
+                    let moving_pc = board.piece_on[m.from()] as usize;
+                    let p_idx = (board.pawn_hash as usize) & 511;
 
                     update_history(&mut self.history[us][m.from() as usize][m.to() as usize], bonus);
+                    update_history(&mut self.pawn_history[p_idx][moving_pc][m.to() as usize], bonus);
                     self.update_conthist(ply, m, bonus);
 
                     for j in 0..quiet_count.saturating_sub(1) {
                         let qm = quiet_moves[j];
+                        let q_pc = board.piece_on[qm.from()] as usize;
                         update_history(&mut self.history[us][qm.from() as usize][qm.to() as usize], -bonus);
+                        update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -bonus);
                         self.update_conthist(ply, qm, -bonus);
+                    }
+                } else {
+                    let moving_pc = board.piece_on[m.from()] as usize;
+                    let victim_pt = if m.move_type() == MoveType::EnPassant {
+                        PieceType::Pawn
+                    } else {
+                        board.piece_on[m.to()].piece_type()
+                    } as usize;
+
+                    update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt], bonus);
+
+                    for j in 0..noisy_count.saturating_sub(1) {
+                        let nm = noisy_moves[j];
+                        let n_pc = board.piece_on[nm.from()] as usize;
+                        let n_victim_pt = if nm.move_type() == MoveType::EnPassant {
+                            PieceType::Pawn
+                        } else {
+                            board.piece_on[nm.to()].piece_type()
+                        } as usize;
+                        update_history(&mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt], -bonus);
                     }
                 }
                 break;
@@ -699,8 +731,9 @@ impl Searcher {
         while let Some(m) = picker.next(
             board,
             &self.history,
+            &self.pawn_history,
             &self.conthist,
-            &self.capture_history,
+            &self.noisy_history,
             ply,
             &self.played_pieces,
             &self.played_moves,

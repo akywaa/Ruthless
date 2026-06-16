@@ -13,7 +13,7 @@ use std::time::Instant;
 pub const INFINITY: i32 = 1_000_000;
 pub const MATE_SCORE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
-pub const PAWN_CORR_ENTRIES: usize = 16384;
+pub const CORR_ENTRIES: usize = 16384;
 
 static LMR: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 
@@ -47,7 +47,8 @@ pub struct Searcher {
     noisy_history: Box<[[[i32; 6]; 64]; 12]>,
     counter_moves: [[Move; 64]; 64],
     conthist: Box<[[[[i32; 64]; 64]; 12]; 4]>,
-    pawn_corr: Box<[[i32; PAWN_CORR_ENTRIES]; 2]>,
+    pawn_corr: Box<[[i32; CORR_ENTRIES]; 2]>,
+    non_pawn_corr: Box<[[[i32; CORR_ENTRIES]; 2]; 2]>,
     played_moves: [Move; MAX_PLY],
     played_pieces: [Piece; MAX_PLY],
 }
@@ -93,7 +94,8 @@ impl Searcher {
             noisy_history: vec![[[0; 6]; 64]; 12].into_boxed_slice().try_into().unwrap(),
             counter_moves: [[Move::NULL; 64]; 64],
             conthist: vec![[[[0; 64]; 64]; 12]; 4].into_boxed_slice().try_into().unwrap(),
-            pawn_corr: vec![[0; PAWN_CORR_ENTRIES]; 2].into_boxed_slice().try_into().unwrap(),
+            pawn_corr: vec![[0; CORR_ENTRIES]; 2].into_boxed_slice().try_into().unwrap(),
+            non_pawn_corr: vec![[[0; CORR_ENTRIES]; 2]; 2].into_boxed_slice().try_into().unwrap(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
         }
@@ -107,7 +109,8 @@ impl Searcher {
         self.noisy_history.fill([[0; 6]; 64]);
         self.counter_moves = [[Move::NULL; 64]; 64];
         self.conthist.fill([[[0; 64]; 64]; 12]);
-        self.pawn_corr.fill([0; PAWN_CORR_ENTRIES]);
+        self.pawn_corr.fill([0; CORR_ENTRIES]);
+        self.non_pawn_corr.fill([[0; CORR_ENTRIES]; 2]);
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
     }
@@ -116,9 +119,22 @@ impl Searcher {
     fn corrected_eval(&self, board: &Board) -> i32 {
         let raw = evaluate(board);
         let side = board.side_to_move as usize;
-        let idx = (board.pawn_hash as usize) & (PAWN_CORR_ENTRIES - 1);
-        let bonus = self.pawn_corr[side][idx] / 64;
-        (raw + bonus).clamp(-MATE_SCORE + 100, MATE_SCORE - 100)
+
+        let p_idx = (board.pawn_hash as usize) & (CORR_ENTRIES - 1);
+        let w_np_idx = (board.non_pawn_hash[0] as usize) & (CORR_ENTRIES - 1);
+        let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
+
+        let bonus = (self.pawn_corr[side][p_idx]
+            + self.non_pawn_corr[0][side][w_np_idx]
+            + self.non_pawn_corr[1][side][b_np_idx])
+            / 64;
+
+        let mut eval = raw + bonus;
+
+        // Scale evaluation towards draw near 50-move rule
+        eval = eval * (200 - board.halfmove_clock as i32) / 200;
+
+        eval.clamp(-MATE_SCORE + 100, MATE_SCORE - 100)
     }
 
     const CONT_OFFSETS: [usize; 4] = [1, 2, 4, 6];
@@ -773,8 +789,14 @@ impl Searcher {
             {
                 let bonus = ((best_score - static_eval) * (depth as i32)).clamp(-1600, 1600);
                 let side = board.side_to_move as usize;
-                let idx = (board.pawn_hash as usize) & (PAWN_CORR_ENTRIES - 1);
-                update_history(&mut self.pawn_corr[side][idx], bonus);
+
+                let p_idx = (board.pawn_hash as usize) & (CORR_ENTRIES - 1);
+                let w_np_idx = (board.non_pawn_hash[0] as usize) & (CORR_ENTRIES - 1);
+                let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
+
+                update_history(&mut self.pawn_corr[side][p_idx], bonus);
+                update_history(&mut self.non_pawn_corr[0][side][w_np_idx], bonus);
+                update_history(&mut self.non_pawn_corr[1][side][b_np_idx], bonus);
             }
         }
         best_score

@@ -84,6 +84,10 @@ impl Board {
         }
     }
 
+    pub fn refresh_accumulator_side(&mut self, color: Color) {
+        self.accumulator.refresh_side(self, color);
+    }
+
     pub fn from_fen(fen: &str) -> Result<Self, String> {
         let mut board = Self::new();
         let parts: Vec<&str> = fen.split_whitespace().collect();
@@ -384,8 +388,12 @@ impl Board {
         }
 
         self.remove_piece(from);
+
         if !is_king_move {
             self.accumulator.remove_feature(moving_piece, from, w_ksq, b_ksq);
+        } else {
+            // For the opponent, king bucket never changes; update incrementally
+            self.accumulator.remove_feature_side(moving_piece, from, self.king_square(them), them);
         }
 
         match move_type {
@@ -394,11 +402,15 @@ impl Board {
                     self.remove_piece(to);
                     if !is_king_move {
                         self.accumulator.remove_feature(undo.captured, to, w_ksq, b_ksq);
+                    } else {
+                        self.accumulator.remove_feature_side(undo.captured, to, self.king_square(them), them);
                     }
                 }
                 self.put_piece(moving_piece, to);
                 if !is_king_move {
                     self.accumulator.add_feature(moving_piece, to, w_ksq, b_ksq);
+                } else {
+                    self.accumulator.add_feature_side(moving_piece, to, self.king_square(them), them);
                 }
 
                 if moving_piece.piece_type() == PieceType::Pawn && ((from as i8) - (to as i8)).abs() == 16 {
@@ -408,6 +420,7 @@ impl Board {
             }
             MoveType::Castling => {
                 self.put_piece(moving_piece, to);
+                self.accumulator.add_feature_side(moving_piece, to, self.king_square(them), them);
 
                 let (rook_from, rook_to) = match to {
                     Square::G1 => (Square::H1, Square::F1),
@@ -418,6 +431,9 @@ impl Board {
                 };
                 let rook = self.remove_piece(rook_from);
                 self.put_piece(rook, rook_to);
+
+                self.accumulator.remove_feature_side(rook, rook_from, self.king_square(them), them);
+                self.accumulator.add_feature_side(rook, rook_to, self.king_square(them), them);
             }
             MoveType::EnPassant => {
                 let cap_sq = Square::from_coords(to.file(), from.rank());
@@ -439,7 +455,38 @@ impl Board {
         }
 
         if is_king_move {
-            self.refresh_accumulator();
+            let old_bucket = match us {
+                Color::White => crate::nnue::king_bucket(from),
+                Color::Black => crate::nnue::king_bucket(Square::new((from as u8) ^ 56)),
+            };
+            let new_bucket = match us {
+                Color::White => crate::nnue::king_bucket(to),
+                Color::Black => crate::nnue::king_bucket(Square::new((to as u8) ^ 56)),
+            };
+
+            if old_bucket != new_bucket {
+                self.refresh_accumulator_side(us);
+            } else {
+                // Same bucket: update our side incrementally
+                self.accumulator.remove_feature_side(moving_piece, from, to, us);
+                if undo.captured != Piece::None {
+                    self.accumulator.remove_feature_side(undo.captured, to, to, us);
+                }
+                self.accumulator.add_feature_side(moving_piece, to, to, us);
+
+                if move_type == MoveType::Castling {
+                    let (rook_from, rook_to) = match to {
+                        Square::G1 => (Square::H1, Square::F1),
+                        Square::C1 => (Square::A1, Square::D1),
+                        Square::G8 => (Square::H8, Square::F8),
+                        Square::C8 => (Square::A8, Square::D8),
+                        _ => unreachable!(),
+                    };
+                    let rook = self.piece_on[rook_to];
+                    self.accumulator.remove_feature_side(rook, rook_from, to, us);
+                    self.accumulator.add_feature_side(rook, rook_to, to, us);
+                }
+            }
         }
 
         let new_castling = self.castling_rights & CASTLING_RIGHTS_MASK[from as usize] & CASTLING_RIGHTS_MASK[to as usize];

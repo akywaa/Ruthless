@@ -38,6 +38,7 @@ pub struct Searcher {
     pub tt: Arc<TranspositionTable>,
     pub nodes: u64,
     pub stop: Arc<AtomicBool>,
+    pub thread_id: usize,
     start_time: Instant,
     soft_time_ms: Option<u128>,
     hard_time_ms: Option<u128>,
@@ -80,11 +81,12 @@ fn update_history(val: &mut i32, bonus: i32) {
 }
 
 impl Searcher {
-    pub fn new(tt: Arc<TranspositionTable>, stop: Arc<AtomicBool>) -> Self {
+    pub fn new(tt: Arc<TranspositionTable>, stop: Arc<AtomicBool>, thread_id: usize) -> Self {
         Self {
             tt,
             nodes: 0,
             stop,
+            thread_id,
             start_time: Instant::now(),
             soft_time_ms: None,
             hard_time_ms: None,
@@ -274,18 +276,20 @@ impl Searcher {
             if let Some(soft_limit) = self.soft_time_ms {
                 let mut time_scale = 1.0f32;
 
-                if best_move != prev_best_move && depth >= 6 {
-                    time_scale *= 1.5;
+                if best_move != prev_best_move && depth >= 5 {
+                    time_scale *= 1.6;
                 }
-                if score < prev_score - 30 && depth >= 6 {
-                    time_scale *= 1.3;
+                if score < prev_score - 20 && depth >= 5 {
+                    time_scale *= 1.4;
                 }
-                if stable_iterations >= 4 && depth >= 8 {
-                    time_scale *= 0.7;
+                if stable_iterations >= 4 && depth >= 7 {
+                    time_scale *= 0.6;
+                } else if stable_iterations >= 2 && depth >= 6 {
+                    time_scale *= 0.8;
                 }
 
                 let dynamic_soft = ((soft_limit as f32) * time_scale) as u128;
-                if elapsed >= dynamic_soft || elapsed * 2 >= self.hard_time_ms.unwrap_or(u128::MAX) {
+                if elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
                     break;
                 }
             }
@@ -300,8 +304,10 @@ impl Searcher {
     pub fn search_helper(&mut self, board: &mut Board, max_depth: u8) {
         self.nodes = 0;
         let mut score = 0;
+        let start_depth = 1 + (self.thread_id % 2) as u8;
+        let target_depth = (max_depth as usize + 8).min(64) as u8;
 
-        for depth in 1..=max_depth {
+        for depth in start_depth..=target_depth {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -663,6 +669,11 @@ impl Searcher {
 
                     if is_pv {
                         r -= 1;
+                    }
+
+                    // Thread diversity for helper threads
+                    if self.thread_id > 0 && ((moves_searched + self.thread_id) % 2 == 0) {
+                        r += 1;
                     }
 
                     r = r.clamp(0, depth as i32 - 2);

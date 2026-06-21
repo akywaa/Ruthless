@@ -13,7 +13,7 @@ pub fn uci_loop() {
     let mut num_threads = 1;
     let mut tt = Arc::new(TranspositionTable::new(tt_size_mb));
     let stop_signal = Arc::new(AtomicBool::new(false));
-    let mut searcher = Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal));
+    let mut searcher = Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal), 0);
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -206,11 +206,11 @@ fn handle_go(
 
         if let Some(time) = my_time {
             let usable_time = time.saturating_sub(overhead_ms);
-            let moves = movestogo.unwrap_or(25).clamp(2, 50);
+            let moves = movestogo.unwrap_or(28).clamp(2, 50);
 
-            let base_time = usable_time / moves + (my_inc * 3) / 4;
-            let soft = base_time.clamp(5, usable_time);
-            let hard = (soft * 3).min(usable_time * 8 / 10).max(soft);
+            let base_time = usable_time / moves + (my_inc * 4) / 5;
+            let soft = (base_time * 6 / 10).clamp(5, usable_time);
+            let hard = (base_time * 2 + my_inc / 2).min(usable_time * 85 / 100).max(soft);
 
             (Some(soft), Some(hard))
         } else {
@@ -220,15 +220,18 @@ fn handle_go(
 
     let stop_signal = Arc::clone(&main_searcher.stop);
     let tt = Arc::clone(&main_searcher.tt);
+    let total_helper_nodes = Arc::new(AtomicU64::new(0));
 
     let best_move = if threads > 1 {
         std::thread::scope(|s| {
-            for _ in 1..threads {
+            for id in 1..threads {
                 let mut helper_searcher =
-                    Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal));
+                    Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal), id);
                 let mut helper_board = board.clone();
+                let nodes_acc = Arc::clone(&total_helper_nodes);
                 s.spawn(move || {
                     helper_searcher.search_helper(&mut helper_board, depth);
+                    nodes_acc.fetch_add(helper_searcher.nodes, Ordering::Relaxed);
                 });
             }
 

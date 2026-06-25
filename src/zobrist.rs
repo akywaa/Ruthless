@@ -6,6 +6,7 @@ pub struct ZobristKeys {
     pub castling: [u64; 16],
     pub ep: [u64; 8],
     pub side: u64,
+    pub fiftymove_clock: [u64; 16],
 }
 
 static ZOBRIST: OnceLock<ZobristKeys> = OnceLock::new();
@@ -48,11 +49,17 @@ impl ZobristKeys {
 
         let side = rng.next();
 
+        let mut fiftymove_clock = [0u64; 16];
+        for item in &mut fiftymove_clock {
+            *item = rng.next();
+        }
+
         Self {
             pieces,
             castling,
             ep,
             side,
+            fiftymove_clock,
         }
     }
 }
@@ -70,6 +77,11 @@ pub fn castling_key(rights: u8) -> u64 {
 #[inline(always)]
 pub fn ep_key(file: u8) -> u64 {
     zobrist().ep[(file & 7) as usize]
+}
+
+#[inline(always)]
+pub fn fiftymove_key(bucket: u8) -> u64 {
+    zobrist().fiftymove_clock[(bucket & 15) as usize]
 }
 
 #[inline(always)]

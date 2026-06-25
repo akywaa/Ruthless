@@ -236,7 +236,7 @@ impl Searcher {
                 break;
             }
 
-            if let Some(entry) = self.tt.probe(board.hash) {
+            if let Some(entry) = self.tt.probe(board.tt_hash) {
                 if entry.best_move != Move::NULL {
                     best_move = entry.best_move;
                 }
@@ -406,6 +406,11 @@ impl Searcher {
         let in_check = board.in_check();
         if in_check {
             depth += 1;
+        }
+
+        // 50-move rule and insufficient material draw unless a mate is in reach
+        if !in_check && board.is_draw() {
+            return 0;
         }
 
         if depth == 0 {
@@ -786,7 +791,7 @@ impl Searcher {
         };
 
         if excluded_move == Move::NULL {
-            self.tt.store(board.hash, score_to_tt(best_score, ply), depth, flag, best_move);
+            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), depth, flag, best_move);
 
             let tt_move_quiet = best_move == Move::NULL
                 || (board.piece_on[best_move.to()] == Piece::None
@@ -821,6 +826,10 @@ impl Searcher {
 
         self.nodes += 1;
         let in_check = board.in_check();
+
+        if !in_check && board.is_draw() {
+            return 0;
+        }
 
         if !in_check {
             let stand_pat = self.corrected_eval(board);

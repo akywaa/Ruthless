@@ -40,6 +40,7 @@ pub struct Board {
     pub halfmove_clock: u8,
     pub fullmove_number: u16,
     pub hash: u64,
+    pub tt_hash: u64,
     pub pawn_hash: u64,
     pub non_pawn_hash: [u64; 2],
     pub history: Vec<u64>,
@@ -64,6 +65,7 @@ impl Board {
             halfmove_clock: 0,
             fullmove_number: 1,
             hash: 0,
+            tt_hash: 0,
             pawn_hash: 0,
             non_pawn_hash: [0; 2],
             history: Vec::with_capacity(256),
@@ -172,10 +174,16 @@ impl Board {
         }
 
         board.hash = board.compute_hash();
+        board.refresh_tt_hash();
         board.pawn_hash = board.compute_pawn_hash();
         board.non_pawn_hash = board.compute_non_pawn_hash();
         board.refresh_accumulator();
         Ok(board)
+    }
+
+    #[inline(always)]
+    pub fn refresh_tt_hash(&mut self) {
+        self.tt_hash = self.hash ^ fiftymove_key(self.halfmove_clock / 8);
     }
 
     pub fn compute_hash(&self) -> u64 {
@@ -300,6 +308,52 @@ impl Board {
     }
 
     #[inline(always)]
+    pub fn has_insufficient_material(&self) -> bool {
+        let pawns = self.pieces[Piece::new(Color::White, PieceType::Pawn)]
+            | self.pieces[Piece::new(Color::Black, PieceType::Pawn)];
+        if !pawns.is_empty() {
+            return false;
+        }
+
+        let rooks = self.pieces[Piece::new(Color::White, PieceType::Rook)]
+            | self.pieces[Piece::new(Color::Black, PieceType::Rook)];
+        let queens = self.pieces[Piece::new(Color::White, PieceType::Queen)]
+            | self.pieces[Piece::new(Color::Black, PieceType::Queen)];
+        if !rooks.is_empty() || !queens.is_empty() {
+            return false;
+        }
+
+        let w_knights = self.pieces[Piece::new(Color::White, PieceType::Knight)];
+        let b_knights = self.pieces[Piece::new(Color::Black, PieceType::Knight)];
+        let w_bishops = self.pieces[Piece::new(Color::White, PieceType::Bishop)];
+        let b_bishops = self.pieces[Piece::new(Color::Black, PieceType::Bishop)];
+        let total_knights = (w_knights | b_knights).count();
+        let total_bishops = (w_bishops | b_bishops).count();
+
+        match (total_knights, total_bishops) {
+            (_knights, 0) => true, // kings only or king + knights (impossible 2+ checkmates but rare)
+            (0, 1) => true,        // K+B vs K or K vs K+B
+            (0, 2) => {
+                // K+B vs K+B: draw if bishops on same color
+                if w_bishops.is_empty() || b_bishops.is_empty() {
+                    return true;
+                }
+                let w_sq = w_bishops.lsb();
+                let b_sq = b_bishops.lsb();
+                let w_color = (w_sq.file() + w_sq.rank()) & 1;
+                let b_color = (b_sq.file() + b_sq.rank()) & 1;
+                w_color == b_color
+            }
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_draw(&self) -> bool {
+        self.halfmove_clock >= 100 || self.has_insufficient_material()
+    }
+
+    #[inline(always)]
     pub fn is_repetition(&self) -> bool {
         let count = self.history.len();
         if count < 4 || self.halfmove_clock < 4 {
@@ -339,6 +393,7 @@ impl Board {
         self.side_to_move = !self.side_to_move;
         self.hash ^= side_key();
         self.halfmove_clock = 0;
+        self.tt_hash = self.hash ^ fiftymove_key(0);
 
         undo
     }
@@ -350,6 +405,7 @@ impl Board {
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
+        self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
         self.accumulator = undo.accumulator;
     }
@@ -501,6 +557,7 @@ impl Board {
         }
         self.side_to_move = them;
         self.hash ^= side_key();
+        self.refresh_tt_hash();
 
         undo
     }
@@ -556,6 +613,7 @@ impl Board {
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
+        self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
         self.accumulator = undo.accumulator;
     }

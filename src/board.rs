@@ -2,7 +2,7 @@ use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks,
 use crate::bitboard::Bitboard;
 use crate::nnue::Accumulator;
 use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB};
-use crate::zobrist::{castling_key, ep_key, piece_key, side_key};
+use crate::zobrist::{castling_key, ep_key, fiftymove_key, piece_key, side_key};
 
 pub const STARTING_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -87,7 +87,9 @@ impl Board {
     }
 
     pub fn refresh_accumulator_side(&mut self, color: Color) {
-        self.accumulator.refresh_side(self, color);
+        let piece_on = self.piece_on;
+        let ksq = self.king_square(color);
+        self.accumulator.refresh_side(&piece_on, ksq, color);
     }
 
     pub fn from_fen(fen: &str) -> Result<Self, String> {

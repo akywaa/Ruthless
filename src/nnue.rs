@@ -124,14 +124,13 @@ impl Accumulator {
         self.remove_feature_side(piece, sq, b_ksq, Color::Black);
     }
 
-    pub fn refresh_side(&mut self, board: &Board, color: Color) {
+    pub fn refresh_side(&mut self, piece_on: &[Piece; 64], ksq: Square, color: Color) {
         let net = network();
         let side = color as usize;
         self.vals[side] = net.feature_bias.vals;
-        let ksq = board.king_square(color);
 
         for sq in 0..64 {
-            let piece = board.piece_on[sq];
+            let piece = piece_on[sq];
             if piece != Piece::None {
                 self.add_feature_side(piece, Square::new(sq as u8), ksq, color);
             }

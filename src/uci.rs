@@ -4,7 +4,7 @@ use crate::search::Searcher;
 use crate::tt::TranspositionTable;
 use crate::types::Color;
 use std::io::{self, BufRead};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub fn uci_loop() {

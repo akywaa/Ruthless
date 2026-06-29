@@ -54,6 +54,7 @@ pub struct Searcher {
     played_pieces: [Piece; MAX_PLY],
     prev_in_check: [bool; MAX_PLY],
     prev_is_capture: [bool; MAX_PLY],
+    eval_stack: [i32; MAX_PLY],
 }
 
 fn score_to_tt(score: i32, ply: u8) -> i32 {
@@ -104,6 +105,7 @@ impl Searcher {
             played_pieces: [Piece::None; MAX_PLY],
             prev_in_check: [false; MAX_PLY],
             prev_is_capture: [false; MAX_PLY],
+            eval_stack: [0; MAX_PLY],
         }
     }
 
@@ -121,6 +123,7 @@ impl Searcher {
         self.played_pieces = [Piece::None; MAX_PLY];
         self.prev_in_check = [false; MAX_PLY];
         self.prev_is_capture = [false; MAX_PLY];
+        self.eval_stack = [0; MAX_PLY];
     }
 
     #[inline(always)]
@@ -220,7 +223,7 @@ impl Searcher {
                 let mut beta = (score + delta).min(INFINITY);
 
                 loop {
-                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL);
+                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false);
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -241,7 +244,7 @@ impl Searcher {
                     }
                 }
             } else {
-                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL);
+                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false);
             }
 
             if self.stop.load(Ordering::Relaxed) {
@@ -330,7 +333,7 @@ impl Searcher {
                 let mut beta = (score + delta).min(INFINITY);
 
                 loop {
-                    score = self.negamax(board, depth, 0, alpha, beta, false, Move::NULL);
+                    score = self.negamax(board, depth, 0, alpha, beta, false, Move::NULL, false);
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -351,7 +354,7 @@ impl Searcher {
                     }
                 }
             } else {
-                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, false, Move::NULL);
+                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, false, Move::NULL, false);
             }
         }
     }
@@ -401,6 +404,7 @@ impl Searcher {
         beta: i32,
         is_pv: bool,
         excluded_move: Move,
+        cut_node: bool,
     ) -> i32 {
         self.check_time();
         if self.stop.load(Ordering::Relaxed) {
@@ -438,7 +442,7 @@ impl Searcher {
         let mut tt_flag = TTFlag::Exact;
         let mut has_tt = false;
 
-        if let Some(entry) = self.tt.probe(board.hash) {
+        if let Some(entry) = self.tt.probe(board.tt_hash) {
             has_tt = true;
             tt_score = score_from_tt(entry.score, ply);
             tt_depth = entry.depth;
@@ -463,9 +467,20 @@ impl Searcher {
         }
 
         let static_eval = self.corrected_eval(board);
+        if (ply as usize) < MAX_PLY {
+            self.eval_stack[ply as usize] = static_eval;
+        }
+
+        let improving = if in_check || ply < 2 {
+            false
+        } else {
+            static_eval > self.eval_stack[(ply - 2) as usize]
+        };
 
         if !is_pv && !in_check {
-            if depth <= 3 && static_eval - 85 * (depth as i32) >= beta {
+            // Reverse futility pruning
+            let rfp_margin = (75 - 15 * improving as i32) * (depth as i32);
+            if depth <= 7 && static_eval - rfp_margin >= beta {
                 return static_eval;
             }
 
@@ -477,10 +492,20 @@ impl Searcher {
                 }
             }
 
+            // Null move pruning
             if depth >= 3 && static_eval >= beta && board.has_non_pawn_material(board.side_to_move) {
-                let r = 2 + depth / 4;
+                let r = 3 + depth / 4 + ((static_eval - beta) / 128).clamp(0, 3) as u8 + improving as u8;
                 let undo = board.make_null_move();
-                let score = -self.negamax(board, depth.saturating_sub(r + 1), ply + 1, -beta, -beta + 1, false, Move::NULL);
+                let score = -self.negamax(
+                    board,
+                    depth.saturating_sub(r + 1),
+                    ply + 1,
+                    -beta,
+                    -beta + 1,
+                    false,
+                    Move::NULL,
+                    !cut_node,
+                );
                 board.undo_null_move(undo);
 
                 if score >= beta {
@@ -522,6 +547,7 @@ impl Searcher {
                         -probcut_beta + 1,
                         false,
                         Move::NULL,
+                        !cut_node,
                     );
                 }
 
@@ -557,6 +583,7 @@ impl Searcher {
                 singular_beta,
                 false,
                 tt_move,
+                cut_node,
             );
 
             if self.stop.load(Ordering::Relaxed) {
@@ -581,6 +608,8 @@ impl Searcher {
             } else if tt_score >= beta {
                 // Negative extension for non-singular moves failing high
                 extension = -1;
+            } else if cut_node {
+                extension = -2;
             }
         }
 
@@ -669,14 +698,14 @@ impl Searcher {
             }
 
             let undo = board.make_move(m);
+            let gives_check = board.in_check();
 
             let score = if moves_searched == 0 {
                 let next_depth = (depth as i32 - 1 + extension).max(1) as u8;
-                -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL)
+                -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, false)
             } else {
                 let mut r = 0;
 
-                // Dynamic late move reduction
                 if depth >= 3 && moves_searched >= 1 && (is_quiet || moves_searched >= 6) {
                     r = lmr(depth as usize, moves_searched);
 
@@ -684,17 +713,27 @@ impl Searcher {
                         r /= 2;
                     }
 
-                    // Adjust by move history
-                    let us = board.side_to_move as usize;
-                    let hist = self.history[us][m.from() as usize][m.to() as usize] + self.get_conthist(ply, m);
+                    if !improving {
+                        r += 1;
+                    }
 
-                    r -= hist / 512;
+                    if cut_node {
+                        r += 1;
+                    }
+
+                    if gives_check {
+                        r -= 1;
+                    }
+
+                    // Side to move was flipped by make_move, get mover's side
+                    let us = (!board.side_to_move) as usize;
+                    let hist = self.history[us][m.from() as usize][m.to() as usize] + self.get_conthist(ply, m);
+                    r -= (hist / 512).clamp(-2, 2);
 
                     if is_pv {
                         r -= 1;
                     }
 
-                    // Thread diversity for helper threads
                     if self.thread_id > 0 && ((moves_searched + self.thread_id) % 2 == 0) {
                         r += 1;
                     }
@@ -704,16 +743,14 @@ impl Searcher {
 
                 let reduced = (depth as i32 - 1 - r).max(1) as u8;
 
-                let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL);
+                let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL, true);
 
-                // Re-search at full depth if reduced search fails high
                 if s > alpha && reduced < depth - 1 {
-                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL);
+                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node);
                 }
 
-                // Full PV search
                 if s > alpha && s < beta {
-                    s = -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, true, Move::NULL);
+                    s = -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, true, Move::NULL, false);
                 }
 
                 s
@@ -846,15 +883,20 @@ impl Searcher {
             return 0;
         }
 
-        self.nodes += 1;
-        let in_check = board.in_check();
-
-        if !in_check && board.is_draw() {
+        if ply > 0 && (board.is_repetition() || board.halfmove_clock >= 100) {
             return 0;
         }
 
+        if (ply as usize) >= MAX_PLY {
+            return evaluate(board);
+        }
+
+        self.nodes += 1;
+        let in_check = board.in_check();
+
+        let mut stand_pat = -INFINITY;
         if !in_check {
-            let stand_pat = self.corrected_eval(board);
+            stand_pat = self.corrected_eval(board);
             if stand_pat >= beta {
                 return beta;
             }
@@ -876,6 +918,16 @@ impl Searcher {
             &self.prev_in_check,
             &self.prev_is_capture,
         ) {
+            // Prune captures that cannot realistically beat alpha
+            if !in_check && moves_searched > 0 && !see(board, m, alpha - stand_pat - 90) {
+                continue;
+            }
+
+            // Quiescence late move pruning
+            if !in_check && moves_searched >= 4 {
+                break;
+            }
+
             moves_searched += 1;
             let undo = board.make_move(m);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);

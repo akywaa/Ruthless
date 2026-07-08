@@ -22,6 +22,8 @@ pub fn see_value(board: &Board, m: Move) -> i32 {
 
     let target_pt = if move_type == MoveType::EnPassant {
         PieceType::Pawn
+    } else if board.piece_on[to] == Piece::None {
+        PieceType::None
     } else {
         board.piece_on[to].piece_type()
     };

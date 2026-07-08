@@ -13,5 +13,14 @@ mod uci;
 mod zobrist;
 
 fn main() {
-    uci::uci_loop();
+    std::panic::set_hook(Box::new(|info| {
+        let _ = std::fs::write("ruthless_panic.txt", format!("{info}"));
+    }));
+
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(uci::uci_loop)
+        .unwrap()
+        .join()
+        .unwrap();
 }

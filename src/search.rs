@@ -718,10 +718,9 @@ unsafe {
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
 
-        let lmp_threshold = 3 + 3 * (depth as usize) * (depth as usize);
-        let futility_margin = 120 * (depth as i32);
-        let futility_pruning =
-            !is_pv && !in_check && depth <= 3 && static_eval + futility_margin <= alpha;
+        let lmp_threshold = (3 + (depth as usize) * (depth as usize) / (1 + (!improving as usize))).max(3);
+        let futility_margin = (80 + 35 * depth as i32) * (depth as i32);
+        let futility_pruning = !is_pv && !in_check && depth <= 8 && (static_eval + futility_margin <= alpha);
 
         let mut quiet_moves = [Move::NULL; 64];
         let mut quiet_count = 0;
@@ -767,18 +766,15 @@ unsafe {
             let is_quiet = !is_capture && m.move_type() != MoveType::Promotion;
 
             if !is_pv && !in_check && moves_searched > 0 {
-                // Late Move Pruning
-                if is_quiet && depth <= 4 && moves_searched >= lmp_threshold {
+                if is_quiet && depth <= 8 && moves_searched >= lmp_threshold {
                     continue;
                 }
 
-                // Futility Pruning
                 if is_quiet && futility_pruning {
                     continue;
                 }
 
-                // Prune quiet moves with negative SEE
-                if is_quiet && depth <= 3 && !see(board, m, -30 * (depth as i32)) {
+                if is_quiet && depth <= 4 && !see(board, m, -25 * (depth as i32) * (depth as i32)) {
                     continue;
                 }
             }
@@ -1075,9 +1071,19 @@ unsafe {
             &self.prev_in_check,
             &self.prev_is_capture,
         ) {
-            // Prune captures that cannot realistically beat alpha
-            if !in_check && moves_searched > 0 && !see(board, m, alpha - stand_pat - 90) {
-                continue;
+            let is_promo = m.move_type() == MoveType::Promotion;
+            if moves_searched > 0 && !is_promo {
+                let cap_pt = match m.move_type() {
+                    MoveType::EnPassant => PieceType::Pawn,
+                    _ => board.piece_on[m.to()].piece_type(),
+                };
+                let gain = crate::eval::PIECE_VALUES[cap_pt as usize];
+                if stand_pat + gain + 200 < alpha {
+                    continue;
+                }
+                if !see(board, m, 0) {
+                    continue;
+                }
             }
 
             moves_searched += 1;

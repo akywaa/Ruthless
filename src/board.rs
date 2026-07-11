@@ -1,4 +1,4 @@
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks, between};
 use crate::bitboard::Bitboard;
 use crate::nnue::Accumulator;
 use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB};
@@ -301,6 +301,122 @@ impl Board {
     }
 
     #[inline(always)]
+    pub fn checkers(&self) -> Bitboard {
+        let ksq = self.king_square(self.side_to_move);
+        let them = !self.side_to_move;
+        let pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
+        let knights = self.pieces[Piece::new(them, PieceType::Knight)];
+        let bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
+            | self.pieces[Piece::new(them, PieceType::Queen)];
+        let rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
+            | self.pieces[Piece::new(them, PieceType::Queen)];
+        let king = self.pieces[Piece::new(them, PieceType::King)];
+        (pawn_attacks(self.side_to_move, ksq) & pawns)
+            | (knight_attacks(ksq) & knights)
+            | (bishop_attacks(ksq, self.occupied) & bishops_queens)
+            | (rook_attacks(ksq, self.occupied) & rooks_queens)
+            | (king_attacks(ksq) & king)
+    }
+
+    pub fn pinned_pieces(&self, color: Color) -> Bitboard {
+        let ksq = self.king_square(color);
+        let them = !color;
+        let mut pinned = Bitboard::EMPTY;
+        let mut sliders = self.pieces[Piece::new(them, PieceType::Bishop)]
+            | self.pieces[Piece::new(them, PieceType::Rook)]
+            | self.pieces[Piece::new(them, PieceType::Queen)];
+        while !sliders.is_empty() {
+            let sq = sliders.pop_lsb();
+            let between_sq = between(sq, ksq);
+            if between_sq.is_empty() {
+                continue;
+            }
+            let blockers = between_sq & self.occupied;
+            if blockers.count() == 1 {
+                pinned |= blockers & self.occupied_co[color];
+            }
+        }
+        pinned
+    }
+
+    pub fn is_legal(&self, m: Move) -> bool {
+        let us = self.side_to_move;
+        let them = !us;
+        let from = m.from();
+        let to = m.to();
+        let moving_piece = self.piece_on[from];
+        let ksq = self.king_square(us);
+
+        if m.move_type() == MoveType::Castling {
+            return true;
+        }
+
+        let checkers = self.checkers();
+        let num_checkers = checkers.count();
+
+        if num_checkers > 1 {
+            if moving_piece.piece_type() != PieceType::King {
+                return false;
+            }
+        } else if num_checkers == 1 && moving_piece.piece_type() != PieceType::King {
+            let checker_sq = checkers.lsb();
+            if !((between(ksq, checker_sq) | checkers).contains(to)) {
+                return false;
+            }
+        }
+
+        if moving_piece.piece_type() == PieceType::King {
+            let mut occ = self.occupied;
+            occ.clear(ksq);
+            occ.set(to);
+            let opp_pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
+            let opp_knights = self.pieces[Piece::new(them, PieceType::Knight)];
+            let opp_bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
+                | self.pieces[Piece::new(them, PieceType::Queen)];
+            let opp_rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
+                | self.pieces[Piece::new(them, PieceType::Queen)];
+            let opp_king = self.pieces[Piece::new(them, PieceType::King)];
+            return (pawn_attacks(us, to) & opp_pawns).is_empty()
+                && (knight_attacks(to) & opp_knights).is_empty()
+                && (bishop_attacks(to, occ) & opp_bishops_queens).is_empty()
+                && (rook_attacks(to, occ) & opp_rooks_queens).is_empty()
+                && (king_attacks(to) & opp_king).is_empty();
+        }
+
+        if m.move_type() == MoveType::EnPassant {
+            let cap_sq = Square::from_coords(to.file(), from.rank());
+            let mut occ = self.occupied;
+            occ.clear(from);
+            occ.clear(cap_sq);
+            occ.set(to);
+            let opp_pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
+            let opp_knights = self.pieces[Piece::new(them, PieceType::Knight)];
+            let opp_bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
+                | self.pieces[Piece::new(them, PieceType::Queen)];
+            let opp_rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
+                | self.pieces[Piece::new(them, PieceType::Queen)];
+            let opp_king = self.pieces[Piece::new(them, PieceType::King)];
+            return (pawn_attacks(us, ksq) & opp_pawns).is_empty()
+                && (knight_attacks(ksq) & opp_knights).is_empty()
+                && (bishop_attacks(ksq, occ) & opp_bishops_queens).is_empty()
+                && (rook_attacks(ksq, occ) & opp_rooks_queens).is_empty()
+                && (king_attacks(ksq) & opp_king).is_empty();
+        }
+
+        if self.pinned_pieces(us).contains(from) {
+            let from_rank = (from.rank() as i32) - (ksq.rank() as i32);
+            let from_file = (from.file() as i32) - (ksq.file() as i32);
+            let to_rank = (to.rank() as i32) - (ksq.rank() as i32);
+            let to_file = (to.file() as i32) - (ksq.file() as i32);
+            if from_rank * to_file != from_file * to_rank {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[inline(always)]
     pub fn has_non_pawn_material(&self, color: Color) -> bool {
         let knights = self.pieces[Piece::new(color, PieceType::Knight)];
         let bishops = self.pieces[Piece::new(color, PieceType::Bishop)];
@@ -411,6 +527,7 @@ impl Board {
         false
     }
 
+    #[allow(dead_code)]
     pub fn upcoming_repetition(&self) -> bool {
         let count = self.history.len();
         let max_steps = (self.halfmove_clock as usize).min(count);

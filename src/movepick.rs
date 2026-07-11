@@ -1,10 +1,11 @@
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, rook_attacks};
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
 use crate::movegen::{generate_noisy_pseudo, generate_quiet_pseudo};
 use crate::see::see;
-use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType};
+use crate::search::MAX_PLY;
+use crate::types::{Move, MoveList, MoveType, Piece, PieceType};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Stage {
@@ -65,23 +66,23 @@ impl MovePicker {
 
     pub fn next(
         &mut self,
-        board: &mut Board,
+        board: &Board,
         history: &[[[i32; 64]; 64]; 2],
         pawn_history: &[[[i32; 64]; 12]; 512],
         conthist: &[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4],
         noisy_history: &[[[[i32; 2]; 6]; 64]; 12],
         ply: u8,
-        played_pieces: &[Piece; 64],
-        played_moves: &[Move; 64],
-        prev_in_check: &[bool; 64],
-        prev_is_capture: &[bool; 64],
+        played_pieces: &[Piece; MAX_PLY],
+        played_moves: &[Move; MAX_PLY],
+        prev_in_check: &[bool; MAX_PLY],
+        prev_is_capture: &[bool; MAX_PLY],
     ) -> Option<Move> {
         loop {
             match self.stage {
                 Stage::TTMove => {
                     self.stage = Stage::GenerateNoisy;
                     let m = self.tt_move;
-                    if self.is_pseudo_legal_any(board, m) && self.is_legal(board, m) {
+                    if self.is_pseudo_legal_any(board, m) && board.is_legal(m) {
                         return Some(m);
                     }
                 }
@@ -100,7 +101,7 @@ impl MovePicker {
                         }
 
                         if see(board, m, 0) {
-                            if self.is_legal(board, m) {
+                            if board.is_legal(m) {
                                 return Some(m);
                             }
                         } else {
@@ -122,7 +123,7 @@ impl MovePicker {
                             && k != self.tt_move
                             && !(self.killer_idx == 2 && k == self.killers[0])
                             && self.is_pseudo_legal(board, k)
-                            && self.is_legal(board, k)
+                            && board.is_legal(k)
                         {
                             return Some(k);
                         }
@@ -137,7 +138,7 @@ impl MovePicker {
                         && cm != self.killers[0]
                         && cm != self.killers[1]
                         && self.is_pseudo_legal(board, cm)
-                        && self.is_legal(board, cm)
+                        && board.is_legal(cm)
                     {
                         return Some(cm);
                     }
@@ -165,7 +166,7 @@ impl MovePicker {
                         if m == self.tt_move || m == self.killers[0] || m == self.killers[1] || m == self.counter_move {
                             continue;
                         }
-                        if self.is_legal(board, m) {
+                        if board.is_legal(m) {
                             return Some(m);
                         }
                     }
@@ -176,7 +177,7 @@ impl MovePicker {
                     while self.cur_idx < self.bad_noisy.count {
                         let m = self.bad_noisy.moves[self.cur_idx];
                         self.cur_idx += 1;
-                        if m != self.tt_move && self.is_legal(board, m) {
+                        if m != self.tt_move && board.is_legal(m) {
                             return Some(m);
                         }
                     }
@@ -233,10 +234,10 @@ impl MovePicker {
         pawn_history: &[[[i32; 64]; 12]; 512],
         conthist: &[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4],
         ply: u8,
-        played_pieces: &[Piece; 64],
-        played_moves: &[Move; 64],
-        prev_in_check: &[bool; 64],
-        prev_is_capture: &[bool; 64],
+        played_pieces: &[Piece; MAX_PLY],
+        played_moves: &[Move; MAX_PLY],
+        prev_in_check: &[bool; MAX_PLY],
+        prev_is_capture: &[bool; MAX_PLY],
     ) {
         let us = board.side_to_move;
         let them = !us;
@@ -330,15 +331,6 @@ impl MovePicker {
         let mut quiets = MoveList::new();
         generate_quiet_pseudo(board, &mut quiets);
         quiets.as_slice().contains(&m)
-    }
-
-    fn is_legal(&self, board: &mut Board, m: Move) -> bool {
-        let us = board.side_to_move;
-        let undo = board.make_move(m);
-        let ksq = board.king_square(us);
-        let legal = !board.is_square_attacked(ksq, board.side_to_move);
-        board.undo_move(m, undo);
-        legal
     }
 
     fn is_pseudo_legal_any(&self, board: &Board, m: Move) -> bool {

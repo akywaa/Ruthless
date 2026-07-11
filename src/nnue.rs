@@ -226,12 +226,14 @@ pub fn evaluate(board: &Board) -> i32 {
 #[target_feature(enable = "avx2")]
 unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
     use std::arch::x86_64::*;
-    let a_ptr = acc.as_mut_ptr() as *mut __m256i;
-    let w_ptr = weights.as_ptr() as *const __m256i;
-    for i in 0..(HIDDEN_SIZE / 16) {
-        let va = _mm256_load_si256(a_ptr.add(i));
-        let vw = _mm256_load_si256(w_ptr.add(i));
-        _mm256_store_si256(a_ptr.add(i), _mm256_add_epi16(va, vw));
+    unsafe {
+        let a_ptr = acc.as_mut_ptr() as *mut __m256i;
+        let w_ptr = weights.as_ptr() as *const __m256i;
+        for i in 0..(HIDDEN_SIZE / 16) {
+            let va = _mm256_load_si256(a_ptr.add(i));
+            let vw = _mm256_load_si256(w_ptr.add(i));
+            _mm256_store_si256(a_ptr.add(i), _mm256_add_epi16(va, vw));
+        }
     }
 }
 
@@ -239,12 +241,14 @@ unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
 #[target_feature(enable = "avx2")]
 unsafe fn vec_sub_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
     use std::arch::x86_64::*;
-    let a_ptr = acc.as_mut_ptr() as *mut __m256i;
-    let w_ptr = weights.as_ptr() as *const __m256i;
-    for i in 0..(HIDDEN_SIZE / 16) {
-        let va = _mm256_load_si256(a_ptr.add(i));
-        let vw = _mm256_load_si256(w_ptr.add(i));
-        _mm256_store_si256(a_ptr.add(i), _mm256_sub_epi16(va, vw));
+    unsafe {
+        let a_ptr = acc.as_mut_ptr() as *mut __m256i;
+        let w_ptr = weights.as_ptr() as *const __m256i;
+        for i in 0..(HIDDEN_SIZE / 16) {
+            let va = _mm256_load_si256(a_ptr.add(i));
+            let vw = _mm256_load_si256(w_ptr.add(i));
+            _mm256_store_si256(a_ptr.add(i), _mm256_sub_epi16(va, vw));
+        }
     }
 }
 
@@ -259,27 +263,29 @@ unsafe fn evaluate_avx2(
 ) -> i32 {
     use std::arch::x86_64::*;
 
-    let zero = _mm256_setzero_si256();
-    let qa = _mm256_set1_epi16(QA);
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let qa = _mm256_set1_epi16(QA);
 
-    let mut sum_vec = _mm256_setzero_si256();
+        let mut sum_vec = _mm256_setzero_si256();
 
-    forward_side_avx2(&acc.vals[us], &net.output_weights[bucket][0..HIDDEN_SIZE], zero, qa, &mut sum_vec);
-    forward_side_avx2(&acc.vals[them], &net.output_weights[bucket][HIDDEN_SIZE..2 * HIDDEN_SIZE], zero, qa, &mut sum_vec);
+        forward_side_avx2(&acc.vals[us], &net.output_weights[bucket][0..HIDDEN_SIZE], zero, qa, &mut sum_vec);
+        forward_side_avx2(&acc.vals[them], &net.output_weights[bucket][HIDDEN_SIZE..2 * HIDDEN_SIZE], zero, qa, &mut sum_vec);
 
-    let low128 = _mm256_castsi256_si128(sum_vec);
-    let high128 = _mm256_extracti128_si256(sum_vec, 1);
-    let sum128 = _mm_add_epi32(low128, high128);
-    let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b01_00_11_10));
-    let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0b00_00_00_01));
-    let mut output = _mm_cvtsi128_si32(sum32);
+        let low128 = _mm256_castsi256_si128(sum_vec);
+        let high128 = _mm256_extracti128_si256(sum_vec, 1);
+        let sum128 = _mm_add_epi32(low128, high128);
+        let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b01_00_11_10));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0b00_00_00_01));
+        let mut output = _mm_cvtsi128_si32(sum32);
 
-    output /= i32::from(QA);
-    output += i32::from(net.output_bias[bucket]);
-    output *= SCALE;
-    output /= i32::from(QA) * i32::from(QB);
+        output /= i32::from(QA);
+        output += i32::from(net.output_bias[bucket]);
+        output *= SCALE;
+        output /= i32::from(QA) * i32::from(QB);
 
-    output
+        output
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -293,30 +299,32 @@ unsafe fn forward_side_avx2(
 ) {
     use std::arch::x86_64::*;
 
-    let v_ptr = vals.as_ptr() as *const __m256i;
-    let w_ptr = weights.as_ptr() as *const __m256i;
+    unsafe {
+        let v_ptr = vals.as_ptr() as *const __m256i;
+        let w_ptr = weights.as_ptr() as *const __m256i;
 
-    for i in 0..(HIDDEN_SIZE / 16) {
-        let v = _mm256_load_si256(v_ptr.add(i));
-        let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa);
+        for i in 0..(HIDDEN_SIZE / 16) {
+            let v = _mm256_load_si256(v_ptr.add(i));
+            let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa);
 
-        let low_16 = _mm256_castsi256_si128(clamped);
-        let high_16 = _mm256_extracti128_si256(clamped, 1);
+            let low_16 = _mm256_castsi256_si128(clamped);
+            let high_16 = _mm256_extracti128_si256(clamped, 1);
 
-        let y_low = _mm256_cvtepi16_epi32(low_16);
-        let y_high = _mm256_cvtepi16_epi32(high_16);
+            let y_low = _mm256_cvtepi16_epi32(low_16);
+            let y_high = _mm256_cvtepi16_epi32(high_16);
 
-        let sq_low = _mm256_mullo_epi32(y_low, y_low);
-        let sq_high = _mm256_mullo_epi32(y_high, y_high);
+            let sq_low = _mm256_mullo_epi32(y_low, y_low);
+            let sq_high = _mm256_mullo_epi32(y_high, y_high);
 
-        let w = _mm256_loadu_si256(w_ptr.add(i));
-        let w_low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(w));
-        let w_high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(w, 1));
+            let w = _mm256_loadu_si256(w_ptr.add(i));
+            let w_low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(w));
+            let w_high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(w, 1));
 
-        let p_low = _mm256_mullo_epi32(sq_low, w_low);
-        let p_high = _mm256_mullo_epi32(sq_high, w_high);
+            let p_low = _mm256_mullo_epi32(sq_low, w_low);
+            let p_high = _mm256_mullo_epi32(sq_high, w_high);
 
-        *sum_vec = _mm256_add_epi32(*sum_vec, p_low);
-        *sum_vec = _mm256_add_epi32(*sum_vec, p_high);
+            *sum_vec = _mm256_add_epi32(*sum_vec, p_low);
+            *sum_vec = _mm256_add_epi32(*sum_vec, p_high);
+        }
     }
 }

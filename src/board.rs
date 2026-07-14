@@ -25,7 +25,6 @@ pub struct UndoState {
     pub captured: Piece,
     pub hash: u64,
     pub non_pawn_hash: [u64; 2],
-    pub accumulator: Accumulator,
 }
 
 #[derive(Clone)]
@@ -527,7 +526,6 @@ impl Board {
         false
     }
 
-    #[allow(dead_code)]
     pub fn upcoming_repetition(&self) -> bool {
         let count = self.history.len();
         let max_steps = (self.halfmove_clock as usize).min(count);
@@ -578,7 +576,6 @@ impl Board {
             captured: Piece::None,
             hash: self.hash,
             non_pawn_hash: self.non_pawn_hash,
-            accumulator: self.accumulator,
         };
 
         self.history.push(self.hash);
@@ -605,7 +602,6 @@ impl Board {
         self.hash = undo.hash;
         self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
-        self.accumulator = undo.accumulator;
     }
 
     pub fn make_move(&mut self, m: Move) -> UndoState {
@@ -626,7 +622,6 @@ impl Board {
             captured: self.piece_on[to],
             hash: self.hash,
             non_pawn_hash: self.non_pawn_hash,
-            accumulator: self.accumulator,
         };
 
         self.history.push(self.hash);
@@ -813,12 +808,101 @@ impl Board {
         self.hash = undo.hash;
         self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
-        self.accumulator = undo.accumulator;
+
+        let them = !us;
+        let is_king_move = moved_piece.piece_type() == PieceType::King;
+
+        if is_king_move {
+            let ksq_them = self.king_square(them);
+            match move_type {
+                MoveType::Castling => {
+                    let (rook_from, rook_to) = match to {
+                        Square::G1 => (Square::H1, Square::F1),
+                        Square::C1 => (Square::A1, Square::D1),
+                        Square::G8 => (Square::H8, Square::F8),
+                        Square::C8 => (Square::A8, Square::D8),
+                        _ => unreachable!(),
+                    };
+                    let rook = self.piece_on[rook_from];
+                    self.accumulator.add_feature_side(moved_piece, from, ksq_them, them);
+                    self.accumulator.remove_feature_side(moved_piece, to, ksq_them, them);
+                    self.accumulator.add_feature_side(rook, rook_from, ksq_them, them);
+                    self.accumulator.remove_feature_side(rook, rook_to, ksq_them, them);
+                }
+                _ => {
+                    self.accumulator.add_feature_side(moved_piece, from, ksq_them, them);
+                    self.accumulator.remove_feature_side(moved_piece, to, ksq_them, them);
+                    if undo.captured != Piece::None {
+                        self.accumulator.add_feature_side(undo.captured, to, ksq_them, them);
+                    }
+                }
+            }
+            self.refresh_accumulator_side(us);
+        } else {
+            let w_ksq = self.king_square(Color::White);
+            let b_ksq = self.king_square(Color::Black);
+            match move_type {
+                MoveType::EnPassant => {
+                    let cap_sq = Square::from_coords(to.file(), from.rank());
+                    let cap_pawn = Piece::new(them, PieceType::Pawn);
+                    self.accumulator.remove_feature(moved_piece, to, w_ksq, b_ksq);
+                    self.accumulator.add_feature(cap_pawn, cap_sq, w_ksq, b_ksq);
+                    self.accumulator.add_feature(moved_piece, from, w_ksq, b_ksq);
+                }
+                MoveType::Promotion => {
+                    let pawn = Piece::new(us, PieceType::Pawn);
+                    self.accumulator.remove_feature(moved_piece, to, w_ksq, b_ksq);
+                    if undo.captured != Piece::None {
+                        self.accumulator.add_feature(undo.captured, to, w_ksq, b_ksq);
+                    }
+                    self.accumulator.add_feature(pawn, from, w_ksq, b_ksq);
+                }
+                _ => {
+                    self.accumulator.remove_feature(moved_piece, to, w_ksq, b_ksq);
+                    if undo.captured != Piece::None {
+                        self.accumulator.add_feature(undo.captured, to, w_ksq, b_ksq);
+                    }
+                    self.accumulator.add_feature(moved_piece, from, w_ksq, b_ksq);
+                }
+            }
+        }
     }
 }
 
 impl Default for Board {
     fn default() -> Self {
         Self::from_fen(STARTING_FEN).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::movegen::generate_legal_moves;
+
+    #[test]
+    fn accumulator_roundtrip_random_walk() {
+        let mut board = Board::default();
+        let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
+        for _ in 0..400 {
+            let moves = generate_legal_moves(&mut board);
+            if moves.count == 0 {
+                break;
+            }
+            for &m in moves.as_slice() {
+                let before = board.accumulator.vals;
+                let undo = board.make_move(m);
+                let mut check = board.clone();
+                check.refresh_accumulator();
+                assert_eq!(board.accumulator.vals, check.accumulator.vals, "make mismatch on {}", m);
+                board.undo_move(m, undo);
+                assert_eq!(board.accumulator.vals, before, "undo mismatch on {}", m);
+            }
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let pick = (rng as usize) % moves.count;
+            board.make_move(moves.moves[pick]);
+        }
     }
 }

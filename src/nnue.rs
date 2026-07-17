@@ -222,6 +222,92 @@ pub fn evaluate(board: &Board) -> i32 {
     output
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::Board;
+
+    fn eval_ordering(board: &Board, swap: bool) -> i32 {
+        let net = network();
+        let us = board.side_to_move as usize;
+        let them = (!board.side_to_move) as usize;
+        let bucket = output_bucket(board);
+        let (a, b) = if swap { (them, us) } else { (us, them) };
+        let mut output = 0i32;
+        for i in 0..HIDDEN_SIZE {
+            output += screlu(board.accumulator.vals[a][i]) * i32::from(net.output_weights[bucket][i]);
+        }
+        for i in 0..HIDDEN_SIZE {
+            output += screlu(board.accumulator.vals[b][i]) * i32::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+        }
+        output /= i32::from(QA);
+        output += i32::from(net.output_bias[bucket]);
+        output *= SCALE;
+        output /= i32::from(QA) * i32::from(QB);
+        output
+    }
+
+    #[test]
+    fn debug_eval_orderings() {
+        let cases = [
+            ("K vs K w", "4k3/8/8/8/8/8/8/4K3 w - - 0 1"),
+            ("K w vs K b", "4k3/8/8/8/8/8/8/4K3 b - - 0 1"),
+            ("K+Q w", "4k3/8/8/8/8/8/3Q4/4K3 w - - 0 1"),
+            ("K+q w", "4k3/8/8/8/8/8/3q4/4K3 w - - 0 1"),
+            ("K+R w", "4k3/8/8/8/8/8/3R4/4K3 w - - 0 1"),
+            ("K+r w", "4k3/8/8/8/8/8/3r4/4K3 w - - 0 1"),
+            ("K+P w", "4k3/8/8/8/8/8/3P4/4K3 w - - 0 1"),
+            ("K+p w", "4k3/8/8/8/8/8/3p4/4K3 w - - 0 1"),
+            ("startpos w", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+        ];
+        for (name, fen) in cases {
+            let board = Board::from_fen(fen).unwrap();
+            println!(
+                "{}: normal={} swapped={}",
+                name,
+                eval_ordering(&board, false),
+                eval_ordering(&board, true)
+            );
+        }
+
+        let net = network();
+        let k = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let kq = Board::from_fen("4k3/8/8/8/8/8/3Q4/4K3 w - - 0 1").unwrap();
+        let changed = k.accumulator.vals[0]
+            .iter()
+            .zip(kq.accumulator.vals[0].iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("hidden units changed by adding white Q: {}", changed);
+        let mut ow_max = 0i32;
+        let mut ow_gt100 = 0usize;
+        for b in 0..NUM_OUTPUT_BUCKETS {
+            for &w in net.output_weights[b].iter() {
+                let a = (w as i32).abs();
+                ow_max = ow_max.max(a);
+                if a > 100 {
+                    ow_gt100 += 1;
+                }
+            }
+        }
+        println!("output_weights: maxabs={} count>100={} total={}", ow_max, ow_gt100, NUM_OUTPUT_BUCKETS * 2 * HIDDEN_SIZE);
+        let mut fw_max = 0i32;
+        let mut fw_mean = 0i64;
+        let mut fw_count = 0i64;
+        for f in 0..768 * NUM_INPUT_BUCKETS {
+            for &w in net.feature_weights[f].vals.iter() {
+                let a = (w as i32).abs();
+                fw_max = fw_max.max(a);
+                fw_mean += a as i64;
+                fw_count += 1;
+            }
+        }
+        println!("feature_weights: maxabs={} meanabs={}", fw_max, fw_mean / fw_count);
+        println!("output_bias = {:?}", net.output_bias);
+        println!("feature_bias[0..6] = {:?}", &net.feature_bias.vals[0..6]);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {

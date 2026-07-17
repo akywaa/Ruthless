@@ -879,6 +879,41 @@ impl Default for Board {
 mod tests {
     use super::*;
     use crate::movegen::generate_legal_moves;
+    use crate::nnue::evaluate;
+
+    fn play(board: &mut Board, s: &str) {
+        let moves = generate_legal_moves(board);
+        for &m in moves.as_slice() {
+            if m.to_string() == s {
+                board.make_move(m);
+                return;
+            }
+        }
+        panic!("move not found: {}", s);
+    }
+
+    #[test]
+    fn debug_game_position() {
+        let mut board = Board::default();
+        for s in [
+            "e2e4", "g8f6", "e4e5", "b8c6", "e5f6", "e7f6", "d2d4", "d7d5",
+            "f1b5", "f8b4", "c1d2", "e8g8", "d2b4", "c6d4", "d1d4", "c8h3",
+            "g2h3", "f8e8", "b5e8", "c7c5", "d4c5", "d8e8", "g1e2", "e8e6", "b1c3",
+        ] {
+            play(&mut board, s);
+        }
+        println!("side_to_move = {:?}", board.side_to_move);
+        println!("eval (side to move) = {}", evaluate(&board));
+        println!("is_draw = {}", board.is_draw());
+        println!("upcoming_repetition = {}", board.upcoming_repetition());
+        println!("is_repetition = {}", board.is_repetition());
+        println!("halfmove = {}", board.halfmove_clock);
+
+        let start = Board::default();
+        println!("eval startpos (white to move) = {}", evaluate(&start));
+        let noq = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1").unwrap();
+        println!("eval white-no-queen (white to move) = {}", evaluate(&noq));
+    }
 
     #[test]
     fn accumulator_roundtrip_random_walk() {

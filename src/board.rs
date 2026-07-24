@@ -320,17 +320,16 @@ impl Board {
     pub fn pinned_pieces(&self, color: Color) -> Bitboard {
         let ksq = self.king_square(color);
         let them = !color;
-        let mut pinned = Bitboard::EMPTY;
-        let mut sliders = self.pieces[Piece::new(them, PieceType::Bishop)]
-            | self.pieces[Piece::new(them, PieceType::Rook)]
+        let bq = self.pieces[Piece::new(them, PieceType::Bishop)]
             | self.pieces[Piece::new(them, PieceType::Queen)];
+        let rq = self.pieces[Piece::new(them, PieceType::Rook)]
+            | self.pieces[Piece::new(them, PieceType::Queen)];
+        let mut sliders = (bishop_attacks(ksq, Bitboard::EMPTY) & bq)
+            | (rook_attacks(ksq, Bitboard::EMPTY) & rq);
+        let mut pinned = Bitboard::EMPTY;
         while !sliders.is_empty() {
             let sq = sliders.pop_lsb();
-            let between_sq = between(sq, ksq);
-            if between_sq.is_empty() {
-                continue;
-            }
-            let blockers = between_sq & self.occupied;
+            let blockers = between(sq, ksq) & self.occupied;
             if blockers.count() == 1 {
                 pinned |= blockers & self.occupied_co[color];
             }
@@ -359,7 +358,9 @@ impl Board {
             }
         } else if num_checkers == 1 && moving_piece.piece_type() != PieceType::King {
             let checker_sq = checkers.lsb();
-            if !((between(ksq, checker_sq) | checkers).contains(to)) {
+            let ep_takes_checker = m.move_type() == MoveType::EnPassant
+                && Square::from_coords(to.file(), from.rank()) == checker_sq;
+            if !ep_takes_checker && !((between(ksq, checker_sq) | checkers).contains(to)) {
                 return false;
             }
         }
@@ -704,38 +705,7 @@ impl Board {
         }
 
         if is_king_move {
-            let old_bucket = match us {
-                Color::White => crate::nnue::king_bucket(from),
-                Color::Black => crate::nnue::king_bucket(Square::new((from as u8) ^ 56)),
-            };
-            let new_bucket = match us {
-                Color::White => crate::nnue::king_bucket(to),
-                Color::Black => crate::nnue::king_bucket(Square::new((to as u8) ^ 56)),
-            };
-
-            if old_bucket != new_bucket || ((from.file() > 3) != (to.file() > 3)) {
-                self.refresh_accumulator_side(us);
-            } else {
-                // Same bucket: update our side incrementally
-                self.accumulator.remove_feature_side(moving_piece, from, to, us);
-                if undo.captured != Piece::None {
-                    self.accumulator.remove_feature_side(undo.captured, to, to, us);
-                }
-                self.accumulator.add_feature_side(moving_piece, to, to, us);
-
-                if move_type == MoveType::Castling {
-                    let (rook_from, rook_to) = match to {
-                        Square::G1 => (Square::H1, Square::F1),
-                        Square::C1 => (Square::A1, Square::D1),
-                        Square::G8 => (Square::H8, Square::F8),
-                        Square::C8 => (Square::A8, Square::D8),
-                        _ => unreachable!(),
-                    };
-                    let rook = self.piece_on[rook_to];
-                    self.accumulator.remove_feature_side(rook, rook_from, to, us);
-                    self.accumulator.add_feature_side(rook, rook_to, to, us);
-                }
-            }
+            self.refresh_accumulator_side(us);
         }
 
         let new_castling = self.castling_rights & CASTLING_RIGHTS_MASK[from as usize] & CASTLING_RIGHTS_MASK[to as usize];
@@ -878,8 +848,15 @@ impl Default for Board {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::movegen::generate_legal_moves;
+    use crate::movegen::{generate_legal_moves, generate_noisy_pseudo, generate_quiet_pseudo};
     use crate::nnue::evaluate;
+
+    fn pseudo_legal(board: &Board) -> crate::types::MoveList {
+        let mut list = crate::types::MoveList::new();
+        generate_noisy_pseudo(board, &mut list);
+        generate_quiet_pseudo(board, &mut list);
+        list
+    }
 
     fn play(board: &mut Board, s: &str) {
         let moves = generate_legal_moves(board);
@@ -939,5 +916,64 @@ mod tests {
             let pick = (rng as usize) % moves.count;
             board.make_move(moves.moves[pick]);
         }
+    }
+
+    #[test]
+    fn is_legal_matches_make_unmake() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            "r4rk1/1pp4p/p1pb4/4P3/8/1P3N2/PBP2PPP/R5K1 w - - 0 1",
+            "1r4k1/3q1ppp/p3bn2/2pP4/2P1B3/1P6/P4PPP/2R1Q1K1 w - - 0 1",
+        ];
+
+        for fen in fens {
+            let mut board = Board::from_fen(fen).unwrap();
+            let moves = pseudo_legal(&board);
+            assert!(!moves.as_slice().is_empty(), "no moves generated from {}", fen);
+
+            for &m in moves.as_slice() {
+                let us = board.side_to_move;
+                let rule = board.is_legal(m);
+                let undo = board.make_move(m);
+                let our_ksq = board.king_square(us);
+                let still_legal = !board.is_square_attacked(our_ksq, board.side_to_move);
+                board.undo_move(m, undo);
+
+                assert_eq!(rule, still_legal, "is_legal mismatch on {} in {}", m, fen);
+            }
+        }
+    }
+
+    #[test]
+    fn perft() {
+        let cases: [(&str, u32, u64); 3] = [
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 4, 197_281),
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 4, 43_238),
+            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 3, 97_862),
+        ];
+
+        for (fen, depth, expected) in cases {
+            let mut board = Board::from_fen(fen).unwrap();
+            let nodes = perft_impl(&mut board, depth);
+            assert_eq!(nodes, expected, "perft mismatch for FEN {}", fen);
+        }
+    }
+
+    fn perft_impl(board: &mut Board, depth: u32) -> u64 {
+        let moves = generate_legal_moves(board);
+        if depth <= 1 {
+            return moves.count as u64;
+        }
+        let mut nodes = 0;
+        for &m in moves.as_slice() {
+            let undo = board.make_move(m);
+            nodes += perft_impl(board, depth - 1);
+            board.undo_move(m, undo);
+        }
+        nodes
     }
 }

@@ -196,10 +196,12 @@ unsafe {
         let w_np_idx = (board.non_pawn_hash[0] as usize) & (CORR_ENTRIES - 1);
         let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
 
-        let mut bonus = self.pawn_corr[bucket][side][p_idx] as i32
-            + self.non_pawn_corr[bucket][0][side][w_np_idx] as i32
-            + self.non_pawn_corr[bucket][1][side][b_np_idx] as i32;
+        let pawn_term = self.pawn_corr[bucket][side][p_idx] as i32 * 12;
+        let np_term = (self.non_pawn_corr[bucket][0][side][w_np_idx] as i32
+            + self.non_pawn_corr[bucket][1][side][b_np_idx] as i32)
+            * 9;
 
+        let mut cont_term = 0i32;
         let ply_idx = ply as usize;
         if ply_idx >= 1 {
             let p1_piece = self.played_pieces[ply_idx - 1];
@@ -210,7 +212,7 @@ unsafe {
                     let p2_piece = self.played_pieces[ply_idx - 2];
                     let p2_move = self.played_moves[ply_idx - 2];
                     if p2_piece != Piece::None && p2_move != Move::NULL {
-                        bonus += self.cont_corr[p2_piece as usize][p2_move.to() as usize]
+                        cont_term += self.cont_corr[p2_piece as usize][p2_move.to() as usize]
                             [p1_piece as usize][p1_move.to() as usize] as i32;
                     }
                 }
@@ -218,14 +220,18 @@ unsafe {
                     let p4_piece = self.played_pieces[ply_idx - 4];
                     let p4_move = self.played_moves[ply_idx - 4];
                     if p4_piece != Piece::None && p4_move != Move::NULL {
-                        bonus += self.cont_corr[p4_piece as usize][p4_move.to() as usize]
+                        cont_term += self.cont_corr[p4_piece as usize][p4_move.to() as usize]
                             [p1_piece as usize][p1_move.to() as usize] as i32;
                     }
                 }
             }
         }
+        cont_term *= 7;
 
-        let mut eval = raw + bonus / 64;
+        let total_bonus = (pawn_term + np_term + cont_term) / (8 * 64);
+        let clamped_bonus = total_bonus.clamp(-200, 200);
+
+        let mut eval = raw + clamped_bonus;
 
         // Scale evaluation towards draw near 50-move rule
         eval = eval * (200 - board.halfmove_clock as i32) / 200;
@@ -1043,7 +1049,7 @@ unsafe {
                 && !(flag == TTFlag::LowerBound && best_score <= static_eval)
                 && !(flag == TTFlag::UpperBound && best_score >= static_eval)
             {
-                let bonus = ((best_score - static_eval) * (depth as i32)).clamp(-1600, 1600);
+                let bonus = ((best_score - static_eval) * (depth as i32)).clamp(-1200, 1200);
                 let side = board.side_to_move as usize;
                 let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
 
@@ -1051,12 +1057,10 @@ unsafe {
                 let w_np_idx = (board.non_pawn_hash[0] as usize) & (CORR_ENTRIES - 1);
                 let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
 
-                let main_bonus = bonus / 3;
-                update_corr(&mut self.pawn_corr[bucket][side][p_idx], main_bonus);
-                update_corr(&mut self.non_pawn_corr[bucket][0][side][w_np_idx], main_bonus);
-                update_corr(&mut self.non_pawn_corr[bucket][1][side][b_np_idx], main_bonus);
+                update_corr(&mut self.pawn_corr[bucket][side][p_idx], bonus);
+                update_corr(&mut self.non_pawn_corr[bucket][0][side][w_np_idx], bonus);
+                update_corr(&mut self.non_pawn_corr[bucket][1][side][b_np_idx], bonus);
 
-                let cont_bonus = bonus / 3;
                 let ply_idx = ply as usize;
                 if ply_idx >= 1 {
                     let p1_piece = self.played_pieces[ply_idx - 1];
@@ -1070,7 +1074,7 @@ unsafe {
                                 update_corr(
                                     &mut self.cont_corr[p2_piece as usize][p2_move.to() as usize]
                                         [p1_piece as usize][p1_move.to() as usize],
-                                    cont_bonus,
+                                    bonus,
                                 );
                             }
                         }
@@ -1081,7 +1085,7 @@ unsafe {
                                 update_corr(
                                     &mut self.cont_corr[p4_piece as usize][p4_move.to() as usize]
                                         [p1_piece as usize][p1_move.to() as usize],
-                                    cont_bonus,
+                                    bonus,
                                 );
                             }
                         }

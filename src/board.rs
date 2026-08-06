@@ -425,6 +425,16 @@ impl Board {
         !(knights | bishops | rooks | queens).is_empty()
     }
 
+    #[inline(always)]
+    pub fn non_pawn_material(&self) -> i32 {
+        let knights = (self.pieces[Piece::WhiteKnight] | self.pieces[Piece::BlackKnight]).count() as i32;
+        let bishops = (self.pieces[Piece::WhiteBishop] | self.pieces[Piece::BlackBishop]).count() as i32;
+        let rooks = (self.pieces[Piece::WhiteRook] | self.pieces[Piece::BlackRook]).count() as i32;
+        let queens = (self.pieces[Piece::WhiteQueen] | self.pieces[Piece::BlackQueen]).count() as i32;
+
+        knights * 320 + bishops * 330 + rooks * 500 + queens * 900
+    }
+
     pub fn draw_by_material(&self) -> bool {
         let pawns = self.pieces[Piece::WhitePawn] | self.pieces[Piece::BlackPawn];
         let rooks = self.pieces[Piece::WhiteRook] | self.pieces[Piece::BlackRook];

@@ -261,6 +261,11 @@ unsafe {
     }
 
     #[inline(always)]
+    fn draw_score(&self) -> i32 {
+        (self.nodes as i32 & 3) - 2
+    }
+
+    #[inline(always)]
     fn quiet_history_score(&self, board: &Board, ply: u8, m: Move) -> i32 {
         let us = board.side_to_move as usize;
         let piece = board.piece_on[m.from()];
@@ -588,7 +593,7 @@ unsafe {
         }
 
         if ply > 0 && board.is_draw() {
-            return 0;
+            return self.draw_score();
         }
 
         if (ply as usize) >= MAX_PLY {
@@ -1149,7 +1154,7 @@ unsafe {
         }
 
         if ply > 0 && (board.is_repetition() || board.halfmove_clock >= 100) {
-            return 0;
+            return self.draw_score();
         }
 
         if (ply as usize) >= MAX_PLY {

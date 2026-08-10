@@ -1161,13 +1161,29 @@ unsafe {
             return evaluate(board);
         }
 
-        self.nodes += 1;
         let in_check = board.in_check();
+        let alpha_orig = alpha;
+        let mut tt_move = Move::NULL;
+
+        if let Some(entry) = self.tt.probe(board.tt_hash) {
+            tt_move = entry.best_move;
+            let tt_score = score_from_tt(entry.score, ply);
+
+            match entry.flag {
+                TTFlag::Exact => return tt_score,
+                TTFlag::LowerBound if tt_score >= beta => return tt_score,
+                TTFlag::UpperBound if tt_score <= alpha => return tt_score,
+                _ => {}
+            }
+        }
+
+        self.nodes += 1;
 
         let mut stand_pat = -INFINITY;
+        let mut raw_eval = 0;
         if !in_check {
-            let raw = self.raw_eval(board);
-            stand_pat = self.corrected_eval(board, ply, raw);
+            raw_eval = self.raw_eval(board);
+            stand_pat = self.corrected_eval(board, ply, raw_eval);
             if stand_pat >= beta {
                 return beta;
             }
@@ -1179,6 +1195,9 @@ unsafe {
             if moves.count == 0 {
                 return -MATE_SCORE + ply as i32;
             }
+            let mut best_score = -INFINITY;
+            let mut best_move = Move::NULL;
+
             for &m in moves.as_slice() {
                 let undo = board.make_move(m);
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1);
@@ -1187,16 +1206,27 @@ unsafe {
                 if self.stop.load(Ordering::Relaxed) {
                     return 0;
                 }
+
+                if score > best_score {
+                    best_score = score;
+                    best_move = m;
+                }
+
                 if score >= beta {
+                    self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
                     return beta;
                 }
                 alpha = alpha.max(score);
             }
+
+            let flag = if best_score <= alpha_orig { TTFlag::UpperBound } else { TTFlag::Exact };
+            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
             return alpha;
         }
 
-        let mut picker = MovePicker::new_qsearch(Move::NULL);
-        let mut moves_searched = 0;
+        let mut picker = MovePicker::new_qsearch(tt_move);
+        let mut best_score = stand_pat;
+        let mut best_move = Move::NULL;
 
         while let Some(m) = picker.next(
             board,
@@ -1225,7 +1255,6 @@ unsafe {
                 }
             }
 
-            moves_searched += 1;
             let undo = board.make_move(m);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             board.undo_move(m, undo);
@@ -1234,16 +1263,21 @@ unsafe {
                 return 0;
             }
 
+            if score > best_score {
+                best_score = score;
+                best_move = m;
+            }
+
             if score >= beta {
+                self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
                 return beta;
             }
             alpha = alpha.max(score);
         }
 
-        if in_check && moves_searched == 0 {
-            return -MATE_SCORE + ply as i32;
-        }
+        let flag = if best_score <= alpha_orig { TTFlag::UpperBound } else { TTFlag::Exact };
+        self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
 
-        alpha
+        best_score
     }
 }

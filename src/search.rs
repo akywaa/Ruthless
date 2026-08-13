@@ -604,7 +604,7 @@ unsafe {
         }
 
         let in_check = board.in_check();
-        if in_check {
+        if in_check && (ply as usize) < MAX_PLY - 1 && excluded_move == Move::NULL {
             depth += 1;
         }
 

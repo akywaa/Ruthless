@@ -22,8 +22,9 @@ fn init_lmr() -> [[i32; 64]; 64] {
     let mut table = [[0; 64]; 64];
     for d in 1..64 {
         for m in 1..64 {
-            let base = 0.75 + ((d as f64).ln() * (m as f64).ln()) / 2.25;
-            table[d][m] = base as i32;
+            // Formula calibrated closer to modern engines to prune cold quiet branches
+            let base = 0.5 + ((d as f64).ln() * (m as f64).ln()) / 1.95;
+            table[d][m] = (base as i32).max(1);
         }
     }
     table
@@ -438,8 +439,8 @@ unsafe {
 
                 let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor) as u128;
 
-                // Stop if we have exhausted our soft time or if starting another depth would likely blow it
-                if elapsed >= dynamic_soft.saturating_mul(6) / 10
+                // Do not start the next depth if we've already spent most of our allocated soft time
+                if elapsed >= dynamic_soft.saturating_mul(75) / 100
                     || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX)
                 {
                     let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
@@ -676,7 +677,7 @@ unsafe {
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
-                let r = 3 + depth / 4 + ((static_eval - beta) / 128).clamp(0, 3) as u8 + improving as u8;
+                let r = 4 + depth / 4 + ((static_eval - beta) / 160).clamp(0, 3) as u8 + improving as u8;
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = Move::NULL;
                     self.played_pieces[ply as usize] = Piece::None;

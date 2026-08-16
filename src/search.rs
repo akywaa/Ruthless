@@ -657,8 +657,8 @@ unsafe {
 
         if !is_pv && !in_check {
             // Reverse futility pruning
-            let rfp_margin = (75 - 15 * improving as i32) * (depth as i32);
-            if depth <= 7 && static_eval - rfp_margin >= beta {
+            let rfp_margin = (80 - 20 * improving as i32) * (depth as i32);
+            if depth <= 9 && static_eval - rfp_margin >= beta {
                 return static_eval;
             }
 
@@ -795,7 +795,8 @@ unsafe {
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
 
-        let lmp_threshold = (3 + (depth as usize) * (depth as usize) / (1 + (!improving as usize))).max(3);
+        // Tighter LMP formula: search fewer quiet moves when not improving
+        let lmp_threshold = 2 + (depth as usize) * (depth as usize) / (1 + (!improving as usize) * 2);
         let futility_margin = 60 + (65 - 25 * improving as i32) * (depth as i32);
         let futility_pruning = !is_pv
             && !in_check
@@ -852,7 +853,7 @@ unsafe {
             };
 
             if !is_pv && !in_check && moves_searched > 0 {
-                if is_quiet && depth <= 8 && moves_searched >= lmp_threshold {
+                if is_quiet && depth <= 10 && moves_searched >= lmp_threshold {
                     continue;
                 }
 
@@ -869,8 +870,8 @@ unsafe {
                     continue;
                 }
 
-                if is_quiet && depth <= 5 {
-                    let threshold = -1800 * (depth as i32) - if improving { 1200 } else { 0 };
+                if is_quiet && depth <= 7 {
+                    let threshold = -1200 * (depth as i32) - if improving { 800 } else { 0 };
                     if hist < threshold {
                         continue;
                     }

@@ -82,7 +82,14 @@ impl MovePicker {
                 Stage::TTMove => {
                     self.stage = Stage::GenerateNoisy;
                     let m = self.tt_move;
-                    if self.is_pseudo_legal_any(board, m) && board.is_legal(m) {
+                    let is_noisy = board.piece_on[m.to()] != Piece::None
+                        || m.move_type() == MoveType::Promotion
+                        || m.move_type() == MoveType::EnPassant;
+
+                    if (!self.qsearch || is_noisy)
+                        && self.is_pseudo_legal_any(board, m)
+                        && board.is_legal(m)
+                    {
                         return Some(m);
                     }
                 }

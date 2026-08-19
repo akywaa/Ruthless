@@ -9,11 +9,20 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
 }
 
 pub fn see_value(board: &Board, m: Move) -> i32 {
+    if m == Move::NULL {
+        return 0;
+    }
+
     let from = m.from();
     let to = m.to();
     let move_type = m.move_type();
 
     if move_type == MoveType::Castling {
+        return 0;
+    }
+
+    // Invalid move for SEE if there is no piece on the origin square
+    if board.piece_on[from] == Piece::None {
         return 0;
     }
 

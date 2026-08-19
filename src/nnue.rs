@@ -192,11 +192,12 @@ pub fn evaluate(board: &Board) -> i32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
-            unsafe {
-                return evaluate_avx2(&board.accumulator, us, them, bucket, net);
-            }
-        }
+    // Temporarily disabled: AVX2 accumulation overflows i32
+    // if is_x86_feature_detected!("avx2") {
+    //     unsafe {
+    //         return evaluate_avx2(&board.accumulator, us, them, bucket, net);
+    //     }
+    // }
     }
 
     let mut output = 0i64;

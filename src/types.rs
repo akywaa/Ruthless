@@ -104,12 +104,20 @@ impl Piece {
 
     #[inline(always)]
     pub const fn color(self) -> Color {
-        Color::from_index((self as usize) / 6)
+        if (self as usize) == 12 {
+            Color::White
+        } else {
+            Color::from_index((self as usize) / 6)
+        }
     }
 
     #[inline(always)]
     pub const fn piece_type(self) -> PieceType {
-        PieceType::from_index((self as usize) % 6)
+        if (self as usize) == 12 {
+            PieceType::None
+        } else {
+            PieceType::from_index((self as usize) % 6)
+        }
     }
 }
 

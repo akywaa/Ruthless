@@ -192,12 +192,11 @@ pub fn evaluate(board: &Board) -> i32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-    // Temporarily disabled: AVX2 accumulation overflows i32
-    // if is_x86_feature_detected!("avx2") {
-    //     unsafe {
-    //         return evaluate_avx2(&board.accumulator, us, them, bucket, net);
-    //     }
-    // }
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                return evaluate_avx2(&board.accumulator, us, them, bucket, net);
+            }
+        }
     }
 
     let mut output = 0i64;
@@ -222,6 +221,7 @@ pub fn evaluate(board: &Board) -> i32 {
 mod tests {
     use super::*;
     use crate::board::Board;
+    use crate::movegen::generate_legal_moves;
 
     fn eval_ordering(board: &Board, swap: bool) -> i32 {
         let net = network();
@@ -298,6 +298,38 @@ mod tests {
         println!("output_bias = {:?}", net.output_bias);
         println!("feature_bias[0..6] = {:?}", &net.feature_bias.vals[0..6]);
     }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_matches_scalar_random_walk() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut board = Board::default();
+        let mut rng: u64 = 0xC0FF_EE00_1234_5678;
+        for _ in 0..400 {
+            let moves = generate_legal_moves(&mut board);
+            if moves.count == 0 {
+                break;
+            }
+            for &m in moves.as_slice() {
+                let undo = board.make_move(m);
+                let expected = eval_ordering(&board, false);
+                let net = network();
+                let us = board.side_to_move as usize;
+                let them = (!board.side_to_move) as usize;
+                let bucket = output_bucket(&board);
+                let got = unsafe { evaluate_avx2(&board.accumulator, us, them, bucket, net) };
+                assert_eq!(got, expected, "AVX2 mismatch after {}", m);
+                board.undo_move(m, undo);
+            }
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let pick = (rng as usize) % moves.count;
+            board.make_move(moves.moves[pick]);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -344,46 +376,55 @@ unsafe fn evaluate_avx2(
     unsafe {
         let zero = _mm256_setzero_si256();
         let qa = _mm256_set1_epi16(QA);
-        let mut sum_us = _mm256_setzero_si256();
-        let mut sum_them = _mm256_setzero_si256();
+        let mut acc64 = _mm256_setzero_si256();
 
-        let evaluate_side = |vals: &[i16; HIDDEN_SIZE], offset: usize, sum: &mut __m256i| {
+        let mut evaluate_side = |vals: &[i16; HIDDEN_SIZE], offset: usize| {
             let v_ptr = vals.as_ptr() as *const __m256i;
             let w_ptr = net.output_weights[bucket][offset..].as_ptr() as *const __m256i;
+            let mut acc = _mm256_setzero_si256();
 
             for chunk in 0..(HIDDEN_SIZE / 16) {
                 let v = _mm256_load_si256(v_ptr.add(chunk));
                 let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa);
 
+                // Split both clamped and weights into 128-bit halves with the
+                // same sign-extension so lane i pairs with weight i.
                 let low_16 = _mm256_castsi256_si128(clamped);
                 let high_16 = _mm256_extracti128_si256(clamped, 1);
-
                 let y_low = _mm256_cvtepi16_epi32(low_16);
                 let y_high = _mm256_cvtepi16_epi32(high_16);
-
-                let sq_low = _mm256_mullo_epi32(y_low, y_low);
-                let sq_high = _mm256_mullo_epi32(y_high, y_high);
 
                 let w = _mm256_loadu_si256(w_ptr.add(chunk));
                 let w_low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(w));
                 let w_high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(w, 1));
 
-                *sum = _mm256_add_epi32(*sum, _mm256_mullo_epi32(sq_low, w_low));
-                *sum = _mm256_add_epi32(*sum, _mm256_mullo_epi32(sq_high, w_high));
+                // Single screlu*w product per lane fits in i32 (screlu <= QA^2,
+                // |w| bounded). Sign-extend to i64 and accumulate there so the
+                // running total cannot overflow i32.
+                let p_low = _mm256_mullo_epi32(_mm256_mullo_epi32(y_low, y_low), w_low);
+                let p_high = _mm256_mullo_epi32(_mm256_mullo_epi32(y_high, y_high), w_high);
+                acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(p_low)));
+                acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(p_high)));
+
+                // Low 128 bits already consumed; do the high halves.
+                let p_low_hi = _mm256_extracti128_si256(p_low, 1);
+                acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(p_low_hi));
+                let p_high_hi = _mm256_extracti128_si256(p_high, 1);
+                acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(p_high_hi));
             }
+
+            acc64 = _mm256_add_epi64(acc64, acc);
         };
 
-        evaluate_side(&acc.vals[us], 0, &mut sum_us);
-        evaluate_side(&acc.vals[them], HIDDEN_SIZE, &mut sum_them);
+        evaluate_side(&acc.vals[us], 0);
+        evaluate_side(&acc.vals[them], HIDDEN_SIZE);
 
-        let mut us_arr = [0i32; 8];
-        let mut them_arr = [0i32; 8];
-        _mm256_storeu_si256(us_arr.as_mut_ptr() as *mut _, sum_us);
-        _mm256_storeu_si256(them_arr.as_mut_ptr() as *mut _, sum_them);
+        let mut arr = [0i64; 4];
+        _mm256_storeu_si256(arr.as_mut_ptr() as *mut _, acc64);
 
         let mut output = 0i64;
-        for i in 0..8 {
-            output += us_arr[i] as i64 + them_arr[i] as i64;
+        for i in 0..4 {
+            output += arr[i];
         }
 
         output /= i64::from(QA);

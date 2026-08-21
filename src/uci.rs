@@ -49,6 +49,9 @@ pub fn uci_loop() {
                 searcher.tt = Arc::clone(&tt);
                 searcher.num_threads = num_threads;
             }
+            "eval" => {
+                println!("nnue eval: {} cp", crate::eval::evaluate(&board));
+            }
             "isready" => {
                 println!("readyok");
             }

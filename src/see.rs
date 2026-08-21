@@ -88,6 +88,7 @@ pub fn see_value(board: &Board, m: Move) -> i32 {
 
         let opp_attackers = attackers & occ & board.occupied_co[!side];
         if pt == PieceType::King && !opp_attackers.is_empty() {
+            d -= 1;
             break;
         }
 

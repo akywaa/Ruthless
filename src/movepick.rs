@@ -1,5 +1,3 @@
-use crate::attacks::{king_attacks, knight_attacks, pawn_attacks};
-use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
 use crate::movegen::{generate_noisy_pseudo, generate_quiet_pseudo};
@@ -247,20 +245,10 @@ impl MovePicker {
         prev_is_capture: &[bool; MAX_PLY],
     ) {
         let us = board.side_to_move;
-        let them = !us;
-        let threats = board.opponent_threats();
         let pawn_threats = board.opponent_pawn_threats();
         let p_idx = (board.pawn_hash as usize) & 511;
         let offsets = [1usize, 2, 4, 6];
         let ply_idx = ply as usize;
-
-        // Wall pawns: protect the friendly king
-        let my_ksq = board.king_square(us);
-        let my_pawns = board.pieces[Piece::new(us, PieceType::Pawn)];
-        let king_wall_pawns = king_attacks(my_ksq) & my_pawns;
-
-        // Opponent attackable targets
-        let their_occ = board.occupied_co[them];
 
         for i in 0..self.moves.count {
             let m = self.moves.moves[i];
@@ -287,22 +275,6 @@ impl MovePicker {
 
             if pawn_threats.contains(to) && pt != PieceType::Pawn {
                 score -= 3000;
-            }
-
-            // Give a bonus if the move attacks an undefended enemy piece
-            let attacks_from_to = match pt {
-                PieceType::Knight => knight_attacks(to),
-                PieceType::Pawn => pawn_attacks(us, to),
-                _ => Bitboard::EMPTY,
-            };
-            let attacks_enemy = attacks_from_to & their_occ & !threats;
-            if !attacks_enemy.is_empty() {
-                score += 1500;
-            }
-
-            // Discourage moving king shield pawns
-            if pt == PieceType::Pawn && king_wall_pawns.contains(from) {
-                score -= 1200;
             }
 
             self.scores[i] = score;

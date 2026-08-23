@@ -972,7 +972,7 @@ impl Default for Board {
 mod tests {
     use super::*;
     use crate::movegen::{generate_legal_moves, generate_noisy_pseudo, generate_quiet_pseudo};
-    use crate::nnue::evaluate;
+    use crate::eval::evaluate;
 
     fn pseudo_legal(board: &Board) -> crate::types::MoveList {
         let mut list = crate::types::MoveList::new();

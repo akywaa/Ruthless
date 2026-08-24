@@ -880,7 +880,7 @@ unsafe {
                     }
                 }
 
-                if !is_quiet && depth <= 6 && !see(board, m, -90 * (depth as i32)) {
+                if !is_quiet && depth <= 6 && !see(board, m, -200 * (depth as i32)) {
                     continue;
                 }
             }
@@ -936,10 +936,6 @@ unsafe {
                         r += 1;
                     }
 
-                    if gives_check {
-                        r -= 1;
-                    }
-
                     if is_quiet {
                         if m == killers[0] || m == killers[1] {
                             r -= 1;
@@ -958,6 +954,11 @@ unsafe {
 
                     if self.thread_id > 0 && ((moves_searched + self.thread_id) % 2 == 0) {
                         r += 1;
+                    }
+
+                    // Never reduce checks: critical for tactics.
+                    if gives_check {
+                        r = 0;
                     }
 
                     r = r.clamp(0, depth as i32 - 2);

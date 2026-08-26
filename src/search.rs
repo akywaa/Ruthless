@@ -341,7 +341,7 @@ unsafe {
             self.root_move_nodes = [0; 256];
             if depth >= 4 {
                 let temp_depth = depth;
-                let mut delta = 25;
+                let mut delta = 13;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
                 let mut fails = 0;
@@ -479,7 +479,7 @@ unsafe {
 
             if depth >= 4 {
                 let temp_depth = depth;
-                let mut delta = 25;
+                let mut delta = 13;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
                 let mut fails = 0;
@@ -674,13 +674,14 @@ unsafe {
             }
 
             // Null move pruning
+            let nmp_threshold = if depth < 5 { 38 } else { 0 };
             if excluded_move == Move::NULL
-                && depth >= 3
-                && static_eval >= beta
+                && depth >= 2
+                && static_eval >= beta + nmp_threshold
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
-                let r = 3 + depth / 4 + ((static_eval - beta) / 200).clamp(0, 3) as u8;
+                let r = 5 + depth / 5 + ((static_eval - beta) / 183).clamp(0, 4) as u8;
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = Move::NULL;
                     self.played_pieces[ply as usize] = Piece::None;

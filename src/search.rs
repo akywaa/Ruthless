@@ -799,12 +799,11 @@ unsafe {
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
 
-        // Tighter LMP formula: search fewer quiet moves when not improving
-        let lmp_threshold = 2 + (depth as usize) * (depth as usize) / (1 + (!improving as usize) * 2);
-        let futility_margin = 60 + (65 - 25 * improving as i32) * (depth as i32);
+        let lmp_threshold = 2 + (depth as usize) * (depth as usize) / (1 + (!improving as usize));
+        let futility_margin = 85 + 156 * (depth as i32);
         let futility_pruning = !is_pv
             && !in_check
-            && depth <= 6
+            && depth <= 10
             && alpha.abs() < MATE_SCORE - 100
             && (static_eval + futility_margin <= alpha);
 

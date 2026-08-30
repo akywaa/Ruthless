@@ -752,7 +752,7 @@ unsafe {
 
         let mut extension = 0;
 
-        if depth >= 6
+        if depth >= 7
             && has_tt
             && tt_move != Move::NULL
             && excluded_move == Move::NULL
@@ -762,7 +762,7 @@ unsafe {
             && (tt_flag == TTFlag::Exact || tt_flag == TTFlag::LowerBound)
             && tt_score.abs() < MATE_SCORE - 100
         {
-            let singular_margin = (depth as i32) * 2;
+            let singular_margin = (depth as i32) * 70 / 64;
             let singular_beta = tt_score - singular_margin;
             let singular_depth = (depth - 1) / 2;
 
@@ -783,7 +783,7 @@ unsafe {
 
             if score < singular_beta {
                 extension = 1;
-                if score < singular_beta - singular_margin && (!is_pv || singular_beta <= beta) {
+                if !is_pv && score + 20 < singular_beta && ply < self.completed_depth {
                     extension = 2;
                 }
             } else if singular_beta >= beta {

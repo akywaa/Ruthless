@@ -22,7 +22,7 @@ fn init_lmr() -> [[i32; 64]; 64] {
     let mut table = [[0; 64]; 64];
     for d in 1..64 {
         for m in 1..64 {
-            let base = 0.75 + ((d as f64).ln() * (m as f64).ln()) / 2.25;
+            let base = ((d as f64).ln() * (m as f64).ln()) / 2.4;
             table[d][m] = (base as i32).max(1);
         }
     }
@@ -922,10 +922,11 @@ unsafe {
                     r = lmr(depth as usize, moves_searched);
 
                     if !is_quiet {
-                        r /= 2;
+                        r = r * 33 / 64;
                         if !is_see_ge_zero {
                             r += 2;
                         }
+                        r -= (hist / 8192).clamp(-2, 2);
                     }
 
                     if !improving {
@@ -933,19 +934,14 @@ unsafe {
                     }
 
                     if cut_node {
-                        r += 1;
+                        r += 2;
                     }
 
                     if is_quiet {
-                        if m == killers[0] || m == killers[1] {
-                            r -= 1;
+                        if m == killers[0] || m == killers[1] || m == counter_move {
+                            r -= 2;
                         }
-                        if m == counter_move {
-                            r -= 1;
-                        }
-                        r -= (hist / 512).clamp(-2, 2);
-                    } else {
-                        r -= (hist / 400).clamp(-2, 2);
+                        r -= (hist / 8192).clamp(-2, 2);
                     }
 
                     if is_pv {

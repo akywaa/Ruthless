@@ -674,14 +674,13 @@ unsafe {
             }
 
             // Null move pruning
-            let nmp_threshold = if depth < 5 { 38 } else { 0 };
             if excluded_move == Move::NULL
-                && depth >= 2
-                && static_eval >= beta + nmp_threshold
+                && depth >= 3
+                && static_eval >= beta
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
-                let r = 5 + depth / 5 + ((static_eval - beta) / 183).clamp(0, 4) as u8;
+                let r = 3 + depth / 3 + ((static_eval - beta) / 200).clamp(0, 3) as u8;
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = Move::NULL;
                     self.played_pieces[ply as usize] = Piece::None;
@@ -799,11 +798,11 @@ unsafe {
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
 
-        let lmp_threshold = 2 + (depth as usize) * (depth as usize) / (1 + (!improving as usize));
-        let futility_margin = 85 + 156 * (depth as i32);
+        let lmp_threshold = 3 + (depth as usize) * (depth as usize) / (1 + (!improving as usize));
+        let futility_margin = 70 + 75 * (depth as i32);
         let futility_pruning = !is_pv
             && !in_check
-            && depth <= 10
+            && depth <= 6
             && alpha.abs() < MATE_SCORE - 100
             && (static_eval + futility_margin <= alpha);
 
@@ -869,7 +868,7 @@ unsafe {
                     continue;
                 }
 
-                if is_quiet && depth <= 9 && !see(board, m, -78 * (depth as i32)) {
+                if is_quiet && depth <= 6 && !see(board, m, -35 * (depth as i32) * (depth as i32)) {
                     continue;
                 }
 
@@ -880,7 +879,7 @@ unsafe {
                     }
                 }
 
-                if !is_quiet && depth <= 9 && !see(board, m, -30 * (depth as i32) * (depth as i32)) {
+                if !is_quiet && depth <= 6 && !see(board, m, -120 * (depth as i32)) {
                     continue;
                 }
             }

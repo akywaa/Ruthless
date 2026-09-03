@@ -222,16 +222,15 @@ fn handle_go(
             let usable_time = time.saturating_sub(overhead_ms);
 
             if let Some(moves) = movestogo {
-                // Allocate more time per move similar to top engines
-                let moves = (moves.clamp(1, 50) as f64).min(25.0);
-                let base = (usable_time as f64 / moves) + 0.8 * my_inc as f64;
-                let soft = (base as u128).clamp(10, usable_time * 4 / 10);
-                let hard = ((base * 3.5) as u128).min(usable_time * 80 / 100).max(soft);
+                let moves = (moves.clamp(1, 50) as f64).min(20.0);
+                let base = (usable_time as f64 / moves) + 0.85 * my_inc as f64;
+                let soft = (base as u128).clamp(10, usable_time * 5 / 10);
+                let hard = ((base * 3.0) as u128).min(usable_time * 85 / 100).max(soft);
                 (Some(soft), Some(hard))
             } else {
-                let base_time = usable_time / 25 + (my_inc * 3) / 4;
-                let soft = base_time.clamp(10, usable_time / 3);
-                let hard = (base_time * 3).min(usable_time * 80 / 100).max(soft);
+                let base_time = usable_time / 18 + (my_inc * 4) / 5;
+                let soft = base_time.clamp(10, usable_time * 4 / 10);
+                let hard = (base_time * 3).min(usable_time * 85 / 100).max(soft);
                 (Some(soft), Some(hard))
             }
         } else {

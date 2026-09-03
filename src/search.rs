@@ -440,10 +440,7 @@ unsafe {
 
                 let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor) as u128;
 
-                // Do not start the next depth if we've already spent most of our allocated soft time
-                if elapsed >= dynamic_soft.saturating_mul(75) / 100
-                    || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX)
-                {
+                if elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
                     let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
                     let majority = (self.num_threads * 65).div_ceil(100);
                     if votes >= majority || elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {

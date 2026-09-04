@@ -228,8 +228,9 @@ fn handle_go(
                 let hard = ((base * 3.0) as u128).min(usable_time * 85 / 100).max(soft);
                 (Some(soft), Some(hard))
             } else {
-                let base_time = usable_time / 18 + (my_inc * 4) / 5;
-                let soft = base_time.clamp(10, usable_time * 4 / 10);
+                let base_time = usable_time / 16 + my_inc;
+                let min_time = (my_inc * 8 / 10).max(15);
+                let soft = base_time.clamp(min_time, usable_time * 4 / 10);
                 let hard = (base_time * 3).min(usable_time * 85 / 100).max(soft);
                 (Some(soft), Some(hard))
             }

@@ -420,7 +420,7 @@ unsafe {
 
             if let Some(soft_limit) = self.soft_time_ms {
                 let score_diff = (prev_score - score).clamp(-100, 100) as f32;
-                let score_trend = (0.75 + 0.04 * score_diff).clamp(0.7, 1.4);
+                let score_trend = if score < -100 { 1.25 } else { (0.85 + 0.03 * score_diff).clamp(0.8, 1.3) };
                 let pv_factor = (1.25 - 0.05 * (stable_iterations as f32)).max(0.7);
                 let eval_factor = if eval_stable { 0.85 } else { 1.15 };
 

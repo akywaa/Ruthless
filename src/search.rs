@@ -229,7 +229,8 @@ unsafe {
         cont_term *= 7;
 
         let total_bonus = (pawn_term + np_term + cont_term) / (8 * 64);
-        let clamped_bonus = total_bonus.clamp(-200, 200);
+        // Scale down the history bonus so it doesn't overpower the new NNUE scale
+        let clamped_bonus = (total_bonus / 3).clamp(-70, 70);
 
         let mut eval = raw + clamped_bonus;
 
@@ -355,7 +356,7 @@ unsafe {
                     if score <= alpha {
                         fails += 1;
                         alpha = (alpha - delta).max(-INFINITY);
-                        delta += delta / 2;
+                        delta += delta * 2 / 3;
                         if fails >= 2 || delta > 300 {
                             alpha = -INFINITY;
                             beta = INFINITY;
@@ -363,7 +364,7 @@ unsafe {
                     } else if score >= beta {
                         fails += 1;
                         beta = (beta + delta).min(INFINITY);
-                        delta += delta / 2;
+                        delta += delta * 2 / 3;
                         if fails >= 2 || delta > 300 {
                             alpha = -INFINITY;
                             beta = INFINITY;
@@ -490,7 +491,7 @@ unsafe {
                     if score <= alpha {
                         fails += 1;
                         alpha = (alpha - delta).max(-INFINITY);
-                        delta += delta / 2;
+                        delta += delta * 2 / 3;
                         if fails >= 2 || delta > 300 {
                             alpha = -INFINITY;
                             beta = INFINITY;
@@ -498,7 +499,7 @@ unsafe {
                     } else if score >= beta {
                         fails += 1;
                         beta = (beta + delta).min(INFINITY);
-                        delta += delta / 2;
+                        delta += delta * 2 / 3;
                         if fails >= 2 || delta > 300 {
                             alpha = -INFINITY;
                             beta = INFINITY;
@@ -677,7 +678,8 @@ unsafe {
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
-                let r = 3 + depth / 3 + ((static_eval - beta) / 200).clamp(0, 3) as u8;
+                // Divide by 80 instead of 200 because 1 pawn is now ~40 cp
+                let r = 3 + depth / 3 + ((static_eval - beta) / 80).clamp(0, 3) as u8;
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = Move::NULL;
                     self.played_pieces[ply as usize] = Piece::None;
@@ -703,7 +705,7 @@ unsafe {
 
         // ProbCut
         if !is_pv && !in_check && excluded_move == Move::NULL && depth >= 5 && beta.abs() < MATE_SCORE - 100 {
-            let probcut_beta = beta + 200;
+            let probcut_beta = beta + 80;
             let mut probcut_picker = MovePicker::new_qsearch(Move::NULL);
 
             while let Some(m) = probcut_picker.next(
@@ -796,7 +798,8 @@ unsafe {
         let mut moves_searched = 0;
 
         let lmp_threshold = 3 + (depth as usize) * (depth as usize) / (1 + (!improving as usize));
-        let futility_margin = 70 + 75 * (depth as i32);
+        // Margins adapted to the new eval scale (~40cp per pawn)
+        let futility_margin = 30 + 35 * (depth as i32);
         let futility_pruning = !is_pv
             && !in_check
             && depth <= 6

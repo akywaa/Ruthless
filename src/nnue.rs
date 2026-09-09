@@ -192,27 +192,26 @@ pub fn evaluate(board: &Board) -> i32 {
     {
         if is_x86_feature_detected!("avx2") {
             unsafe {
-                // The net is trained in absolute [White, Black] order and always
-                // predicts from White's perspective; flip sign for Black to move.
-                let mut eval = evaluate_avx2(&board.accumulator, 0, 1, bucket, net);
-                if board.side_to_move == Color::Black {
-                    eval = -eval;
-                }
-                return eval;
+                // Feed the accumulators in [side-to-move, non-side-to-move] order.
+                let us = board.side_to_move as usize;
+                let them = us ^ 1;
+                return evaluate_avx2(&board.accumulator, us, them, bucket, net);
             }
         }
     }
 
     let mut output = 0i64;
 
-    // First weight half always pairs with the White accumulator, the second
-    // half with the Black accumulator (absolute [White, Black] training).
+    // First weight half pairs with the side to move, the second half with the
+    // opponent (dual-perspective training).
+    let us = board.side_to_move as usize;
+    let them = us ^ 1;
     for i in 0..HIDDEN_SIZE {
-        output += screlu(board.accumulator.vals[0][i]) as i64 * i64::from(net.output_weights[bucket][i]);
+        output += screlu(board.accumulator.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
     }
 
     for i in 0..HIDDEN_SIZE {
-        output += screlu(board.accumulator.vals[1][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+        output += screlu(board.accumulator.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
     }
 
     output /= i64::from(QA);
@@ -220,13 +219,7 @@ pub fn evaluate(board: &Board) -> i32 {
     output *= SCALE as i64;
     output /= i64::from(QA) * i64::from(QB);
 
-    let eval = output as i32;
-
-    if board.side_to_move == Color::Black {
-        -eval
-    } else {
-        eval
-    }
+    output as i32
 }
 
 #[cfg(test)]
@@ -328,21 +321,23 @@ mod tests {
                 let undo = board.make_move(m);
                 let net = network();
                 let bucket = output_bucket(&board);
-                // Scalar reference in the same absolute [White, Black] ordering
-                // and perspective used by the production evaluate().
+                let us = board.side_to_move as usize;
+                let them = us ^ 1;
+                // Scalar reference in the same [side-to-move, non-side-to-move]
+                // ordering and perspective used by the production evaluate().
                 let mut out = 0i64;
                 for i in 0..HIDDEN_SIZE {
-                    out += screlu(board.accumulator.vals[0][i]) as i64 * i64::from(net.output_weights[bucket][i]);
+                    out += screlu(board.accumulator.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
                 }
                 for i in 0..HIDDEN_SIZE {
-                    out += screlu(board.accumulator.vals[1][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+                    out += screlu(board.accumulator.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
                 }
                 out /= i64::from(QA);
                 out += i64::from(net.output_bias[bucket]);
                 out *= SCALE as i64;
                 out /= i64::from(QA) * i64::from(QB);
                 let expected = out as i32;
-                let got = unsafe { evaluate_avx2(&board.accumulator, 0, 1, bucket, net) };
+                let got = unsafe { evaluate_avx2(&board.accumulator, us, them, bucket, net) };
                 assert_eq!(got, expected, "AVX2 mismatch after {}", m);
                 board.undo_move(m, undo);
             }

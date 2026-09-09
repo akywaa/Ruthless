@@ -223,14 +223,15 @@ fn handle_go(
 
             if let Some(moves) = movestogo {
                 let moves = (moves.clamp(1, 50) as f64).min(20.0);
-                let base = (usable_time as f64 / moves) + 0.85 * my_inc as f64;
-                let soft = (base as u128).clamp(10, usable_time * 5 / 10);
+                let base = (usable_time as f64 / moves) + 0.75 * my_inc as f64;
+                let soft = (base as u128).min(usable_time * 4 / 10).max(1);
                 let hard = ((base * 3.0) as u128).min(usable_time * 85 / 100).max(soft);
                 (Some(soft), Some(hard))
             } else {
-                let base_time = usable_time / 16 + my_inc;
+                let base_time = usable_time / 25 + (my_inc * 3) / 4;
                 let min_time = (my_inc * 8 / 10).max(15);
-                let soft = base_time.clamp(min_time, usable_time * 4 / 10);
+                let max_soft = usable_time * 3 / 10;
+                let soft = base_time.max(min_time).min(max_soft).max(1);
                 let hard = (base_time * 3).min(usable_time * 85 / 100).max(soft);
                 (Some(soft), Some(hard))
             }

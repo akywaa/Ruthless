@@ -226,9 +226,19 @@ impl MovePicker {
             };
 
             let to_threatened = threats.contains(m.to()) as usize;
-            let mvv_lva = PIECE_VALUES[victim_pt as usize] * 12 - PIECE_VALUES[attacker.piece_type() as usize];
-            let hist = noisy_history[attacker as usize][m.to() as usize][victim_pt as usize][to_threatened];
-            self.scores[i] = mvv_lva + hist;
+
+            let attacker_idx = attacker as usize;
+            let victim_idx = victim_pt as usize;
+
+            // Guard against broken moves (Piece::None attacker/victim) that
+            // would index out of bounds in PIECE_VALUES and noisy_history.
+            if attacker_idx < 12 && victim_idx < 6 {
+                let mvv_lva = PIECE_VALUES[victim_idx] * 12 - PIECE_VALUES[attacker.piece_type() as usize];
+                let hist = noisy_history[attacker_idx][m.to() as usize][victim_idx][to_threatened];
+                self.scores[i] = mvv_lva + hist;
+            } else {
+                self.scores[i] = 0;
+            }
         }
     }
 

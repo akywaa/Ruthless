@@ -1178,6 +1178,7 @@ unsafe {
             return evaluate(board);
         }
 
+        let alpha_orig = alpha;
         let in_check = board.in_check();
         let mut tt_move = Move::NULL;
 
@@ -1201,7 +1202,7 @@ unsafe {
             raw_eval = self.raw_eval(board);
             stand_pat = self.corrected_eval(board, ply, raw_eval);
             if stand_pat >= beta {
-                return beta;
+                return stand_pat;
             }
             alpha = alpha.max(stand_pat);
         }
@@ -1236,18 +1237,20 @@ unsafe {
 
                 if score >= beta {
                     self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store);
-                    return beta;
+                    return score;
                 }
                 alpha = alpha.max(score);
             }
 
             let flag = if best_score >= beta {
                 TTFlag::LowerBound
+            } else if best_score > alpha_orig {
+                TTFlag::Exact
             } else {
                 TTFlag::UpperBound
             };
             self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval_to_store);
-            return alpha;
+            return best_score;
         }
 
         let mut picker = MovePicker::new_qsearch(tt_move);
@@ -1299,13 +1302,15 @@ unsafe {
 
             if score >= beta {
                 self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store);
-                return beta;
+                return score;
             }
             alpha = alpha.max(score);
         }
 
         let flag = if best_score >= beta {
             TTFlag::LowerBound
+        } else if best_score > alpha_orig {
+            TTFlag::Exact
         } else {
             TTFlag::UpperBound
         };

@@ -3,20 +3,16 @@ use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType, Square};
 
-pub fn generate_legal_moves(board: &mut Board) -> MoveList {
+pub fn generate_legal_moves(board: &Board) -> MoveList {
     let mut list = MoveList::new();
     let mut pseudo = MoveList::new();
     generate_noisy_pseudo(board, &mut pseudo);
     generate_quiet_pseudo(board, &mut pseudo);
 
-    let us = board.side_to_move;
     for &m in pseudo.as_slice() {
-        let undo = board.make_move(m);
-        let ksq = board.king_square(us);
-        if !board.is_square_attacked(ksq, board.side_to_move) {
+        if board.is_legal(m) {
             list.push(m);
         }
-        board.undo_move(m, undo);
     }
 
     list

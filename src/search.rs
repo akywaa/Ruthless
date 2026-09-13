@@ -5,7 +5,7 @@ use crate::movepick::MovePicker;
 use crate::see::see;
 use crate::tt::{TTFlag, TranspositionTable};
 use crate::types::{Move, MoveType, Piece, PieceType};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -15,6 +15,13 @@ pub const MATE_SCORE: i32 = 32_000;
 pub const MAX_PLY: usize = 128;
 pub const CORR_ENTRIES: usize = 16384;
 pub const CORR_BUCKETS: usize = 8;
+
+pub static RFP_BASE: AtomicI32 = AtomicI32::new(80);
+pub static RFP_IMPROVING: AtomicI32 = AtomicI32::new(20);
+pub static FUTILITY_BASE: AtomicI32 = AtomicI32::new(70);
+pub static FUTILITY_MARGIN: AtomicI32 = AtomicI32::new(75);
+pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
+pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(200);
 
 static LMR: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 
@@ -388,7 +395,7 @@ unsafe {
             }
 
             let elapsed = self.start_time.elapsed().as_millis().max(1);
-            let total_nodes = self.shared_nodes.load(Ordering::Relaxed) + (self.nodes & 2047);
+            let total_nodes = self.shared_nodes.load(Ordering::Relaxed) + (self.nodes & 1023);
             let nps = (total_nodes as u128 * 1000) / elapsed;
 
             let pv = self.extract_pv(board, depth);
@@ -567,12 +574,10 @@ unsafe {
     }
 
     fn check_time(&mut self) {
-    if self.nodes > 0 && (self.nodes & 2047) == 0 {
-        self.shared_nodes.fetch_add(2048, Ordering::Relaxed);
+    if self.nodes > 0 && (self.nodes & 1023) == 0 {
+        self.shared_nodes.fetch_add(1024, Ordering::Relaxed);
         let elapsed = self.start_time.elapsed().as_millis();
 
-        // Only the hard limit is allowed to abort mid-search; the soft limit
-        // is enforced between iterations so a partial depth is never discarded.
         if let Some(hard_limit) = self.hard_time_ms {
             if elapsed >= hard_limit {
                 self.stop.store(true, Ordering::Relaxed);
@@ -657,8 +662,7 @@ unsafe {
         };
 
         if !is_pv && !in_check {
-            // Reverse futility pruning
-            let rfp_margin = (80 - 20 * improving as i32) * (depth as i32);
+            let rfp_margin = (RFP_BASE.load(Ordering::Relaxed) - RFP_IMPROVING.load(Ordering::Relaxed) * improving as i32) * (depth as i32);
             if depth <= 9 && static_eval - rfp_margin >= beta {
                 return static_eval;
             }
@@ -678,7 +682,7 @@ unsafe {
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
-                let r = 3 + depth / 3 + ((static_eval - beta) / 200).clamp(0, 3) as u8;
+                let r = NMP_BASE.load(Ordering::Relaxed) as u8 + depth / 3 + ((static_eval - beta) / NMP_EVAL_DIV.load(Ordering::Relaxed)).clamp(0, 3) as u8;
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = Move::NULL;
                     self.played_pieces[ply as usize] = Piece::None;
@@ -797,7 +801,7 @@ unsafe {
         let mut moves_searched = 0;
 
         let lmp_threshold = 2 + (depth as usize) * (depth as usize) / (1 + (!improving as usize) * 2);
-        let futility_margin = 70 + 75 * (depth as i32);
+        let futility_margin = FUTILITY_BASE.load(Ordering::Relaxed) + FUTILITY_MARGIN.load(Ordering::Relaxed) * (depth as i32);
         let futility_pruning = !is_pv
             && !in_check
             && depth <= 6
@@ -1178,7 +1182,6 @@ unsafe {
             return evaluate(board);
         }
 
-        let alpha_orig = alpha;
         let in_check = board.in_check();
         let mut tt_move = Move::NULL;
 
@@ -1195,6 +1198,7 @@ unsafe {
         }
 
         self.nodes += 1;
+        let alpha_orig = alpha;
 
         let mut stand_pat = -INFINITY;
         let mut raw_eval = 0;

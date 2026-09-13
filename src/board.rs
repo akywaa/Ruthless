@@ -164,6 +164,22 @@ impl Board {
                 s if s.len() == 2 => Square::from_str(s).unwrap_or(Square::None),
                 _ => Square::None,
             };
+
+            if board.ep_square.is_valid() {
+                let us = board.side_to_move;
+                let them = !us;
+                let cap_rank = match us {
+                    Color::White => 4,
+                    Color::Black => 3,
+                };
+                let cap_sq = Square::from_coords(board.ep_square.file(), cap_rank);
+                let our_pawns = board.pieces[Piece::new(us, PieceType::Pawn)];
+                let attackers = pawn_attacks(them, board.ep_square) & our_pawns;
+
+                if board.piece_on[cap_sq] != Piece::new(them, PieceType::Pawn) || attackers.is_empty() {
+                    board.ep_square = Square::None;
+                }
+            }
         }
 
         if parts.len() > 4 {
@@ -411,7 +427,8 @@ impl Board {
                 if piece.piece_type() != PieceType::Pawn || to != self.ep_square {
                     return false;
                 }
-                pawn_attacks(us, from).contains(to)
+                let cap_sq = Square::from_coords(to.file(), from.rank());
+                self.piece_on[cap_sq] == Piece::new(them, PieceType::Pawn) && pawn_attacks(us, from).contains(to)
             }
             MoveType::Castling => {
                 let occ = self.occupied;
@@ -498,22 +515,22 @@ impl Board {
 
         if m.move_type() == MoveType::EnPassant {
             let cap_sq = Square::from_coords(to.file(), from.rank());
+            if self.piece_on[cap_sq] != Piece::new(them, PieceType::Pawn) {
+                return false;
+            }
+
             let mut occ = self.occupied;
             occ.clear(from);
             occ.clear(cap_sq);
             occ.set(to);
-            let opp_pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
-            let opp_knights = self.pieces[Piece::new(them, PieceType::Knight)];
+
             let opp_bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
                 | self.pieces[Piece::new(them, PieceType::Queen)];
             let opp_rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
                 | self.pieces[Piece::new(them, PieceType::Queen)];
-            let opp_king = self.pieces[Piece::new(them, PieceType::King)];
-            return (pawn_attacks(us, ksq) & opp_pawns).is_empty()
-                && (knight_attacks(ksq) & opp_knights).is_empty()
-                && (bishop_attacks(ksq, occ) & opp_bishops_queens).is_empty()
-                && (rook_attacks(ksq, occ) & opp_rooks_queens).is_empty()
-                && (king_attacks(ksq) & opp_king).is_empty();
+
+            return (bishop_attacks(ksq, occ) & opp_bishops_queens).is_empty()
+                && (rook_attacks(ksq, occ) & opp_rooks_queens).is_empty();
         }
 
         if self.pinned_pieces(us).contains(from) {

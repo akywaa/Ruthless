@@ -42,6 +42,12 @@ pub fn uci_loop() {
                 println!("id author Ruthless Team");
                 println!("option name Hash type spin default 32 min 1 max 1048576");
                 println!("option name Threads type spin default 1 min 1 max 256");
+                println!("option name RfpBase type spin default 80 min 10 max 200");
+                println!("option name RfpImproving type spin default 20 min 0 max 100");
+                println!("option name FutilityBase type spin default 70 min 10 max 200");
+                println!("option name FutilityMargin type spin default 75 min 10 max 200");
+                println!("option name NmpBase type spin default 3 min 1 max 6");
+                println!("option name NmpEvalDiv type spin default 200 min 50 max 500");
                 println!("uciok");
             }
             "setoption" => {
@@ -111,6 +117,24 @@ fn handle_setoption(
                 *num_threads = t.clamp(1, 256);
             }
         }
+        "rfpbase" => {
+            if let Ok(v) = value.parse::<i32>() { crate::search::RFP_BASE.store(v, std::sync::atomic::Ordering::Relaxed); }
+        }
+        "rfpimproving" => {
+            if let Ok(v) = value.parse::<i32>() { crate::search::RFP_IMPROVING.store(v, std::sync::atomic::Ordering::Relaxed); }
+        }
+        "futilitybase" => {
+            if let Ok(v) = value.parse::<i32>() { crate::search::FUTILITY_BASE.store(v, std::sync::atomic::Ordering::Relaxed); }
+        }
+        "futilitymargin" => {
+            if let Ok(v) = value.parse::<i32>() { crate::search::FUTILITY_MARGIN.store(v, std::sync::atomic::Ordering::Relaxed); }
+        }
+        "nmpbase" => {
+            if let Ok(v) = value.parse::<i32>() { crate::search::NMP_BASE.store(v, std::sync::atomic::Ordering::Relaxed); }
+        }
+        "nmpevaldiv" => {
+            if let Ok(v) = value.parse::<i32>() { crate::search::NMP_EVAL_DIV.store(v, std::sync::atomic::Ordering::Relaxed); }
+        }
         _ => {}
     }
 }
@@ -142,8 +166,9 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
     if move_start < tokens.len() && tokens[move_start] == "moves" {
         for &m_str in &tokens[move_start + 1..] {
             let moves = generate_legal_moves(board);
+            let m_lower = m_str.to_ascii_lowercase();
             for &m in moves.as_slice() {
-                if m.to_string() == m_str {
+                if m.to_string() == m_lower {
                     board.make_move(m);
                     break;
                 }
@@ -206,7 +231,7 @@ fn handle_go(
         i += 1;
     }
 
-    let overhead_ms = 20;
+    let overhead_ms = 50;
 
     let (soft_time, hard_time) = if let Some(mt) = movetime {
         let t = mt.saturating_sub(overhead_ms).max(5);

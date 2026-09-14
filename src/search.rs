@@ -784,16 +784,21 @@ unsafe {
 
             if score < singular_beta {
                 extension = 1;
-                if !is_pv && score + 20 < singular_beta && ply < self.completed_depth {
-                    extension = 2;
+                if score < singular_beta - depth as i32 * 2 {
+                    extension += 1;
+                }
+                if score < singular_beta - depth as i32 * 4 {
+                    extension += 1;
                 }
             } else if singular_beta >= beta {
                 return singular_beta;
-            } else if !is_pv && tt_score >= beta {
-                extension = -1;
-            } else if !is_pv && cut_node {
-                extension = -1;
+            } else if score >= beta && score.abs() < MATE_SCORE - 100 {
+                return score;
+            } else if cut_node || tt_score >= beta {
+                extension = -2;
             }
+        } else if depth <= 6 && !in_check && cut_node && static_eval <= alpha - 30 {
+            extension = 1;
         }
 
         let mut best_score = -INFINITY;

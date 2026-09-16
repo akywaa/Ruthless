@@ -663,8 +663,8 @@ unsafe {
 
         if !is_pv && !in_check {
             let rfp_margin = (RFP_BASE.load(Ordering::Relaxed) - RFP_IMPROVING.load(Ordering::Relaxed) * improving as i32) * (depth as i32);
-            if depth <= 9 && static_eval - rfp_margin >= beta {
-                return static_eval;
+            if depth <= 10 && static_eval - rfp_margin >= beta {
+                return (static_eval + beta) / 2;
             }
 
             // Razoring
@@ -932,7 +932,7 @@ unsafe {
                         if !is_see_ge_zero {
                             r += 2;
                         }
-                        r -= (hist / 8192).clamp(-2, 2);
+                        r -= (hist / 4096).clamp(-3, 3);
                     }
 
                     if !improving {
@@ -947,7 +947,7 @@ unsafe {
                         if m == killers[0] || m == killers[1] || m == counter_move {
                             r -= 2;
                         }
-                        r -= (hist / 8192).clamp(-2, 2);
+                        r -= (hist / 4096).clamp(-3, 3);
                     }
 
                     if is_pv {
@@ -1006,7 +1006,8 @@ unsafe {
             }
 
             if alpha >= beta {
-                let bonus = ((depth as i32) * (depth as i32)).min(1600);
+                let bonus = (180 * depth as i32 - 60).clamp(0, 1600);
+                let malus = (150 * depth as i32 - 40).clamp(0, 1200);
 
                 let moving_pc = board.piece_on[m.from()] as usize;
                 let victim_pt = match m.move_type() {
@@ -1045,9 +1046,9 @@ unsafe {
 
                         let q_pc = board.piece_on[qm.from()] as usize;
                         if q_pc < 12 {
-                            update_history(&mut self.history[us][qm.from() as usize][qm.to() as usize], -bonus);
-                            update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -bonus);
-                            self.update_conthist(ply, qm, -bonus);
+                            update_history(&mut self.history[us][qm.from() as usize][qm.to() as usize], -malus);
+                            update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -malus);
+                            self.update_conthist(ply, qm, -malus);
                         }
                     }
 
@@ -1112,6 +1113,17 @@ unsafe {
         } else {
             TTFlag::Exact
         };
+
+        if !is_pv && best_score <= alpha_orig && ply > 0 {
+            let prev_idx = (ply - 1) as usize;
+            let p_move = self.played_moves[prev_idx];
+            let p_piece = self.played_pieces[prev_idx];
+            if p_move != Move::NULL && !self.prev_is_capture[prev_idx] && p_piece != Piece::None {
+                let prev_bonus = (120 * depth as i32 - 40).clamp(0, 1200);
+                let opp_color = !board.side_to_move as usize;
+                update_history(&mut self.history[opp_color][p_move.from() as usize][p_move.to() as usize], prev_bonus);
+            }
+        }
 
         if excluded_move == Move::NULL {
             self.tt.store(board.tt_hash, score_to_tt(best_score, ply), depth, flag, best_move, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);

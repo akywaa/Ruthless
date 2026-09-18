@@ -467,6 +467,25 @@ impl Board {
         }
     }
 
+    #[inline(always)]
+    pub fn gives_direct_check(&self, m: Move) -> bool {
+        let us = self.side_to_move;
+        let ksq = self.king_square(!us);
+        let from = m.from();
+        let to = m.to();
+        let pt = self.piece_on[from].piece_type();
+        let occ = (self.occupied ^ Bitboard::from_square(from)) | Bitboard::from_square(to);
+
+        match pt {
+            PieceType::Knight => knight_attacks(to).contains(ksq),
+            PieceType::Bishop => bishop_attacks(to, occ).contains(ksq),
+            PieceType::Rook => rook_attacks(to, occ).contains(ksq),
+            PieceType::Queen => (bishop_attacks(to, occ) | rook_attacks(to, occ)).contains(ksq),
+            PieceType::Pawn => pawn_attacks(us, to).contains(ksq),
+            _ => false,
+        }
+    }
+
     pub fn is_legal(&self, m: Move) -> bool {
         let us = self.side_to_move;
         let them = !us;

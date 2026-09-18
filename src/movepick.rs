@@ -235,7 +235,16 @@ impl MovePicker {
             if attacker_idx < 12 && victim_idx < 6 {
                 let mvv_lva = PIECE_VALUES[victim_idx] * 12 - PIECE_VALUES[attacker.piece_type() as usize];
                 let hist = noisy_history[attacker_idx][m.to() as usize][victim_idx][to_threatened];
-                self.scores[i] = mvv_lva + hist;
+                let mut score = mvv_lva + hist;
+
+                if m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Queen {
+                    score += 3000;
+                }
+                if board.gives_direct_check(m) {
+                    score += 2000;
+                }
+
+                self.scores[i] = score;
             } else {
                 self.scores[i] = 0;
             }
@@ -283,8 +292,16 @@ impl MovePicker {
                 }
             }
 
-            if pawn_threats.contains(to) && pt != PieceType::Pawn {
-                score -= 3000;
+            if board.gives_direct_check(m) {
+                score += 8000;
+            }
+
+            if pawn_threats.contains(from) && !pawn_threats.contains(to) {
+                score += 4000;
+            }
+
+            if pawn_threats.contains(to) {
+                score -= if pt != PieceType::Pawn { 3500 } else { 1500 };
             }
 
             self.scores[i] = score;

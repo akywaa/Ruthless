@@ -862,27 +862,31 @@ unsafe {
             };
 
             if !is_pv && !in_check && moves_searched > 0 {
-                if is_quiet && depth <= 10 && moves_searched >= lmp_threshold {
-                    continue;
-                }
+                let is_direct_check = board.gives_direct_check(m);
 
-                if is_quiet
-                    && futility_pruning
-                    && m != killers[0]
-                    && m != killers[1]
-                    && m != counter_move
-                {
-                    continue;
-                }
-
-                if is_quiet && depth <= 6 && !see(board, m, -35 * (depth as i32) * (depth as i32)) {
-                    continue;
-                }
-
-                if is_quiet && depth <= 7 {
-                    let threshold = -1200 * (depth as i32) - if improving { 800 } else { 0 };
-                    if hist < threshold {
+                if !is_direct_check {
+                    if is_quiet && depth <= 10 && moves_searched >= lmp_threshold {
                         continue;
+                    }
+
+                    if is_quiet
+                        && futility_pruning
+                        && m != killers[0]
+                        && m != killers[1]
+                        && m != counter_move
+                    {
+                        continue;
+                    }
+
+                    if is_quiet && depth <= 6 && !see(board, m, -35 * (depth as i32) * (depth as i32)) {
+                        continue;
+                    }
+
+                    if is_quiet && depth <= 7 {
+                        let threshold = -1200 * (depth as i32) - if improving { 800 } else { 0 };
+                        if hist < threshold {
+                            continue;
+                        }
                     }
                 }
 
@@ -971,7 +975,13 @@ unsafe {
                 let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL, true);
 
                 if s > alpha && reduced < depth - 1 {
-                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node);
+                    let mut re_search_depth = depth - 1;
+                    if s > best_score + 50 && !is_pv {
+                        re_search_depth = (re_search_depth + 1).min((MAX_PLY - 1) as u8);
+                    } else if s < best_score + 10 && re_search_depth as i32 > (reduced as i32 + 1) {
+                        re_search_depth -= 1;
+                    }
+                    s = -self.negamax(board, re_search_depth, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node);
                 }
 
                 if s > alpha && s < beta {

@@ -270,7 +270,13 @@ unsafe {
 
     #[inline(always)]
     fn draw_score(&self) -> i32 {
-        (self.nodes as i32 & 3) - 2
+        let fuzz = (self.nodes as i32 & 3) - 2;
+        let contempt = if self.root_score.abs() < 500 {
+            -self.root_score / 16
+        } else {
+            0
+        };
+        fuzz + contempt
     }
 
     #[inline(always)]
@@ -602,8 +608,9 @@ unsafe {
             return 0;
         }
 
-        if ply > 0 && board.is_draw() {
-            return self.draw_score();
+        let draw_score = self.draw_score();
+        if ply > 0 && (board.is_draw() || (alpha < draw_score && board.upcoming_repetition())) {
+            return draw_score;
         }
 
         if (ply as usize) >= MAX_PLY {
@@ -1201,8 +1208,9 @@ unsafe {
             return 0;
         }
 
-        if ply > 0 && (board.is_repetition() || board.halfmove_clock >= 100) {
-            return self.draw_score();
+        let draw_score = self.draw_score();
+        if ply > 0 && (board.is_repetition() || board.halfmove_clock >= 100 || (alpha < draw_score && board.upcoming_repetition())) {
+            return draw_score;
         }
 
         if (ply as usize) >= MAX_PLY {

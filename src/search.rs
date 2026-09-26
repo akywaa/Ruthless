@@ -1218,15 +1218,19 @@ unsafe {
 
         let in_check = board.in_check();
         let mut tt_move = Move::NULL;
+        let mut tt_score: Option<i32> = None;
+        let mut tt_flag = TTFlag::None;
 
         if let Some(entry) = self.tt.probe(board.tt_hash) {
             tt_move = entry.best_move;
-            let tt_score = score_from_tt(entry.score, ply);
+            tt_score = Some(score_from_tt(entry.score, ply));
+            tt_flag = entry.flag;
 
-            match entry.flag {
-                TTFlag::Exact => return tt_score,
-                TTFlag::LowerBound if tt_score >= beta => return tt_score,
-                TTFlag::UpperBound if tt_score <= alpha => return tt_score,
+            let s = tt_score.unwrap();
+            match tt_flag {
+                TTFlag::Exact => return s,
+                TTFlag::LowerBound if s >= beta => return s,
+                TTFlag::UpperBound if s <= alpha => return s,
                 _ => {}
             }
         }
@@ -1239,6 +1243,17 @@ unsafe {
         if !in_check {
             raw_eval = self.raw_eval(board);
             stand_pat = self.corrected_eval(board, ply, raw_eval);
+
+            if let Some(s) = tt_score {
+                if s.abs() < MATE_SCORE - 100 {
+                    match tt_flag {
+                        TTFlag::LowerBound if s > stand_pat => stand_pat = s,
+                        TTFlag::UpperBound if s < stand_pat => stand_pat = s,
+                        _ => {}
+                    }
+                }
+            }
+
             if stand_pat >= beta {
                 return stand_pat;
             }
@@ -1252,14 +1267,41 @@ unsafe {
         };
 
         if in_check {
-            let moves = generate_legal_moves(board);
+            let mut moves = generate_legal_moves(board);
             if moves.count == 0 {
                 return -MATE_SCORE + ply as i32;
             }
             let mut best_score = -INFINITY;
             let mut best_move = Move::NULL;
 
-            for &m in moves.as_slice() {
+            let mut scores = [0i32; 256];
+            for i in 0..moves.count {
+                let m = moves.moves[i];
+                if m == tt_move {
+                    scores[i] = 1_000_000;
+                } else if board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant {
+                    let victim = match m.move_type() {
+                        MoveType::EnPassant => PieceType::Pawn,
+                        _ => board.piece_on[m.to()].piece_type(),
+                    };
+                    let attacker = board.piece_on[m.from()].piece_type();
+                    scores[i] = 100_000 + crate::eval::PIECE_VALUES[victim as usize] * 10 - crate::eval::PIECE_VALUES[attacker as usize];
+                } else {
+                    scores[i] = 0;
+                }
+            }
+
+            for i in 0..moves.count {
+                let mut best_idx = i;
+                for j in (i + 1)..moves.count {
+                    if scores[j] > scores[best_idx] {
+                        best_idx = j;
+                    }
+                }
+                scores.swap(i, best_idx);
+                moves.moves.swap(i, best_idx);
+
+                let m = moves.moves[i];
                 let undo = board.make_move(m);
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1);
                 board.undo_move(m, undo);
@@ -1320,9 +1362,6 @@ unsafe {
                 if stand_pat + gain + 200 < alpha {
                     continue;
                 }
-                if !see(board, m, 0) {
-                    continue;
-                }
             }
 
             let undo = board.make_move(m);
@@ -1339,6 +1378,18 @@ unsafe {
             }
 
             if score >= beta {
+                let moving_pc = board.piece_on[m.from()] as usize;
+                let victim_pt = match m.move_type() {
+                    MoveType::EnPassant => PieceType::Pawn,
+                    MoveType::Promotion => m.promo_type(),
+                    _ => board.piece_on[m.to()].piece_type(),
+                } as usize;
+                if moving_pc < 12 && victim_pt < 6 {
+                    let threats = board.opponent_threats();
+                    let to_threatened = threats.contains(m.to()) as usize;
+                    update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt][to_threatened], 100);
+                }
+
                 self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store);
                 return score;
             }

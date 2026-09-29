@@ -478,6 +478,7 @@ unsafe {
 
     pub fn search_helper(&mut self, board: &mut Board, max_depth: u8, soft_time: Option<u128>) {
         self.nodes = 0;
+        self.start_time = Instant::now();
         self.soft_time_ms = soft_time;
         let mut score = 0;
         let start_depth = 1 + (self.thread_id % 2) as u8;

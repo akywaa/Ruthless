@@ -24,6 +24,7 @@ pub fn uci_loop() {
         Arc::clone(&shared_nodes),
         Arc::clone(&soft_stop_votes),
     );
+    let mut helpers: Vec<Searcher> = Vec::new();
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -54,6 +55,19 @@ pub fn uci_loop() {
                 handle_setoption(&tokens[1..], &mut tt_size_mb, &mut num_threads, &mut tt);
                 searcher.tt = Arc::clone(&tt);
                 searcher.num_threads = num_threads;
+
+                // Keep helper searchers persistent across searches
+                helpers.clear();
+                for id in 1..num_threads {
+                    helpers.push(Searcher::new(
+                        Arc::clone(&tt),
+                        Arc::clone(&stop_signal),
+                        id,
+                        num_threads,
+                        Arc::clone(&shared_nodes),
+                        Arc::clone(&soft_stop_votes),
+                    ));
+                }
             }
             "eval" => {
                 println!("nnue eval: {} cp", crate::eval::evaluate(&board));
@@ -63,13 +77,16 @@ pub fn uci_loop() {
             }
             "ucinewgame" => {
                 searcher.clear();
+                for helper in &mut helpers {
+                    helper.clear();
+                }
                 board = Board::default();
             }
             "position" => {
                 handle_position(&mut board, &tokens[1..]);
             }
             "go" => {
-                handle_go(&mut board, &mut searcher, num_threads, &tokens[1..]);
+                handle_go(&mut board, &mut searcher, &mut helpers, &tokens[1..]);
             }
             "quit" => break,
             _ => {}
@@ -180,7 +197,7 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
 fn handle_go(
     board: &mut Board,
     main_searcher: &mut Searcher,
-    threads: usize,
+    helpers: &mut Vec<Searcher>,
     tokens: &[&str],
 ) {
     let mut depth: u8 = 64;
@@ -265,30 +282,22 @@ fn handle_go(
         }
     };
 
-    main_searcher.num_threads = threads;
     main_searcher.soft_stop_votes.store(0, Ordering::Relaxed);
     main_searcher.shared_nodes.store(0, Ordering::Relaxed);
     main_searcher.stop.store(false, Ordering::Relaxed);
 
     let stop_signal = Arc::clone(&main_searcher.stop);
-    let tt = Arc::clone(&main_searcher.tt);
-    let shared_nodes = Arc::clone(&main_searcher.shared_nodes);
-    let soft_stop_votes = Arc::clone(&main_searcher.soft_stop_votes);
 
-    let best_move = if threads > 1 {
+    let best_move = if helpers.is_empty() {
+        let m = main_searcher.search(board, depth, soft_time, hard_time);
+        stop_signal.store(true, Ordering::Relaxed);
+        m
+    } else {
         std::thread::scope(|s| {
-            for id in 1..threads {
-                let mut helper_searcher = Searcher::new(
-                    Arc::clone(&tt),
-                    Arc::clone(&stop_signal),
-                    id,
-                    threads,
-                    Arc::clone(&shared_nodes),
-                    Arc::clone(&soft_stop_votes),
-                );
+            for helper in helpers.iter_mut() {
                 let mut helper_board = board.clone();
                 s.spawn(move || {
-                    helper_searcher.search_helper(&mut helper_board, depth, soft_time);
+                    helper.search_helper(&mut helper_board, depth, soft_time);
                 });
             }
 
@@ -296,10 +305,6 @@ fn handle_go(
             stop_signal.store(true, Ordering::Relaxed);
             m
         })
-    } else {
-        let m = main_searcher.search(board, depth, soft_time, hard_time);
-        stop_signal.store(true, Ordering::Relaxed);
-        m
     };
 
     println!("bestmove {}", best_move);

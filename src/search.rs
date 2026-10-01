@@ -5,7 +5,7 @@ use crate::movepick::MovePicker;
 use crate::see::see;
 use crate::tt::{TTFlag, TranspositionTable};
 use crate::types::{Move, MoveType, Piece, PieceType};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -40,6 +40,9 @@ pub struct Searcher {
     pub nodes: u64,
     pub stop: Arc<AtomicBool>,
     pub thread_id: usize,
+    pub num_threads: usize,
+    pub shared_nodes: Arc<AtomicU64>,
+    pub soft_stop_votes: Arc<AtomicUsize>,
     start_time: Instant,
     soft_time_ms: Option<u128>,
     hard_time_ms: Option<u128>,
@@ -49,8 +52,9 @@ pub struct Searcher {
     noisy_history: Box<[[[[i32; 2]; 6]; 64]; 12]>,
     counter_moves: [[Move; 64]; 64],
     conthist: Box<[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4]>,
-    pawn_corr: Box<[[i32; CORR_ENTRIES]; 2]>,
-    non_pawn_corr: Box<[[[i32; CORR_ENTRIES]; 2]; 2]>,
+    pawn_corr: Box<[[[i16; CORR_ENTRIES]; 2]; CORR_BUCKETS]>,
+    non_pawn_corr: Box<[[[[i16; CORR_ENTRIES]; 2]; 2]; CORR_BUCKETS]>,
+    cont_corr: Box<[[[[i16; 64]; 12]; 64]; 12]>,
     played_moves: [Move; MAX_PLY],
     played_pieces: [Piece; MAX_PLY],
     prev_in_check: [bool; MAX_PLY],
@@ -91,12 +95,22 @@ fn update_corr(val: &mut i16, bonus: i32) {
 }
 
 impl Searcher {
-    pub fn new(tt: Arc<TranspositionTable>, stop: Arc<AtomicBool>, thread_id: usize) -> Self {
+    pub fn new(
+        tt: Arc<TranspositionTable>,
+        stop: Arc<AtomicBool>,
+        thread_id: usize,
+        num_threads: usize,
+        shared_nodes: Arc<AtomicU64>,
+        soft_stop_votes: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             tt,
             nodes: 0,
             stop,
             thread_id,
+            num_threads,
+            shared_nodes,
+            soft_stop_votes,
             start_time: Instant::now(),
             soft_time_ms: None,
             hard_time_ms: None,
@@ -106,8 +120,9 @@ impl Searcher {
             noisy_history: vec![[[[0; 2]; 6]; 64]; 12].into_boxed_slice().try_into().unwrap(),
             counter_moves: [[Move::NULL; 64]; 64],
             conthist: vec![[[[[[0; 64]; 64]; 12]; 2]; 2]; 4].into_boxed_slice().try_into().unwrap(),
-            pawn_corr: vec![[0; CORR_ENTRIES]; 2].into_boxed_slice().try_into().unwrap(),
-            non_pawn_corr: vec![[[0; CORR_ENTRIES]; 2]; 2].into_boxed_slice().try_into().unwrap(),
+            pawn_corr: vec![[[0i16; CORR_ENTRIES]; 2]; CORR_BUCKETS].into_boxed_slice().try_into().unwrap(),
+            non_pawn_corr: vec![[[[0i16; CORR_ENTRIES]; 2]; 2]; CORR_BUCKETS].into_boxed_slice().try_into().unwrap(),
+            cont_corr: vec![[[[0i16; 64]; 12]; 64]; 12].into_boxed_slice().try_into().unwrap(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
             prev_in_check: [false; MAX_PLY],
@@ -291,7 +306,8 @@ impl Searcher {
             }
 
             let elapsed = self.start_time.elapsed().as_millis().max(1);
-            let nps = (self.nodes as u128 * 1000) / elapsed;
+            let total_nodes = self.shared_nodes.load(Ordering::Relaxed) + (self.nodes & 2047);
+            let nps = (total_nodes as u128 * 1000) / elapsed;
 
             let pv = self.extract_pv(board, depth);
             let pv_str = pv.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" ");
@@ -303,7 +319,7 @@ impl Searcher {
                     "info depth {} score mate {} nodes {} nps {} time {} pv {}",
                     depth,
                     mate_dist * sign,
-                    self.nodes,
+                    total_nodes,
                     nps,
                     elapsed,
                     pv_str
@@ -311,7 +327,7 @@ impl Searcher {
             } else {
                 println!(
                     "info depth {} score cp {} nodes {} nps {} time {} pv {}",
-                    depth, score, self.nodes, nps, elapsed, pv_str
+                    depth, score, total_nodes, nps, elapsed, pv_str
                 );
             }
 
@@ -321,23 +337,22 @@ impl Searcher {
                 stable_iterations = 0;
             }
 
+            let eval_stable = (prev_score - score).abs() < 15;
+
             if let Some(soft_limit) = self.soft_time_ms {
-                let mut time_scale = 1.0f32;
+                let score_diff = (prev_score - score).clamp(-100, 100) as f32;
+                let score_trend = (0.75 + 0.04 * score_diff).clamp(0.7, 1.4);
+                let pv_factor = (1.25 - 0.05 * (stable_iterations as f32)).max(0.7);
+                let eval_factor = if eval_stable { 0.85 } else { 1.15 };
 
-                if best_move != prev_best_move && depth >= 5 {
-                    time_scale *= 1.6;
-                }
-                if score < prev_score - 20 && depth >= 5 {
-                    time_scale *= 1.4;
-                }
-                if stable_iterations >= 4 && depth >= 7 {
-                    time_scale *= 0.6;
-                } else if stable_iterations >= 2 && depth >= 6 {
-                    time_scale *= 0.8;
-                }
+                let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor) as u128;
 
-                let dynamic_soft = ((soft_limit as f32) * time_scale) as u128;
                 if elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
+                    let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
+                    let majority = (self.num_threads * 65).div_ceil(100);
+                    if votes >= majority || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
+                        self.stop.store(true, Ordering::Relaxed);
+                    }
                     break;
                 }
             }
@@ -349,8 +364,9 @@ impl Searcher {
         best_move
     }
 
-    pub fn search_helper(&mut self, board: &mut Board, max_depth: u8) {
+    pub fn search_helper(&mut self, board: &mut Board, max_depth: u8, soft_time: Option<u128>) {
         self.nodes = 0;
+        self.soft_time_ms = soft_time;
         let mut score = 0;
         let start_depth = 1 + (self.thread_id % 2) as u8;
         let target_depth = (max_depth as usize + 8).min(64) as u8;
@@ -389,6 +405,18 @@ impl Searcher {
             } else {
                 score = self.negamax(board, depth, 0, -INFINITY, INFINITY, false, Move::NULL, false);
             }
+
+            if let Some(soft_limit) = self.soft_time_ms {
+                let elapsed = self.start_time.elapsed().as_millis();
+                if depth >= 6 && elapsed >= soft_limit {
+                    let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
+                    let majority = (self.num_threads * 65).div_ceil(100);
+                    if votes >= majority {
+                        self.stop.store(true, Ordering::Relaxed);
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -397,7 +425,7 @@ impl Searcher {
         let mut undos = Vec::new();
 
         for _ in 0..depth {
-            if let Some(entry) = self.tt.probe(board.hash) {
+            if let Some(entry) = self.tt.probe(board.tt_hash) {
                 if entry.best_move == Move::NULL {
                     break;
                 }
@@ -421,9 +449,12 @@ impl Searcher {
     }
 
     fn check_time(&mut self) {
-        if let Some(hard_limit) = self.hard_time_ms {
-            if (self.nodes & 2047) == 0 && self.start_time.elapsed().as_millis() >= hard_limit {
-                self.stop.store(true, Ordering::Relaxed);
+        if (self.nodes & 2047) == 0 {
+            self.shared_nodes.fetch_add(2048, Ordering::Relaxed);
+            if let Some(hard_limit) = self.hard_time_ms {
+                if self.start_time.elapsed().as_millis() >= hard_limit {
+                    self.stop.store(true, Ordering::Relaxed);
+                }
             }
         }
     }

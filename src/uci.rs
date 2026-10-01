@@ -4,7 +4,7 @@ use crate::search::Searcher;
 use crate::tt::TranspositionTable;
 use crate::types::Color;
 use std::io::{self, BufRead};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub fn uci_loop() {
@@ -13,7 +13,17 @@ pub fn uci_loop() {
     let mut num_threads = 1;
     let mut tt = Arc::new(TranspositionTable::new(tt_size_mb));
     let stop_signal = Arc::new(AtomicBool::new(false));
-    let mut searcher = Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal), 0);
+    let shared_nodes = Arc::new(AtomicU64::new(0));
+    let soft_stop_votes = Arc::new(AtomicUsize::new(0));
+
+    let mut searcher = Searcher::new(
+        Arc::clone(&tt),
+        Arc::clone(&stop_signal),
+        0,
+        num_threads,
+        Arc::clone(&shared_nodes),
+        Arc::clone(&soft_stop_votes),
+    );
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -37,6 +47,7 @@ pub fn uci_loop() {
             "setoption" => {
                 handle_setoption(&tokens[1..], &mut tt_size_mb, &mut num_threads, &mut tt);
                 searcher.tt = Arc::clone(&tt);
+                searcher.num_threads = num_threads;
             }
             "isready" => {
                 println!("readyok");
@@ -192,7 +203,7 @@ fn handle_go(
         i += 1;
     }
 
-    let overhead_ms = 25;
+    let overhead_ms = 20;
 
     let (soft_time, hard_time) = if let Some(mt) = movetime {
         let t = mt.saturating_sub(overhead_ms).max(5);
@@ -206,32 +217,54 @@ fn handle_go(
 
         if let Some(time) = my_time {
             let usable_time = time.saturating_sub(overhead_ms);
-            let moves = movestogo.unwrap_or(28).clamp(2, 50);
 
-            let base_time = usable_time / moves + (my_inc * 4) / 5;
-            let soft = (base_time * 6 / 10).clamp(5, usable_time);
-            let hard = (base_time * 2 + my_inc / 2).min(usable_time * 85 / 100).max(soft);
+            if let Some(moves) = movestogo {
+                let moves = moves.clamp(2, 50) as f64;
+                let base = (usable_time as f64 / moves) + 0.75 * my_inc as f64;
+                let soft = (base as u128).clamp(5, usable_time);
+                let hard = ((base * 4.5) as u128).min(usable_time * 85 / 100).max(soft);
+                (Some(soft), Some(hard))
+            } else {
+                let fullmove = board.fullmove_number as f64;
+                let soft_scale = 0.0594 - 0.0492 * (-0.0386 * fullmove).exp();
+                let hard_scale = 0.7281;
 
-            (Some(soft), Some(hard))
+                let soft = (soft_scale * usable_time as f64 + 0.75 * my_inc as f64) as u128;
+                let hard = (hard_scale * usable_time as f64 + 0.75 * my_inc as f64) as u128;
+
+                let soft = soft.clamp(5, usable_time);
+                let hard = hard.min(usable_time * 85 / 100).max(soft);
+                (Some(soft), Some(hard))
+            }
         } else {
             (None, None)
         }
     };
 
+    main_searcher.num_threads = threads;
+    main_searcher.soft_stop_votes.store(0, Ordering::Relaxed);
+    main_searcher.shared_nodes.store(0, Ordering::Relaxed);
+    main_searcher.stop.store(false, Ordering::Relaxed);
+
     let stop_signal = Arc::clone(&main_searcher.stop);
     let tt = Arc::clone(&main_searcher.tt);
-    let total_helper_nodes = Arc::new(AtomicU64::new(0));
+    let shared_nodes = Arc::clone(&main_searcher.shared_nodes);
+    let soft_stop_votes = Arc::clone(&main_searcher.soft_stop_votes);
 
     let best_move = if threads > 1 {
         std::thread::scope(|s| {
             for id in 1..threads {
-                let mut helper_searcher =
-                    Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal), id);
+                let mut helper_searcher = Searcher::new(
+                    Arc::clone(&tt),
+                    Arc::clone(&stop_signal),
+                    id,
+                    threads,
+                    Arc::clone(&shared_nodes),
+                    Arc::clone(&soft_stop_votes),
+                );
                 let mut helper_board = board.clone();
-                let nodes_acc = Arc::clone(&total_helper_nodes);
                 s.spawn(move || {
-                    helper_searcher.search_helper(&mut helper_board, depth);
-                    nodes_acc.fetch_add(helper_searcher.nodes, Ordering::Relaxed);
+                    helper_searcher.search_helper(&mut helper_board, depth, soft_time);
                 });
             }
 
@@ -240,7 +273,9 @@ fn handle_go(
             m
         })
     } else {
-        main_searcher.search(board, depth, soft_time, hard_time)
+        let m = main_searcher.search(board, depth, soft_time, hard_time);
+        stop_signal.store(true, Ordering::Relaxed);
+        m
     };
 
     println!("bestmove {}", best_move);

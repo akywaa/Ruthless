@@ -88,6 +88,7 @@ fn handle_go(board: &mut Board, searcher: &mut Searcher, tokens: &[&str]) {
     let mut btime: Option<u128> = None;
     let mut winc: u128 = 0;
     let mut binc: u128 = 0;
+    let mut movestogo: Option<u128> = None;
 
     let mut i = 0;
     while i < tokens.len() {
@@ -120,28 +121,41 @@ fn handle_go(board: &mut Board, searcher: &mut Searcher, tokens: &[&str]) {
                 binc = tokens.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 i += 1;
             }
+            "movestogo" => {
+                movestogo = tokens.get(i + 1).and_then(|s| s.parse().ok());
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
     }
 
-    let time_overhead_ms = 30;
+    let overhead_ms = 25;
 
-let time_budget = if let Some(mt) = movetime {
-    Some(mt.saturating_sub(time_overhead_ms).max(10))
-} else {
-    let (my_time, my_inc) = if board.side_to_move == Color::White {
-        (wtime, winc)
+    let (soft_time, hard_time) = if let Some(mt) = movetime {
+        let t = mt.saturating_sub(overhead_ms).max(5);
+        (Some(t), Some(t))
     } else {
-        (btime, binc)
+        let (my_time, my_inc) = if board.side_to_move == Color::White {
+            (wtime, winc)
+        } else {
+            (btime, binc)
+        };
+
+        if let Some(time) = my_time {
+            let usable_time = time.saturating_sub(overhead_ms);
+            let moves = movestogo.unwrap_or(25).clamp(2, 50);
+
+            let base_time = usable_time / moves + (my_inc * 3) / 4;
+            let soft = base_time.clamp(5, usable_time);
+            let hard = (soft * 3).min(usable_time * 8 / 10).max(soft);
+
+            (Some(soft), Some(hard))
+        } else {
+            (None, None)
+        }
     };
 
-    my_time.map(|t| {
-        let target = (t / 25 + my_inc / 2).saturating_sub(time_overhead_ms);
-        target.max(10)
-    })
-};
-
-    let best_move = searcher.search(board, depth, time_budget);
+    let best_move = searcher.search(board, depth, soft_time, hard_time);
     println!("bestmove {}", best_move);
 }

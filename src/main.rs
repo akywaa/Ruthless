@@ -1,29 +1,73 @@
+mod attacks;
 mod bitboard;
 mod board;
+mod movegen;
 mod types;
 
-use board::{Board, STARTING_FEN};
-use types::Color;
+use board::Board;
+use movegen::generate_legal_moves;
+use std::time::Instant;
+
+pub fn perft(board: &mut Board, depth: usize) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let moves = generate_legal_moves(board);
+    if depth == 1 {
+        return moves.count as u64;
+    }
+
+    let mut nodes = 0;
+    for &m in moves.as_slice() {
+        let undo = board.make_move(m);
+        nodes += perft(board, depth - 1);
+        board.undo_move(m, undo);
+    }
+    nodes
+}
 
 fn main() {
-    let board = Board::default();
-    println!("Board initialized from default FEN: {}", STARTING_FEN);
-    println!("White Pawns: {:064b}", board.pieces[types::Piece::WhitePawn].0);
-    println!("Side to move: {:?}", board.side_to_move);
-    println!("White King at: {:?}", board.king_square(Color::White));
+    let mut board = Board::default();
+    println!("Ruthless Chess Engine");
+
+    for depth in 1..=5 {
+        let start = Instant::now();
+        let nodes = perft(&mut board, depth);
+        let elapsed = start.elapsed();
+        let nps = if elapsed.as_secs_f64() > 0.0 {
+            (nodes as f64 / elapsed.as_secs_f64()) as u64
+        } else {
+            0
+        };
+        println!(
+            "Depth {}: {:>10} nodes | {:>8.2?} | {:>10} nps",
+            depth, nodes, elapsed, nps
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::Square;
 
     #[test]
-    fn test_starting_fen_parsing() {
-        let board = Board::from_fen(STARTING_FEN).expect("Valid starting FEN");
-        assert_eq!(board.side_to_move, Color::White);
-        assert_eq!(board.king_square(Color::White), Square::E1);
-        assert_eq!(board.king_square(Color::Black), Square::E8);
-        assert_eq!(board.occupied.count(), 32);
+    fn test_perft_startpos() {
+        let mut board = Board::default();
+        assert_eq!(perft(&mut board, 1), 20);
+        assert_eq!(perft(&mut board, 2), 400);
+        assert_eq!(perft(&mut board, 3), 8902);
+        assert_eq!(perft(&mut board, 4), 197281);
+    }
+
+    #[test]
+    fn test_perft_kiwipete() {
+        let mut board = Board::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        assert_eq!(perft(&mut board, 1), 48);
+        assert_eq!(perft(&mut board, 2), 2039);
+        assert_eq!(perft(&mut board, 3), 97862);
     }
 }

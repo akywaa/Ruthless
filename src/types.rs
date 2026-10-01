@@ -241,3 +241,61 @@ impl Move {
         }
     }
 }
+
+impl Square {
+    #[inline(always)]
+    pub const fn is_valid(self) -> bool {
+        (self as u8) < 64
+    }
+}
+
+impl std::fmt::Display for Square {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.is_valid() {
+            return write!(f, "-");
+        }
+        let file = (b'a' + self.file()) as char;
+        let rank = (b'1' + self.rank()) as char;
+        write!(f, "{file}{rank}")
+    }
+}
+
+impl std::fmt::Display for Move {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let promo = match self.promo_type() {
+            PieceType::Knight => "n",
+            PieceType::Bishop => "b",
+            PieceType::Rook => "r",
+            PieceType::Queen => "q",
+            _ => "",
+        };
+        write!(f, "{}{}{}", self.from(), self.to(), promo)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct MoveList {
+    pub moves: [Move; 256],
+    pub count: usize,
+}
+
+impl MoveList {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            moves: [Move::NULL; 256],
+            count: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, m: Move) {
+        self.moves[self.count] = m;
+        self.count += 1;
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[Move] {
+        &self.moves[..self.count]
+    }
+}

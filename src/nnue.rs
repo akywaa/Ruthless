@@ -69,58 +69,78 @@ impl Accumulator {
     }
 
     #[inline(always)]
-    pub fn add_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
+    pub fn add_feature_side(&mut self, piece: Piece, sq: Square, ksq: Square, color: Color) {
         let net = network();
-        let (w_idx, b_idx) = feature_indices(piece, sq, w_ksq, b_ksq);
-
-        let w_weights = &net.feature_weights[w_idx].vals;
-        let b_weights = &net.feature_weights[b_idx].vals;
+        let idx = feature_index_side(piece, sq, ksq, color);
+        let weights = &net.feature_weights[idx].vals;
+        let side = color as usize;
 
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
                 unsafe {
-                    vec_add_avx2(&mut self.vals[Color::White as usize], w_weights);
-                    vec_add_avx2(&mut self.vals[Color::Black as usize], b_weights);
+                    vec_add_avx2(&mut self.vals[side], weights);
                     return;
                 }
             }
         }
 
         for i in 0..HIDDEN_SIZE {
-            self.vals[Color::White as usize][i] += w_weights[i];
-            self.vals[Color::Black as usize][i] += b_weights[i];
+            self.vals[side][i] += weights[i];
         }
     }
 
     #[inline(always)]
-    pub fn remove_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
+    pub fn remove_feature_side(&mut self, piece: Piece, sq: Square, ksq: Square, color: Color) {
         let net = network();
-        let (w_idx, b_idx) = feature_indices(piece, sq, w_ksq, b_ksq);
-
-        let w_weights = &net.feature_weights[w_idx].vals;
-        let b_weights = &net.feature_weights[b_idx].vals;
+        let idx = feature_index_side(piece, sq, ksq, color);
+        let weights = &net.feature_weights[idx].vals;
+        let side = color as usize;
 
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
                 unsafe {
-                    vec_sub_avx2(&mut self.vals[Color::White as usize], w_weights);
-                    vec_sub_avx2(&mut self.vals[Color::Black as usize], b_weights);
+                    vec_sub_avx2(&mut self.vals[side], weights);
                     return;
                 }
             }
         }
 
         for i in 0..HIDDEN_SIZE {
-            self.vals[Color::White as usize][i] -= w_weights[i];
-            self.vals[Color::Black as usize][i] -= b_weights[i];
+            self.vals[side][i] -= weights[i];
+        }
+    }
+
+    #[inline(always)]
+    pub fn add_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
+        self.add_feature_side(piece, sq, w_ksq, Color::White);
+        self.add_feature_side(piece, sq, b_ksq, Color::Black);
+    }
+
+    #[inline(always)]
+    pub fn remove_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
+        self.remove_feature_side(piece, sq, w_ksq, Color::White);
+        self.remove_feature_side(piece, sq, b_ksq, Color::Black);
+    }
+
+    pub fn refresh_side(&mut self, board: &Board, color: Color) {
+        let net = network();
+        let side = color as usize;
+        self.vals[side] = net.feature_bias.vals;
+        let ksq = board.king_square(color);
+
+        for sq in 0..64 {
+            let piece = board.piece_on[sq];
+            if piece != Piece::None {
+                self.add_feature_side(piece, Square::new(sq as u8), ksq, color);
+            }
         }
     }
 }
 
 #[inline(always)]
-fn king_bucket(sq: Square) -> usize {
+pub fn king_bucket(sq: Square) -> usize {
     let file = sq.file();
     let rank = sq.rank();
     let mirrored_file = if file > 3 { 7 - file } else { file };
@@ -128,41 +148,34 @@ fn king_bucket(sq: Square) -> usize {
 }
 
 #[inline(always)]
-fn feature_indices(
-    piece: Piece,
-    sq: Square,
-    w_ksq: Square,
-    b_ksq: Square,
-) -> (usize, usize) {
+pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, color: Color) -> usize {
     let p_idx = piece as usize;
     let sq_idx = sq as usize;
 
-    let w_bucket = king_bucket(w_ksq);
-    let white_idx = w_bucket * 768 + p_idx * 64 + sq_idx;
-
-    let flipped_b_ksq = Square::new((b_ksq as u8) ^ 56);
-    let b_bucket = king_bucket(flipped_b_ksq);
-
-    let flipped_piece = match piece {
-        Piece::WhitePawn => Piece::BlackPawn,
-        Piece::WhiteKnight => Piece::BlackKnight,
-        Piece::WhiteBishop => Piece::BlackBishop,
-        Piece::WhiteRook => Piece::BlackRook,
-        Piece::WhiteQueen => Piece::BlackQueen,
-        Piece::WhiteKing => Piece::BlackKing,
-        Piece::BlackPawn => Piece::WhitePawn,
-        Piece::BlackKnight => Piece::WhiteKnight,
-        Piece::BlackBishop => Piece::WhiteBishop,
-        Piece::BlackRook => Piece::WhiteRook,
-        Piece::BlackQueen => Piece::WhiteQueen,
-        Piece::BlackKing => Piece::WhiteKing,
-        Piece::None => Piece::None,
-    } as usize;
-
-    let flipped_sq = sq_idx ^ 56;
-    let black_idx = b_bucket * 768 + flipped_piece * 64 + flipped_sq;
-
-    (white_idx, black_idx)
+    if color == Color::White {
+        let bucket = king_bucket(ksq);
+        bucket * 768 + p_idx * 64 + sq_idx
+    } else {
+        let flipped_ksq = Square::new((ksq as u8) ^ 56);
+        let bucket = king_bucket(flipped_ksq);
+        let flipped_piece = match piece {
+            Piece::WhitePawn => Piece::BlackPawn,
+            Piece::WhiteKnight => Piece::BlackKnight,
+            Piece::WhiteBishop => Piece::BlackBishop,
+            Piece::WhiteRook => Piece::BlackRook,
+            Piece::WhiteQueen => Piece::BlackQueen,
+            Piece::WhiteKing => Piece::BlackKing,
+            Piece::BlackPawn => Piece::WhitePawn,
+            Piece::BlackKnight => Piece::WhiteKnight,
+            Piece::BlackBishop => Piece::WhiteBishop,
+            Piece::BlackRook => Piece::WhiteRook,
+            Piece::BlackQueen => Piece::WhiteQueen,
+            Piece::BlackKing => Piece::WhiteKing,
+            Piece::None => Piece::None,
+        } as usize;
+        let flipped_sq = sq_idx ^ 56;
+        bucket * 768 + flipped_piece * 64 + flipped_sq
+    }
 }
 
 #[inline(always)]

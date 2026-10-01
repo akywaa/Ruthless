@@ -28,7 +28,7 @@ struct Cluster {
 impl Cluster {
     fn empty() -> Self {
         Self {
-            entries: [AtomicU64::new(0); 3],
+            entries: [const { AtomicU64::new(0) }; 3],
             _pad: 0,
         }
     }

@@ -1,9 +1,10 @@
 use crate::board::Board;
-use crate::eval::{evaluate, PIECE_VALUES};
-use crate::movegen::{generate_legal_moves, generate_noisy_moves};
+use crate::eval::evaluate;
+use crate::movegen::generate_legal_moves;
+use crate::movepick::MovePicker;
 use crate::see::see;
 use crate::tt::{TTFlag, TranspositionTable};
-use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType};
+use crate::types::{Color, Move, MoveType, Piece, PieceType};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -433,20 +434,6 @@ impl Searcher {
             }
         }
 
-        let mut moves = generate_legal_moves(board);
-        if moves.count == 0 {
-            if in_check {
-                return -MATE_SCORE + ply as i32;
-            }
-            return 0;
-        }
-
-        // Score all moves upfront without sorting
-        let mut move_scores = [0i32; 256];
-        for i in 0..moves.count {
-            move_scores[i] = self.score_move(board, moves.moves[i], tt_move, ply);
-        }
-
         let mut best_score = -INFINITY;
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
@@ -458,22 +445,39 @@ impl Searcher {
 
         let mut quiet_moves = [Move::NULL; 64];
         let mut quiet_count = 0;
-        let mut noisy_moves = [Move::NULL; 32];
-        let mut noisy_count = 0;
 
-        for i in 0..moves.count {
-            // Incremental selection sort
-            let mut best_idx = i;
-            for j in (i + 1)..moves.count {
-                if move_scores[j] > move_scores[best_idx] {
-                    best_idx = j;
-                }
-            }
-            move_scores.swap(i, best_idx);
-            moves.moves.swap(i, best_idx);
+        let prev_move = if ply > 0 && (ply as usize) < MAX_PLY {
+            self.played_moves[(ply - 1) as usize]
+        } else {
+            Move::NULL
+        };
+        let prev_piece = if ply > 0 && (ply as usize) < MAX_PLY {
+            self.played_pieces[(ply - 1) as usize]
+        } else {
+            Piece::None
+        };
+        let counter_move = if prev_move != Move::NULL {
+            self.counter_moves[prev_move.from() as usize][prev_move.to() as usize]
+        } else {
+            Move::NULL
+        };
 
-            let m = moves.moves[i];
+        let killers = if (ply as usize) < MAX_PLY {
+            self.killers[ply as usize]
+        } else {
+            [Move::NULL; 2]
+        };
 
+        let mut picker = MovePicker::new(tt_move, killers, counter_move);
+
+        while let Some(m) = picker.next(
+            board,
+            &self.history,
+            &self.conthist,
+            &self.capture_history,
+            prev_piece,
+            prev_move,
+        ) {
             if m == excluded_move {
                 continue;
             }
@@ -501,9 +505,6 @@ impl Searcher {
             if is_quiet && quiet_count < 64 {
                 quiet_moves[quiet_count] = m;
                 quiet_count += 1;
-            } else if !is_quiet && noisy_count < 32 {
-                noisy_moves[noisy_count] = m;
-                noisy_count += 1;
             }
 
             if (ply as usize) < MAX_PLY {
@@ -627,6 +628,16 @@ impl Searcher {
             }
         }
 
+        if moves_searched == 0 {
+            if excluded_move != Move::NULL {
+                return alpha;
+            }
+            if in_check {
+                return -MATE_SCORE + ply as i32;
+            }
+            return 0;
+        }
+
         let flag = if best_score <= alpha_orig {
             TTFlag::UpperBound
         } else if best_score >= beta {
@@ -664,33 +675,28 @@ impl Searcher {
         }
 
         self.nodes += 1;
-
         let in_check = board.in_check();
 
-        let mut moves = if in_check {
-            let legal = generate_legal_moves(board);
-            if legal.count == 0 {
-                return -MATE_SCORE + ply as i32;
-            }
-            legal
-        } else {
+        if !in_check {
             let stand_pat = self.corrected_eval(board);
             if stand_pat >= beta {
                 return beta;
             }
             alpha = alpha.max(stand_pat);
-            generate_noisy_moves(board)
-        };
+        }
 
-        self.order_moves(board, &mut moves, Move::NULL, ply);
+        let mut picker = MovePicker::new_qsearch(Move::NULL);
+        let mut moves_searched = 0;
 
-        for i in 0..moves.count {
-            let m = moves.moves[i];
-
-            if !in_check && !see(board, m, 0) {
-                continue;
-            }
-
+        while let Some(m) = picker.next(
+            board,
+            &self.history,
+            &self.conthist,
+            &self.capture_history,
+            Piece::None,
+            Move::NULL,
+        ) {
+            moves_searched += 1;
             let undo = board.make_move(m);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             board.undo_move(m, undo);
@@ -705,70 +711,10 @@ impl Searcher {
             alpha = alpha.max(score);
         }
 
+        if in_check && moves_searched == 0 {
+            return -MATE_SCORE + ply as i32;
+        }
+
         alpha
-    }
-
-    fn score_move(&self, board: &Board, m: Move, tt_move: Move, ply: u8) -> i32 {
-        if m == tt_move {
-            return 2_000_000;
-        }
-
-        let us = board.side_to_move as usize;
-        let attacker_pt = board.piece_on[m.from()].piece_type();
-        let captured = board.piece_on[m.to()];
-
-        if captured != Piece::None || m.move_type() == MoveType::EnPassant {
-            let victim_pt = if m.move_type() == MoveType::EnPassant {
-                PieceType::Pawn
-            } else {
-                captured.piece_type()
-            };
-
-            let victim_val = PIECE_VALUES[victim_pt as usize];
-            let attacker_val = PIECE_VALUES[attacker_pt as usize];
-            let mvv_lva = victim_val * 10 - attacker_val;
-
-            // Skip expensive SEE when capturing equal or higher value piece
-            let is_good = victim_val >= attacker_val || see(board, m, 0);
-
-            if is_good {
-                let cap_hist = self.capture_history[us][attacker_pt as usize][m.to() as usize];
-                return 1_000_000 + mvv_lva + cap_hist;
-            } else {
-                return -500_000 + mvv_lva;
-            }
-        }
-
-        if (ply as usize) < MAX_PLY {
-            if m == self.killers[ply as usize][0] {
-                return 900_000;
-            }
-            if m == self.killers[ply as usize][1] {
-                return 800_000;
-            }
-        }
-
-        let prev_move = if ply > 0 && (ply as usize) < MAX_PLY {
-            self.played_moves[(ply - 1) as usize]
-        } else {
-            Move::NULL
-        };
-
-        if prev_move != Move::NULL
-            && m == self.counter_moves[prev_move.from() as usize][prev_move.to() as usize]
-        {
-            return 700_000;
-        }
-
-        let mut score = self.history[us][m.from() as usize][m.to() as usize];
-
-        if ply > 0 && (ply as usize) < MAX_PLY {
-            let prev_piece = self.played_pieces[(ply - 1) as usize];
-            if prev_piece != Piece::None {
-                score += self.conthist[prev_piece as usize][prev_move.to() as usize][m.to() as usize];
-            }
-        }
-
-        score
     }
 }

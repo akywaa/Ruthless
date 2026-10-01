@@ -3,6 +3,7 @@ mod bitboard;
 mod board;
 mod eval;
 mod movegen;
+mod movepick;
 mod nnue;
 mod search;
 mod see;

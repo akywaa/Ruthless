@@ -25,6 +25,7 @@ pub fn network() -> &'static Network {
     unsafe { &*(NETWORK_BYTES.as_ptr() as *const Network) }
 }
 
+#[repr(C, align(64))]
 #[derive(Copy, Clone)]
 pub struct Accumulator {
     pub vals: [[i16; HIDDEN_SIZE]; 2],
@@ -47,6 +48,17 @@ impl Accumulator {
         let w_weights = &net.feature_weights[w_idx].vals;
         let b_weights = &net.feature_weights[b_idx].vals;
 
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe {
+                    vec_add_avx2(&mut self.vals[Color::White as usize], w_weights);
+                    vec_add_avx2(&mut self.vals[Color::Black as usize], b_weights);
+                    return;
+                }
+            }
+        }
+
         for i in 0..HIDDEN_SIZE {
             self.vals[Color::White as usize][i] += w_weights[i];
             self.vals[Color::Black as usize][i] += b_weights[i];
@@ -60,6 +72,17 @@ impl Accumulator {
 
         let w_weights = &net.feature_weights[w_idx].vals;
         let b_weights = &net.feature_weights[b_idx].vals;
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe {
+                    vec_sub_avx2(&mut self.vals[Color::White as usize], w_weights);
+                    vec_sub_avx2(&mut self.vals[Color::Black as usize], b_weights);
+                    return;
+                }
+            }
+        }
 
         for i in 0..HIDDEN_SIZE {
             self.vals[Color::White as usize][i] -= w_weights[i];
@@ -108,6 +131,15 @@ pub fn evaluate(acc: &Accumulator, side_to_move: Color) -> i32 {
     let us = side_to_move as usize;
     let them = (!side_to_move) as usize;
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                return evaluate_avx2(acc, us, them, net);
+            }
+        }
+    }
+
     let mut output = 0i32;
 
     for i in 0..HIDDEN_SIZE {
@@ -124,4 +156,99 @@ pub fn evaluate(acc: &Accumulator, side_to_move: Color) -> i32 {
     output /= i32::from(QA) * i32::from(QB);
 
     output
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+    use std::arch::x86_64::*;
+    let a_ptr = acc.as_mut_ptr() as *mut __m256i;
+    let w_ptr = weights.as_ptr() as *const __m256i;
+    for i in 0..(HIDDEN_SIZE / 16) {
+        let va = _mm256_load_si256(a_ptr.add(i));
+        let vw = _mm256_load_si256(w_ptr.add(i));
+        _mm256_store_si256(a_ptr.add(i), _mm256_add_epi16(va, vw));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_sub_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+    use std::arch::x86_64::*;
+    let a_ptr = acc.as_mut_ptr() as *mut __m256i;
+    let w_ptr = weights.as_ptr() as *const __m256i;
+    for i in 0..(HIDDEN_SIZE / 16) {
+        let va = _mm256_load_si256(a_ptr.add(i));
+        let vw = _mm256_load_si256(w_ptr.add(i));
+        _mm256_store_si256(a_ptr.add(i), _mm256_sub_epi16(va, vw));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn evaluate_avx2(acc: &Accumulator, us: usize, them: usize, net: &'static Network) -> i32 {
+    use std::arch::x86_64::*;
+
+    let zero = _mm256_setzero_si256();
+    let qa = _mm256_set1_epi16(QA);
+
+    let mut sum_vec = _mm256_setzero_si256();
+
+    forward_side_avx2(&acc.vals[us], &net.output_weights[0..HIDDEN_SIZE], zero, qa, &mut sum_vec);
+    forward_side_avx2(&acc.vals[them], &net.output_weights[HIDDEN_SIZE..2 * HIDDEN_SIZE], zero, qa, &mut sum_vec);
+
+    let low128 = _mm256_castsi256_si128(sum_vec);
+    let high128 = _mm256_extracti128_si256(sum_vec, 1);
+    let sum128 = _mm_add_epi32(low128, high128);
+    let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b01_00_11_10));
+    let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0b00_00_00_01));
+    let mut output = _mm_cvtsi128_si32(sum32);
+
+    output /= i32::from(QA);
+    output += i32::from(net.output_bias);
+    output *= SCALE;
+    output /= i32::from(QA) * i32::from(QB);
+
+    output
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn forward_side_avx2(
+    vals: &[i16; HIDDEN_SIZE],
+    weights: &[i16],
+    zero: std::arch::x86_64::__m256i,
+    qa: std::arch::x86_64::__m256i,
+    sum_vec: &mut std::arch::x86_64::__m256i,
+) {
+    use std::arch::x86_64::*;
+
+    let v_ptr = vals.as_ptr() as *const __m256i;
+    let w_ptr = weights.as_ptr() as *const __m256i;
+
+    for i in 0..(HIDDEN_SIZE / 16) {
+        let v = _mm256_load_si256(v_ptr.add(i));
+        let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa);
+
+        let low_16 = _mm256_castsi256_si128(clamped);
+        let high_16 = _mm256_extracti128_si256(clamped, 1);
+
+        let y_low = _mm256_cvtepi16_epi32(low_16);
+        let y_high = _mm256_cvtepi16_epi32(high_16);
+
+        // SCReLU: y * y
+        let sq_low = _mm256_mullo_epi32(y_low, y_low);
+        let sq_high = _mm256_mullo_epi32(y_high, y_high);
+
+        let w = _mm256_loadu_si256(w_ptr.add(i));
+        let w_low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(w));
+        let w_high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(w, 1));
+
+        // (y * y) * weight
+        let p_low = _mm256_mullo_epi32(sq_low, w_low);
+        let p_high = _mm256_mullo_epi32(sq_high, w_high);
+
+        *sum_vec = _mm256_add_epi32(*sum_vec, p_low);
+        *sum_vec = _mm256_add_epi32(*sum_vec, p_high);
+    }
 }

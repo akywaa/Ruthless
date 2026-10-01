@@ -24,6 +24,7 @@ pub struct UndoState {
     pub halfmove_clock: u8,
     pub captured: Piece,
     pub hash: u64,
+    pub non_pawn_hash: [u64; 2],
     pub accumulator: Accumulator,
 }
 
@@ -40,6 +41,7 @@ pub struct Board {
     pub fullmove_number: u16,
     pub hash: u64,
     pub pawn_hash: u64,
+    pub non_pawn_hash: [u64; 2],
     pub history: Vec<u64>,
     pub accumulator: Accumulator,
 }
@@ -63,6 +65,7 @@ impl Board {
             fullmove_number: 1,
             hash: 0,
             pawn_hash: 0,
+            non_pawn_hash: [0; 2],
             history: Vec::with_capacity(256),
             accumulator: Accumulator::new(),
         }
@@ -166,6 +169,7 @@ impl Board {
 
         board.hash = board.compute_hash();
         board.pawn_hash = board.compute_pawn_hash();
+        board.non_pawn_hash = board.compute_non_pawn_hash();
         board.refresh_accumulator();
         Ok(board)
     }
@@ -197,6 +201,8 @@ impl Board {
         self.hash ^= piece_key(piece, sq);
         if piece.piece_type() == PieceType::Pawn {
             self.pawn_hash ^= piece_key(piece, sq);
+        } else {
+            self.non_pawn_hash[piece.color() as usize] ^= piece_key(piece, sq);
         }
     }
 
@@ -211,6 +217,8 @@ impl Board {
             self.hash ^= piece_key(piece, sq);
             if piece.piece_type() == PieceType::Pawn {
                 self.pawn_hash ^= piece_key(piece, sq);
+            } else {
+                self.non_pawn_hash[piece.color() as usize] ^= piece_key(piece, sq);
             }
         }
         piece
@@ -222,6 +230,17 @@ impl Board {
             let p = self.piece_on[sq];
             if p != Piece::None && p.piece_type() == PieceType::Pawn {
                 h ^= piece_key(p, Square::new(sq as u8));
+            }
+        }
+        h
+    }
+
+    pub fn compute_non_pawn_hash(&self) -> [u64; 2] {
+        let mut h = [0u64; 2];
+        for sq in 0..64 {
+            let p = self.piece_on[sq];
+            if p != Piece::None && p.piece_type() != PieceType::Pawn {
+                h[p.color() as usize] ^= piece_key(p, Square::new(sq as u8));
             }
         }
         h
@@ -302,6 +321,7 @@ impl Board {
             halfmove_clock: self.halfmove_clock,
             captured: Piece::None,
             hash: self.hash,
+            non_pawn_hash: self.non_pawn_hash,
             accumulator: self.accumulator,
         };
 
@@ -326,6 +346,7 @@ impl Board {
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
+        self.non_pawn_hash = undo.non_pawn_hash;
         self.accumulator = undo.accumulator;
     }
 
@@ -346,6 +367,7 @@ impl Board {
             halfmove_clock: self.halfmove_clock,
             captured: self.piece_on[to],
             hash: self.hash,
+            non_pawn_hash: self.non_pawn_hash,
             accumulator: self.accumulator,
         };
 
@@ -487,6 +509,7 @@ impl Board {
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
+        self.non_pawn_hash = undo.non_pawn_hash;
         self.accumulator = undo.accumulator;
     }
 }

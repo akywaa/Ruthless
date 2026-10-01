@@ -230,6 +230,15 @@ impl Board {
     }
 
     #[inline(always)]
+    pub fn has_non_pawn_material(&self, color: Color) -> bool {
+        let knights = self.pieces[Piece::new(color, PieceType::Knight)];
+        let bishops = self.pieces[Piece::new(color, PieceType::Bishop)];
+        let rooks = self.pieces[Piece::new(color, PieceType::Rook)];
+        let queens = self.pieces[Piece::new(color, PieceType::Queen)];
+        !(knights | bishops | rooks | queens).is_empty()
+    }
+
+    #[inline(always)]
     pub fn is_repetition(&self) -> bool {
         let count = self.history.len();
         if count < 4 || self.halfmove_clock < 4 {
@@ -246,6 +255,38 @@ impl Board {
         }
 
         false
+    }
+
+    pub fn make_null_move(&mut self) -> UndoState {
+        let undo = UndoState {
+            castling_rights: self.castling_rights,
+            ep_square: self.ep_square,
+            halfmove_clock: self.halfmove_clock,
+            captured: Piece::None,
+            hash: self.hash,
+        };
+
+        self.history.push(self.hash);
+
+        if self.ep_square.is_valid() {
+            self.hash ^= ep_key(self.ep_square.file());
+            self.ep_square = Square::None;
+        }
+
+        self.side_to_move = !self.side_to_move;
+        self.hash ^= side_key();
+        self.halfmove_clock = 0;
+
+        undo
+    }
+
+    pub fn undo_null_move(&mut self, undo: UndoState) {
+        self.history.pop();
+        self.side_to_move = !self.side_to_move;
+        self.castling_rights = undo.castling_rights;
+        self.ep_square = undo.ep_square;
+        self.halfmove_clock = undo.halfmove_clock;
+        self.hash = undo.hash;
     }
 
     pub fn make_move(&mut self, m: Move) -> UndoState {

@@ -430,6 +430,14 @@ impl Searcher {
                 return static_eval;
             }
 
+            // Razoring
+            if depth <= 3 && static_eval + 300 + 150 * (depth as i32) <= alpha {
+                let qscore = self.quiescence(board, alpha, beta, ply);
+                if qscore <= alpha {
+                    return qscore;
+                }
+            }
+
             if depth >= 3 && static_eval >= beta && board.has_non_pawn_material(board.side_to_move) {
                 let r = 2 + depth / 4;
                 let undo = board.make_null_move();
@@ -438,6 +446,48 @@ impl Searcher {
 
                 if score >= beta {
                     return if score >= MATE_SCORE - 100 { beta } else { score };
+                }
+            }
+        }
+
+        // ProbCut
+        if depth >= 5 && beta.abs() < MATE_SCORE - 100 {
+            let probcut_beta = beta + 200;
+            let mut probcut_picker = MovePicker::new_qsearch(Move::NULL);
+
+            while let Some(m) = probcut_picker.next(
+                board,
+                &self.history,
+                &self.pawn_history,
+                &self.conthist,
+                &self.noisy_history,
+                ply,
+                &self.played_pieces,
+                &self.played_moves,
+            ) {
+                if !see(board, m, probcut_beta - static_eval) {
+                    continue;
+                }
+
+                let undo = board.make_move(m);
+                let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1);
+
+                if score >= probcut_beta {
+                    score = -self.negamax(
+                        board,
+                        depth - 4,
+                        ply + 1,
+                        -probcut_beta,
+                        -probcut_beta + 1,
+                        false,
+                        Move::NULL,
+                    );
+                }
+
+                board.undo_move(m, undo);
+
+                if score >= probcut_beta {
+                    return score;
                 }
             }
         }

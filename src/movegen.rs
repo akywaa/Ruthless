@@ -27,8 +27,10 @@ pub fn generate_noisy_pseudo(board: &Board, list: &mut MoveList) {
     let them = !us;
     let their_occ = board.occupied_co[them];
     let all_occ = board.occupied;
+    let empty = !board.occupied;
 
     generate_pawn_captures_pseudo(board, us, their_occ, list);
+    generate_pawn_promotions_pseudo(board, us, empty, list);
 
     let mut knights = board.pieces[Piece::new(us, PieceType::Knight)];
     while !knights.is_empty() {
@@ -189,20 +191,39 @@ fn generate_pawn_pushes_pseudo(
         let to_idx = (from as i8 + push_offset) as u8;
         let to = Square::new(to_idx);
 
-        if empty.contains(to) {
-            if to.rank() == promo_rank {
-                for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
-                    list.push(Move::new(from, to, pt, MoveType::Promotion));
-                }
-            } else {
-                list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+        if empty.contains(to) && to.rank() != promo_rank {
+            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
 
-                if from.rank() == start_rank {
-                    let double_to = Square::new((from as i8 + push_offset * 2) as u8);
-                    if empty.contains(double_to) {
-                        list.push(Move::new(from, double_to, PieceType::None, MoveType::Normal));
-                    }
+            if from.rank() == start_rank {
+                let double_to = Square::new((from as i8 + push_offset * 2) as u8);
+                if empty.contains(double_to) {
+                    list.push(Move::new(from, double_to, PieceType::None, MoveType::Normal));
                 }
+            }
+        }
+    }
+}
+
+fn generate_pawn_promotions_pseudo(
+    board: &Board,
+    us: Color,
+    empty: Bitboard,
+    list: &mut MoveList,
+) {
+    let pawns = board.pieces[Piece::new(us, PieceType::Pawn)];
+    let (push_offset, promo_rank): (i8, u8) = match us {
+        Color::White => (8, 7),
+        Color::Black => (-8, 0),
+    };
+
+    let mut p = pawns;
+    while !p.is_empty() {
+        let from = p.pop_lsb();
+        let to = Square::new((from as i8 + push_offset) as u8);
+
+        if empty.contains(to) && to.rank() == promo_rank {
+            for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
+                list.push(Move::new(from, to, pt, MoveType::Promotion));
             }
         }
     }

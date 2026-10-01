@@ -309,50 +309,43 @@ impl Board {
         !(knights | bishops | rooks | queens).is_empty()
     }
 
-    #[inline(always)]
-    pub fn has_insufficient_material(&self) -> bool {
-        let pawns = self.pieces[Piece::new(Color::White, PieceType::Pawn)]
-            | self.pieces[Piece::new(Color::Black, PieceType::Pawn)];
-        if !pawns.is_empty() {
+    pub fn draw_by_material(&self) -> bool {
+        let pawns = self.pieces[Piece::WhitePawn] | self.pieces[Piece::BlackPawn];
+        let rooks = self.pieces[Piece::WhiteRook] | self.pieces[Piece::BlackRook];
+        let queens = self.pieces[Piece::WhiteQueen] | self.pieces[Piece::BlackQueen];
+        if !(pawns | rooks | queens).is_empty() {
             return false;
         }
 
-        let rooks = self.pieces[Piece::new(Color::White, PieceType::Rook)]
-            | self.pieces[Piece::new(Color::Black, PieceType::Rook)];
-        let queens = self.pieces[Piece::new(Color::White, PieceType::Queen)]
-            | self.pieces[Piece::new(Color::Black, PieceType::Queen)];
-        if !rooks.is_empty() || !queens.is_empty() {
-            return false;
+        let count = self.occupied.count();
+        if count <= 2 {
+            return true;
         }
-
-        let w_knights = self.pieces[Piece::new(Color::White, PieceType::Knight)];
-        let b_knights = self.pieces[Piece::new(Color::Black, PieceType::Knight)];
-        let w_bishops = self.pieces[Piece::new(Color::White, PieceType::Bishop)];
-        let b_bishops = self.pieces[Piece::new(Color::Black, PieceType::Bishop)];
-        let total_knights = (w_knights | b_knights).count();
-        let total_bishops = (w_bishops | b_bishops).count();
-
-        match (total_knights, total_bishops) {
-            (_knights, 0) => true, // kings only or king + knights (impossible 2+ checkmates but rare)
-            (0, 1) => true,        // K+B vs K or K vs K+B
-            (0, 2) => {
-                // K+B vs K+B: draw if bishops on same color
-                if w_bishops.is_empty() || b_bishops.is_empty() {
+        if count == 3 {
+            let knights = self.pieces[Piece::WhiteKnight] | self.pieces[Piece::BlackKnight];
+            let bishops = self.pieces[Piece::WhiteBishop] | self.pieces[Piece::BlackBishop];
+            if !(knights | bishops).is_empty() {
+                return true;
+            }
+        }
+        if count == 4 {
+            let w_bishops = self.pieces[Piece::WhiteBishop];
+            let b_bishops = self.pieces[Piece::BlackBishop];
+            if w_bishops.count() == 1 && b_bishops.count() == 1 {
+                let light_squares = Bitboard(0x55AA55AA55AA55AAu64);
+                let w_light = !(w_bishops & light_squares).is_empty();
+                let b_light = !(b_bishops & light_squares).is_empty();
+                if w_light == b_light {
                     return true;
                 }
-                let w_sq = w_bishops.lsb();
-                let b_sq = b_bishops.lsb();
-                let w_color = (w_sq.file() + w_sq.rank()) & 1;
-                let b_color = (b_sq.file() + b_sq.rank()) & 1;
-                w_color == b_color
             }
-            _ => false,
         }
+        false
     }
 
     #[inline(always)]
     pub fn is_draw(&self) -> bool {
-        self.halfmove_clock >= 100 || self.has_insufficient_material()
+        self.is_repetition() || self.halfmove_clock >= 100 || self.draw_by_material()
     }
 
     #[inline(always)]
@@ -413,6 +406,48 @@ impl Board {
                 return true;
             }
             i += 2;
+        }
+
+        false
+    }
+
+    pub fn upcoming_repetition(&self) -> bool {
+        let count = self.history.len();
+        let max_steps = (self.halfmove_clock as usize).min(count);
+        if max_steps < 3 {
+            return false;
+        }
+
+        let current_key = self.hash;
+        let mut index = count - 1;
+        let mut other = current_key ^ self.history[index] ^ side_key();
+
+        let mut compared_ply = 3;
+        while compared_ply <= max_steps {
+            index -= 1;
+            other ^= self.history[index] ^ self.history[index - 1] ^ side_key();
+            index -= 1;
+
+            if other == 0 {
+                let diff = current_key ^ self.history[index];
+                let mut c_idx = crate::zobrist::h1(diff);
+
+                let cuckoo = crate::zobrist::cuckoo();
+                if cuckoo.keys[c_idx] != diff {
+                    c_idx = crate::zobrist::h2(diff);
+                    if cuckoo.keys[c_idx] != diff {
+                        compared_ply += 2;
+                        continue;
+                    }
+                }
+
+                let sq1 = cuckoo.sq_a[c_idx];
+                let sq2 = cuckoo.sq_b[c_idx];
+                if (crate::attacks::between(sq1, sq2) & self.occupied).is_empty() {
+                    return true;
+                }
+            }
+            compared_ply += 2;
         }
 
         false
@@ -566,7 +601,7 @@ impl Board {
                 Color::Black => crate::nnue::king_bucket(Square::new((to as u8) ^ 56)),
             };
 
-            if old_bucket != new_bucket {
+            if old_bucket != new_bucket || ((from.file() > 3) != (to.file() > 3)) {
                 self.refresh_accumulator_side(us);
             } else {
                 // Same bucket: update our side incrementally

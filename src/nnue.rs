@@ -1,5 +1,5 @@
 use crate::board::Board;
-use crate::types::{Color, Piece, PieceType, Square};
+use crate::types::{Color, Piece, Square};
 
 pub const HIDDEN_SIZE: usize = 1024;
 pub const NUM_INPUT_BUCKETS: usize = 10;
@@ -152,11 +152,11 @@ pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, color: Color) -
     let sq_idx = sq as usize;
 
     if color == Color::White {
-        let bucket = king_bucket(ksq);
-        bucket * 768 + p_idx * 64 + sq_idx
+        let flip = if ksq.file() > 3 { 7 } else { 0 };
+        king_bucket(ksq) * 768 + p_idx * 64 + (sq_idx ^ flip)
     } else {
         let flipped_ksq = Square::new((ksq as u8) ^ 56);
-        let bucket = king_bucket(flipped_ksq);
+        let flip = if flipped_ksq.file() > 3 { 7 } else { 0 };
         let flipped_piece = match piece {
             Piece::WhitePawn => Piece::BlackPawn,
             Piece::WhiteKnight => Piece::BlackKnight,
@@ -172,27 +172,14 @@ pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, color: Color) -
             Piece::BlackKing => Piece::WhiteKing,
             Piece::None => Piece::None,
         } as usize;
-        let flipped_sq = sq_idx ^ 56;
-        bucket * 768 + flipped_piece * 64 + flipped_sq
+        let flipped_sq = sq_idx ^ 56 ^ flip;
+        king_bucket(flipped_ksq) * 768 + flipped_piece * 64 + flipped_sq
     }
 }
 
 #[inline(always)]
 pub fn output_bucket(board: &Board) -> usize {
-    let mut material_count = 0;
-    for pt in [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
-        let count = board.pieces[Piece::new(Color::White, pt)].count()
-            + board.pieces[Piece::new(Color::Black, pt)].count();
-        let val = match pt {
-            PieceType::Pawn => 0,
-            PieceType::Knight | PieceType::Bishop => 1,
-            PieceType::Rook => 2,
-            PieceType::Queen => 4,
-            _ => 0,
-        };
-        material_count += (count as usize) * val;
-    }
-    (material_count * NUM_OUTPUT_BUCKETS / 32).min(NUM_OUTPUT_BUCKETS - 1)
+    ((board.occupied.count() as usize - 2) / 4).min(7)
 }
 
 #[inline(always)]

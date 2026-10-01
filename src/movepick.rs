@@ -23,6 +23,7 @@ pub struct MovePicker {
     stage: Stage,
     tt_move: Move,
     killers: [Move; 2],
+    killer_idx: usize,
     counter_move: Move,
     moves: MoveList,
     scores: [i32; 256],
@@ -37,6 +38,7 @@ impl MovePicker {
             stage: if tt_move != Move::NULL { Stage::TTMove } else { Stage::GenerateNoisy },
             tt_move,
             killers,
+            killer_idx: 0,
             counter_move,
             moves: MoveList::new(),
             scores: [0; 256],
@@ -51,6 +53,7 @@ impl MovePicker {
             stage: if tt_move != Move::NULL { Stage::TTMove } else { Stage::GenerateNoisy },
             tt_move,
             killers: [Move::NULL; 2],
+            killer_idx: 0,
             counter_move: Move::NULL,
             moves: MoveList::new(),
             scores: [0; 256],
@@ -78,7 +81,7 @@ impl MovePicker {
                 Stage::TTMove => {
                     self.stage = Stage::GenerateNoisy;
                     let m = self.tt_move;
-                    if self.is_legal(board, m) {
+                    if self.is_pseudo_legal_any(board, m) && self.is_legal(board, m) {
                         return Some(m);
                     }
                 }
@@ -112,16 +115,19 @@ impl MovePicker {
                     }
                 }
                 Stage::Killers => {
-                    self.stage = Stage::CounterMove;
-                    for &k in &self.killers {
+                    while self.killer_idx < 2 {
+                        let k = self.killers[self.killer_idx];
+                        self.killer_idx += 1;
                         if k != Move::NULL
                             && k != self.tt_move
+                            && !(self.killer_idx == 2 && k == self.killers[0])
                             && self.is_pseudo_legal(board, k)
                             && self.is_legal(board, k)
                         {
                             return Some(k);
                         }
                     }
+                    self.stage = Stage::CounterMove;
                 }
                 Stage::CounterMove => {
                     self.stage = Stage::GenerateQuiets;
@@ -207,10 +213,10 @@ impl MovePicker {
             let m = self.moves.moves[i];
             let attacker = board.piece_on[m.from()];
             let captured = board.piece_on[m.to()];
-            let victim_pt = if m.move_type() == MoveType::EnPassant {
-                PieceType::Pawn
-            } else {
-                captured.piece_type()
+            let victim_pt = match m.move_type() {
+                MoveType::EnPassant => PieceType::Pawn,
+                MoveType::Promotion => m.promo_type(),
+                _ => captured.piece_type(),
             };
 
             let to_threatened = threats.contains(m.to()) as usize;
@@ -333,5 +339,20 @@ impl MovePicker {
         let legal = !board.is_square_attacked(ksq, board.side_to_move);
         board.undo_move(m, undo);
         legal
+    }
+
+    fn is_pseudo_legal_any(&self, board: &Board, m: Move) -> bool {
+        if m == Move::NULL {
+            return false;
+        }
+        let from = m.from();
+        let pc = board.piece_on[from];
+        if pc == Piece::None || pc.color() != board.side_to_move {
+            return false;
+        }
+        let mut list = MoveList::new();
+        generate_noisy_pseudo(board, &mut list);
+        generate_quiet_pseudo(board, &mut list);
+        list.as_slice().contains(&m)
     }
 }

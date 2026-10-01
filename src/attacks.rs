@@ -16,6 +16,7 @@ pub struct AttackTables {
     pub bishop_magics: [Magic; SQUARE_NB],
     pub rook_magics: [Magic; SQUARE_NB],
     pub slider_table: Vec<Bitboard>,
+    pub between: [[Bitboard; SQUARE_NB]; SQUARE_NB],
 }
 
 static ATTACKS: OnceLock<AttackTables> = OnceLock::new();
@@ -58,6 +59,14 @@ pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
 #[inline(always)]
 pub fn queen_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     bishop_attacks(sq, occ) | rook_attacks(sq, occ)
+}
+
+#[inline(always)]
+pub fn between(sq1: Square, sq2: Square) -> Bitboard {
+    if !sq1.is_valid() || !sq2.is_valid() {
+        return Bitboard::EMPTY;
+    }
+    attacks().between[sq1 as usize][sq2 as usize]
 }
 
 struct Prng(u64);
@@ -119,6 +128,33 @@ impl AttackTables {
         let (bishop_magics, _) = Self::init_slider(true, &mut slider_table, &mut prng);
         let (rook_magics, _) = Self::init_slider(false, &mut slider_table, &mut prng);
 
+        let mut between = [[Bitboard::EMPTY; SQUARE_NB]; SQUARE_NB];
+        for sq1 in 0..64 {
+            let f1 = (sq1 % 8) as i8;
+            let r1 = (sq1 / 8) as i8;
+            for sq2 in 0..64 {
+                if sq1 == sq2 {
+                    continue;
+                }
+                let f2 = (sq2 % 8) as i8;
+                let r2 = (sq2 / 8) as i8;
+                let df = (f2 - f1).signum();
+                let dr = (r2 - r1).signum();
+
+                if f1 == f2 || r1 == r2 || (f1 - f2).abs() == (r1 - r2).abs() {
+                    let mut bb = 0u64;
+                    let mut cf = f1 + df;
+                    let mut cr = r1 + dr;
+                    while cf != f2 || cr != r2 {
+                        bb |= 1u64 << (cr * 8 + cf);
+                        cf += df;
+                        cr += dr;
+                    }
+                    between[sq1][sq2] = Bitboard(bb);
+                }
+            }
+        }
+
         Self {
             pawn_attacks,
             knight_attacks,
@@ -126,6 +162,7 @@ impl AttackTables {
             bishop_magics,
             rook_magics,
             slider_table,
+            between,
         }
     }
 

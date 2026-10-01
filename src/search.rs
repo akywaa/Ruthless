@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-pub const INFINITY: i32 = 1_000_000;
-pub const MATE_SCORE: i32 = 100_000;
-pub const MAX_PLY: usize = 64;
+pub const INFINITY: i32 = 32_500;
+pub const MATE_SCORE: i32 = 32_000;
+pub const MAX_PLY: usize = 128;
 pub const CORR_ENTRIES: usize = 16384;
 pub const CORR_BUCKETS: usize = 8;
 
@@ -60,6 +60,9 @@ pub struct Searcher {
     prev_in_check: [bool; MAX_PLY],
     prev_is_capture: [bool; MAX_PLY],
     eval_stack: [i32; MAX_PLY],
+    pub root_best_move: Move,
+    pub root_score: i32,
+    pub completed_depth: u8,
 }
 
 fn score_to_tt(score: i32, ply: u8) -> i32 {
@@ -94,6 +97,17 @@ fn update_corr(val: &mut i16, bonus: i32) {
     *val += (clamped - (*val as i32 * clamped.abs()) / 16384) as i16;
 }
 
+fn alloc_box_zeroed<T>() -> Box<T> {
+    unsafe {
+        let layout = std::alloc::Layout::new::<T>();
+        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Box::from_raw(ptr)
+    }
+}
+
 impl Searcher {
     pub fn new(
         tt: Arc<TranspositionTable>,
@@ -116,18 +130,21 @@ impl Searcher {
             hard_time_ms: None,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
-            pawn_history: vec![[[0; 64]; 12]; 512].into_boxed_slice().try_into().unwrap(),
-            noisy_history: vec![[[[0; 2]; 6]; 64]; 12].into_boxed_slice().try_into().unwrap(),
-            counter_moves: [[Move::NULL; 64]; 64],
-            conthist: vec![[[[[[0; 64]; 64]; 12]; 2]; 2]; 4].into_boxed_slice().try_into().unwrap(),
-            pawn_corr: vec![[[0i16; CORR_ENTRIES]; 2]; CORR_BUCKETS].into_boxed_slice().try_into().unwrap(),
-            non_pawn_corr: vec![[[[0i16; CORR_ENTRIES]; 2]; 2]; CORR_BUCKETS].into_boxed_slice().try_into().unwrap(),
-            cont_corr: vec![[[[0i16; 64]; 12]; 64]; 12].into_boxed_slice().try_into().unwrap(),
+            pawn_history: alloc_box_zeroed(),
+noisy_history: alloc_box_zeroed(),
+counter_moves: [[Move::NULL; 64]; 64],
+conthist: alloc_box_zeroed(),
+pawn_corr: alloc_box_zeroed(),
+non_pawn_corr: alloc_box_zeroed(),
+cont_corr: alloc_box_zeroed(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
             prev_in_check: [false; MAX_PLY],
             prev_is_capture: [false; MAX_PLY],
             eval_stack: [0; MAX_PLY],
+            root_best_move: Move::NULL,
+            root_score: 0,
+            completed_depth: 0,
         }
     }
 
@@ -135,18 +152,23 @@ impl Searcher {
         self.tt.clear();
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
-        self.pawn_history.fill([[0; 64]; 12]);
-        self.noisy_history.fill([[[0; 2]; 6]; 64]);
         self.counter_moves = [[Move::NULL; 64]; 64];
-        self.conthist.fill([[[[[0; 64]; 64]; 12]; 2]; 2]);
-        self.pawn_corr.fill([[0; CORR_ENTRIES]; 2]);
-        self.non_pawn_corr.fill([[[0; CORR_ENTRIES]; 2]; 2]);
-        self.cont_corr.fill([[[0; 64]; 12]; 64]);
+unsafe {
+    std::ptr::write_bytes(self.pawn_history.as_mut(), 0, 1);
+    std::ptr::write_bytes(self.noisy_history.as_mut(), 0, 1);
+    std::ptr::write_bytes(self.conthist.as_mut(), 0, 1);
+    std::ptr::write_bytes(self.pawn_corr.as_mut(), 0, 1);
+    std::ptr::write_bytes(self.non_pawn_corr.as_mut(), 0, 1);
+    std::ptr::write_bytes(self.cont_corr.as_mut(), 0, 1);
+}
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
         self.prev_in_check = [false; MAX_PLY];
         self.prev_is_capture = [false; MAX_PLY];
         self.eval_stack = [0; MAX_PLY];
+        self.root_best_move = Move::NULL;
+        self.root_score = 0;
+        self.completed_depth = 0;
     }
 
     #[inline(always)]
@@ -299,10 +321,8 @@ impl Searcher {
                 break;
             }
 
-            if let Some(entry) = self.tt.probe(board.tt_hash) {
-                if entry.best_move != Move::NULL {
-                    best_move = entry.best_move;
-                }
+            if self.root_best_move != Move::NULL {
+                best_move = self.root_best_move;
             }
 
             let elapsed = self.start_time.elapsed().as_millis().max(1);
@@ -359,6 +379,10 @@ impl Searcher {
 
             prev_best_move = best_move;
             prev_score = score;
+
+            self.root_best_move = best_move;
+            self.root_score = score;
+            self.completed_depth = depth;
         }
 
         best_move
@@ -369,7 +393,7 @@ impl Searcher {
         self.soft_time_ms = soft_time;
         let mut score = 0;
         let start_depth = 1 + (self.thread_id % 2) as u8;
-        let target_depth = (max_depth as usize + 8).min(64) as u8;
+        let target_depth = (max_depth as usize + 8).min(MAX_PLY) as u8;
 
         for depth in start_depth..=target_depth {
             if self.stop.load(Ordering::Relaxed) {
@@ -404,6 +428,14 @@ impl Searcher {
                 }
             } else {
                 score = self.negamax(board, depth, 0, -INFINITY, INFINITY, false, Move::NULL, false);
+            }
+
+            self.root_score = score;
+            self.completed_depth = depth;
+            if let Some(entry) = self.tt.probe(board.tt_hash) {
+                if entry.best_move != Move::NULL {
+                    self.root_best_move = entry.best_move;
+                }
             }
 
             if let Some(soft_limit) = self.soft_time_ms {
@@ -449,15 +481,23 @@ impl Searcher {
     }
 
     fn check_time(&mut self) {
-        if (self.nodes & 2047) == 0 {
-            self.shared_nodes.fetch_add(2048, Ordering::Relaxed);
-            if let Some(hard_limit) = self.hard_time_ms {
-                if self.start_time.elapsed().as_millis() >= hard_limit {
-                    self.stop.store(true, Ordering::Relaxed);
-                }
+    if (self.nodes & 2047) == 0 {
+        self.shared_nodes.fetch_add(2048, Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_millis();
+        
+        if let Some(hard_limit) = self.hard_time_ms {
+            if elapsed >= hard_limit {
+                self.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+        if let Some(soft_limit) = self.soft_time_ms {
+            if elapsed >= soft_limit.saturating_mul(3) / 2 {
+                self.stop.store(true, Ordering::Relaxed);
             }
         }
     }
+}
 
     fn negamax(
         &mut self,
@@ -475,7 +515,7 @@ impl Searcher {
             return 0;
         }
 
-        if ply > 0 && board.is_repetition() {
+        if ply > 0 && board.is_draw() {
             return 0;
         }
 
@@ -486,11 +526,6 @@ impl Searcher {
         let in_check = board.in_check();
         if in_check {
             depth += 1;
-        }
-
-        // 50-move rule and insufficient material draw unless a mate is in reach
-        if !in_check && board.is_draw() {
-            return 0;
         }
 
         if depth == 0 {
@@ -516,16 +551,9 @@ impl Searcher {
             if excluded_move == Move::NULL && entry.depth >= depth && ply > 0 && !is_pv {
                 match entry.flag {
                     TTFlag::Exact => return tt_score,
-                    TTFlag::LowerBound => alpha = alpha.max(tt_score),
-                    TTFlag::UpperBound => {
-                        if tt_score <= alpha {
-                            return tt_score;
-                        }
-                    }
-                    TTFlag::None => {}
-                }
-                if alpha >= beta {
-                    return tt_score;
+                    TTFlag::LowerBound if tt_score >= beta => return tt_score,
+                    TTFlag::UpperBound if tt_score <= alpha => return tt_score,
+                    _ => {}
                 }
             }
         }
@@ -557,8 +585,17 @@ impl Searcher {
             }
 
             // Null move pruning
-            if depth >= 3 && static_eval >= beta && board.has_non_pawn_material(board.side_to_move) {
+            if excluded_move == Move::NULL
+                && depth >= 3
+                && static_eval >= beta
+                && board.has_non_pawn_material(board.side_to_move)
+                && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
+            {
                 let r = 3 + depth / 4 + ((static_eval - beta) / 128).clamp(0, 3) as u8 + improving as u8;
+                if (ply as usize) < MAX_PLY {
+                    self.played_moves[ply as usize] = Move::NULL;
+                    self.played_pieces[ply as usize] = Piece::None;
+                }
                 let undo = board.make_null_move();
                 let score = -self.negamax(
                     board,
@@ -579,7 +616,7 @@ impl Searcher {
         }
 
         // ProbCut
-        if depth >= 5 && beta.abs() < MATE_SCORE - 100 {
+        if !is_pv && !in_check && excluded_move == Move::NULL && depth >= 5 && beta.abs() < MATE_SCORE - 100 {
             let probcut_beta = beta + 200;
             let mut probcut_picker = MovePicker::new_qsearch(Move::NULL);
 
@@ -765,7 +802,7 @@ impl Searcher {
             let gives_check = board.in_check();
 
             let score = if moves_searched == 0 {
-                let next_depth = (depth as i32 - 1 + extension).max(1) as u8;
+                let next_depth = (depth as i32 - 1 + extension).max(0) as u8;
                 -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, false)
             } else {
                 let mut r = 0;
@@ -805,7 +842,7 @@ impl Searcher {
                     r = r.clamp(0, depth as i32 - 2);
                 }
 
-                let reduced = (depth as i32 - 1 - r).max(1) as u8;
+                let reduced = (depth as i32 - 1 - r).max(0) as u8;
 
                 let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL, true);
 
@@ -830,6 +867,9 @@ impl Searcher {
             if score > best_score {
                 best_score = score;
                 best_move = m;
+                if ply == 0 {
+                    self.root_best_move = m;
+                }
             }
 
             if score > alpha {
@@ -868,10 +908,10 @@ impl Searcher {
                     }
                 } else {
                     let moving_pc = board.piece_on[m.from()] as usize;
-                    let victim_pt = if m.move_type() == MoveType::EnPassant {
-                        PieceType::Pawn
-                    } else {
-                        board.piece_on[m.to()].piece_type()
+                    let victim_pt = match m.move_type() {
+                        MoveType::EnPassant => PieceType::Pawn,
+                        MoveType::Promotion => m.promo_type(),
+                        _ => board.piece_on[m.to()].piece_type(),
                     } as usize;
 
                     let threats = board.opponent_threats();
@@ -882,10 +922,10 @@ impl Searcher {
                     for j in 0..noisy_count.saturating_sub(1) {
                         let nm = noisy_moves[j];
                         let n_pc = board.piece_on[nm.from()] as usize;
-                        let n_victim_pt = if nm.move_type() == MoveType::EnPassant {
-                            PieceType::Pawn
-                        } else {
-                            board.piece_on[nm.to()].piece_type()
+                        let n_victim_pt = match nm.move_type() {
+                            MoveType::EnPassant => PieceType::Pawn,
+                            MoveType::Promotion => nm.promo_type(),
+                            _ => board.piece_on[nm.to()].piece_type(),
                         } as usize;
                         let n_to_threatened = threats.contains(nm.to()) as usize;
                         update_history(&mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt][n_to_threatened], -bonus);
@@ -999,6 +1039,27 @@ impl Searcher {
             alpha = alpha.max(stand_pat);
         }
 
+        if in_check {
+            let moves = generate_legal_moves(board);
+            if moves.count == 0 {
+                return -MATE_SCORE + ply as i32;
+            }
+            for &m in moves.as_slice() {
+                let undo = board.make_move(m);
+                let score = -self.quiescence(board, -beta, -alpha, ply + 1);
+                board.undo_move(m, undo);
+
+                if self.stop.load(Ordering::Relaxed) {
+                    return 0;
+                }
+                if score >= beta {
+                    return beta;
+                }
+                alpha = alpha.max(score);
+            }
+            return alpha;
+        }
+
         let mut picker = MovePicker::new_qsearch(Move::NULL);
         let mut moves_searched = 0;
 
@@ -1017,11 +1078,6 @@ impl Searcher {
             // Prune captures that cannot realistically beat alpha
             if !in_check && moves_searched > 0 && !see(board, m, alpha - stand_pat - 90) {
                 continue;
-            }
-
-            // Quiescence late move pruning
-            if !in_check && moves_searched >= 4 {
-                break;
             }
 
             moves_searched += 1;

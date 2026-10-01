@@ -5,6 +5,9 @@ pub const INPUT_NB: usize = 768;
 pub const L1_SIZE: usize = 256;
 pub const SCALE: i32 = 64;
 
+const BLACK_BLOCK: usize = 128;
+const BLOCK_STRIDE: usize = 20;
+
 #[derive(Clone)]
 pub struct Network {
     pub feature_weights: Vec<i16>,
@@ -91,6 +94,15 @@ fn feature_indices(piece: Piece, sq: Square) -> (usize, usize) {
 }
 
 #[inline(always)]
+fn neuron_block(p: usize) -> usize {
+    if p < 6 {
+        p * BLOCK_STRIDE
+    } else {
+        BLACK_BLOCK + (p - 6) * BLOCK_STRIDE
+    }
+}
+
+#[inline(always)]
 pub fn evaluate(acc: &Accumulator, side_to_move: Color) -> i32 {
     let net = network();
     let us = side_to_move as usize;
@@ -129,27 +141,35 @@ impl Network {
                 let idx = p * 64 + sq;
                 let offset = idx * L1_SIZE;
 
+                let f = (sq % 8) as i16;
+                let r = (sq / 8) as i16;
+
                 let bonus = match pt {
                     0 => {
-                        let r = (sq / 8) as i16;
-                        if is_white { r * 8 } else { (7 - r) * 8 }
+                        let adv = if is_white { r } else { 7 - r };
+                        let center_file = 3 - (f - 3).abs().min((f - 4).abs());
+                        adv * 8 + center_file * 4
                     }
                     1 | 2 => {
-                        let f = (sq % 8) as i16;
-                        let r = (sq / 8) as i16;
                         let center_dist = (3 - f).abs().max((4 - f).abs()) + (3 - r).abs().max((4 - r).abs());
                         16 - center_dist * 3
+                    }
+                    3 => {
+                        let rel = if is_white { r } else { 7 - r };
+                        rel * 4
+                    }
+                    5 => {
+                        let rel = if is_white { r } else { 7 - r };
+                        let shelter = 3 - (f - 3).abs().min((f - 4).abs());
+                        shelter * 2 - rel * 6
                     }
                     _ => 0,
                 };
 
                 let assigned_val = if is_white { val + bonus } else { -(val + bonus) };
 
-                for neuron in 0..L1_SIZE {
-                    if neuron == (idx % L1_SIZE) {
-                        feature_weights[offset + neuron] = assigned_val / 4;
-                    }
-                }
+                let neuron = neuron_block(p) + (sq % BLOCK_STRIDE);
+                feature_weights[offset + neuron] = assigned_val / 4;
             }
         }
 

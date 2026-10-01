@@ -1,5 +1,6 @@
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
 use crate::bitboard::Bitboard;
+use crate::nnue::Accumulator;
 use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB};
 use crate::zobrist::{castling_key, ep_key, piece_key, side_key};
 
@@ -23,6 +24,7 @@ pub struct UndoState {
     pub halfmove_clock: u8,
     pub captured: Piece,
     pub hash: u64,
+    pub accumulator: Accumulator,
 }
 
 #[derive(Clone)]
@@ -38,6 +40,7 @@ pub struct Board {
     pub fullmove_number: u16,
     pub hash: u64,
     pub history: Vec<u64>,
+    pub accumulator: Accumulator,
 }
 
 impl Board {
@@ -59,6 +62,17 @@ impl Board {
             fullmove_number: 1,
             hash: 0,
             history: Vec::with_capacity(256),
+            accumulator: Accumulator::new(),
+        }
+    }
+
+    pub fn refresh_accumulator(&mut self) {
+        self.accumulator = Accumulator::new();
+        for sq in 0..64 {
+            let piece = self.piece_on[sq];
+            if piece != Piece::None {
+                self.accumulator.add_feature(piece, Square::new(sq as u8));
+            }
         }
     }
 
@@ -146,6 +160,7 @@ impl Board {
         }
 
         board.hash = board.compute_hash();
+        board.refresh_accumulator();
         Ok(board)
     }
 
@@ -264,6 +279,7 @@ impl Board {
             halfmove_clock: self.halfmove_clock,
             captured: Piece::None,
             hash: self.hash,
+            accumulator: self.accumulator,
         };
 
         self.history.push(self.hash);
@@ -287,6 +303,7 @@ impl Board {
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
+        self.accumulator = undo.accumulator;
     }
 
     pub fn make_move(&mut self, m: Move) -> UndoState {
@@ -303,6 +320,7 @@ impl Board {
             halfmove_clock: self.halfmove_clock,
             captured: self.piece_on[to],
             hash: self.hash,
+            accumulator: self.accumulator,
         };
 
         self.history.push(self.hash);
@@ -318,13 +336,16 @@ impl Board {
         }
 
         self.remove_piece(from);
+        self.accumulator.remove_feature(moving_piece, from);
 
         match move_type {
             MoveType::Normal => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
+                    self.accumulator.remove_feature(undo.captured, to);
                 }
                 self.put_piece(moving_piece, to);
+                self.accumulator.add_feature(moving_piece, to);
 
                 if moving_piece.piece_type() == PieceType::Pawn && ((from as i8) - (to as i8)).abs() == 16 {
                     self.ep_square = Square::new(((from as u8) + (to as u8)) / 2);
@@ -333,6 +354,8 @@ impl Board {
             }
             MoveType::Castling => {
                 self.put_piece(moving_piece, to);
+                self.accumulator.add_feature(moving_piece, to);
+
                 let (rook_from, rook_to) = match to {
                     Square::G1 => (Square::H1, Square::F1),
                     Square::C1 => (Square::A1, Square::D1),
@@ -341,19 +364,26 @@ impl Board {
                     _ => unreachable!(),
                 };
                 let rook = self.remove_piece(rook_from);
+                self.accumulator.remove_feature(rook, rook_from);
                 self.put_piece(rook, rook_to);
+                self.accumulator.add_feature(rook, rook_to);
             }
             MoveType::EnPassant => {
                 let cap_sq = Square::from_coords(to.file(), from.rank());
-                self.remove_piece(cap_sq);
+                let cap_pawn = self.remove_piece(cap_sq);
+                self.accumulator.remove_feature(cap_pawn, cap_sq);
+
                 self.put_piece(moving_piece, to);
+                self.accumulator.add_feature(moving_piece, to);
             }
             MoveType::Promotion => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
+                    self.accumulator.remove_feature(undo.captured, to);
                 }
                 let promo_piece = Piece::new(us, m.promo_type());
                 self.put_piece(promo_piece, to);
+                self.accumulator.add_feature(promo_piece, to);
             }
         }
 
@@ -424,6 +454,7 @@ impl Board {
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
+        self.accumulator = undo.accumulator;
     }
 }
 

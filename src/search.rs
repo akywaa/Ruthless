@@ -14,6 +14,7 @@ pub const INFINITY: i32 = 1_000_000;
 pub const MATE_SCORE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 pub const CORR_ENTRIES: usize = 16384;
+pub const CORR_BUCKETS: usize = 8;
 
 static LMR: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 
@@ -83,6 +84,12 @@ fn update_history(val: &mut i32, bonus: i32) {
     *val += clamped - (*val * clamped.abs()) / 16384;
 }
 
+#[inline(always)]
+fn update_corr(val: &mut i16, bonus: i32) {
+    let clamped = bonus.clamp(-1600, 1600);
+    *val += (clamped - (*val as i32 * clamped.abs()) / 16384) as i16;
+}
+
 impl Searcher {
     pub fn new(tt: Arc<TranspositionTable>, stop: Arc<AtomicBool>, thread_id: usize) -> Self {
         Self {
@@ -117,8 +124,9 @@ impl Searcher {
         self.noisy_history.fill([[[0; 2]; 6]; 64]);
         self.counter_moves = [[Move::NULL; 64]; 64];
         self.conthist.fill([[[[[0; 64]; 64]; 12]; 2]; 2]);
-        self.pawn_corr.fill([0; CORR_ENTRIES]);
-        self.non_pawn_corr.fill([[0; CORR_ENTRIES]; 2]);
+        self.pawn_corr.fill([[0; CORR_ENTRIES]; 2]);
+        self.non_pawn_corr.fill([[[0; CORR_ENTRIES]; 2]; 2]);
+        self.cont_corr.fill([[[0; 64]; 12]; 64]);
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
         self.prev_in_check = [false; MAX_PLY];
@@ -127,20 +135,45 @@ impl Searcher {
     }
 
     #[inline(always)]
-    fn corrected_eval(&self, board: &Board) -> i32 {
+    fn corrected_eval(&self, board: &Board, ply: u8) -> i32 {
         let raw = evaluate(board);
         let side = board.side_to_move as usize;
+        let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
 
         let p_idx = (board.pawn_hash as usize) & (CORR_ENTRIES - 1);
         let w_np_idx = (board.non_pawn_hash[0] as usize) & (CORR_ENTRIES - 1);
         let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
 
-        let bonus = (self.pawn_corr[side][p_idx]
-            + self.non_pawn_corr[0][side][w_np_idx]
-            + self.non_pawn_corr[1][side][b_np_idx])
-            / 64;
+        let mut bonus = self.pawn_corr[bucket][side][p_idx] as i32
+            + self.non_pawn_corr[bucket][0][side][w_np_idx] as i32
+            + self.non_pawn_corr[bucket][1][side][b_np_idx] as i32;
 
-        let mut eval = raw + bonus;
+        let ply_idx = ply as usize;
+        if ply_idx >= 1 {
+            let p1_piece = self.played_pieces[ply_idx - 1];
+            let p1_move = self.played_moves[ply_idx - 1];
+
+            if p1_piece != Piece::None && p1_move != Move::NULL {
+                if ply_idx >= 2 {
+                    let p2_piece = self.played_pieces[ply_idx - 2];
+                    let p2_move = self.played_moves[ply_idx - 2];
+                    if p2_piece != Piece::None && p2_move != Move::NULL {
+                        bonus += self.cont_corr[p2_piece as usize][p2_move.to() as usize]
+                            [p1_piece as usize][p1_move.to() as usize] as i32;
+                    }
+                }
+                if ply_idx >= 4 {
+                    let p4_piece = self.played_pieces[ply_idx - 4];
+                    let p4_move = self.played_moves[ply_idx - 4];
+                    if p4_piece != Piece::None && p4_move != Move::NULL {
+                        bonus += self.cont_corr[p4_piece as usize][p4_move.to() as usize]
+                            [p1_piece as usize][p1_move.to() as usize] as i32;
+                    }
+                }
+            }
+        }
+
+        let mut eval = raw + bonus / 64;
 
         // Scale evaluation towards draw near 50-move rule
         eval = eval * (200 - board.halfmove_clock as i32) / 200;
@@ -466,7 +499,7 @@ impl Searcher {
             }
         }
 
-        let static_eval = self.corrected_eval(board);
+        let static_eval = self.corrected_eval(board, ply);
         if (ply as usize) < MAX_PLY {
             self.eval_stack[ply as usize] = static_eval;
         }
@@ -864,14 +897,46 @@ impl Searcher {
             {
                 let bonus = ((best_score - static_eval) * (depth as i32)).clamp(-1600, 1600);
                 let side = board.side_to_move as usize;
+                let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
 
                 let p_idx = (board.pawn_hash as usize) & (CORR_ENTRIES - 1);
                 let w_np_idx = (board.non_pawn_hash[0] as usize) & (CORR_ENTRIES - 1);
                 let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
 
-                update_history(&mut self.pawn_corr[side][p_idx], bonus);
-                update_history(&mut self.non_pawn_corr[0][side][w_np_idx], bonus);
-                update_history(&mut self.non_pawn_corr[1][side][b_np_idx], bonus);
+                update_corr(&mut self.pawn_corr[bucket][side][p_idx], bonus);
+                update_corr(&mut self.non_pawn_corr[bucket][0][side][w_np_idx], bonus);
+                update_corr(&mut self.non_pawn_corr[bucket][1][side][b_np_idx], bonus);
+
+                let ply_idx = ply as usize;
+                if ply_idx >= 1 {
+                    let p1_piece = self.played_pieces[ply_idx - 1];
+                    let p1_move = self.played_moves[ply_idx - 1];
+
+                    if p1_piece != Piece::None && p1_move != Move::NULL {
+                        if ply_idx >= 2 {
+                            let p2_piece = self.played_pieces[ply_idx - 2];
+                            let p2_move = self.played_moves[ply_idx - 2];
+                            if p2_piece != Piece::None && p2_move != Move::NULL {
+                                update_corr(
+                                    &mut self.cont_corr[p2_piece as usize][p2_move.to() as usize]
+                                        [p1_piece as usize][p1_move.to() as usize],
+                                    bonus,
+                                );
+                            }
+                        }
+                        if ply_idx >= 4 {
+                            let p4_piece = self.played_pieces[ply_idx - 4];
+                            let p4_move = self.played_moves[ply_idx - 4];
+                            if p4_piece != Piece::None && p4_move != Move::NULL {
+                                update_corr(
+                                    &mut self.cont_corr[p4_piece as usize][p4_move.to() as usize]
+                                        [p1_piece as usize][p1_move.to() as usize],
+                                    bonus,
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         best_score
@@ -896,7 +961,7 @@ impl Searcher {
 
         let mut stand_pat = -INFINITY;
         if !in_check {
-            stand_pat = self.corrected_eval(board);
+            stand_pat = self.corrected_eval(board, ply);
             if stand_pat >= beta {
                 return beta;
             }

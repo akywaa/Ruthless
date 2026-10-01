@@ -1,12 +1,17 @@
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::search::Searcher;
+use crate::tt::TranspositionTable;
 use crate::types::Color;
 use std::io::{self, BufRead};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub fn uci_loop() {
     let mut board = Board::default();
-    let mut searcher = Searcher::new(32);
+    let mut tt_size_mb = 32;
+    let mut num_threads = 1;
+    let mut tt = Arc::new(TranspositionTable::new(tt_size_mb));
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -21,26 +26,75 @@ pub fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                println!("id name Ruthless 0.1");
+                println!("id name Ruthless 0.2");
                 println!("id author Ruthless Team");
+                println!("option name Hash type spin default 32 min 1 max 1048576");
+                println!("option name Threads type spin default 1 min 1 max 256");
                 println!("uciok");
+            }
+            "setoption" => {
+                handle_setoption(&tokens[1..], &mut tt_size_mb, &mut num_threads, &mut tt);
             }
             "isready" => {
                 println!("readyok");
             }
             "ucinewgame" => {
-                searcher.clear();
+                tt.clear();
                 board = Board::default();
             }
             "position" => {
                 handle_position(&mut board, &tokens[1..]);
             }
             "go" => {
-                handle_go(&mut board, &mut searcher, &tokens[1..]);
+                handle_go(&mut board, &Arc::clone(&tt), num_threads, &tokens[1..]);
             }
             "quit" => break,
             _ => {}
         }
+    }
+}
+
+fn handle_setoption(
+    tokens: &[&str],
+    tt_size_mb: &mut usize,
+    num_threads: &mut usize,
+    tt: &mut Arc<TranspositionTable>,
+) {
+    let mut name = String::new();
+    let mut value = String::new();
+    let mut is_name = false;
+    let mut is_value = false;
+
+    for &t in tokens {
+        if t == "name" {
+            is_name = true;
+            is_value = false;
+        } else if t == "value" {
+            is_name = false;
+            is_value = true;
+        } else if is_name {
+            if !name.is_empty() {
+                name.push(' ');
+            }
+            name.push_str(t);
+        } else if is_value {
+            value.push_str(t);
+        }
+    }
+
+    match name.to_lowercase().as_str() {
+        "hash" => {
+            if let Ok(mb) = value.parse::<usize>() {
+                *tt_size_mb = mb.clamp(1, 1048576);
+                *tt = Arc::new(TranspositionTable::new(*tt_size_mb));
+            }
+        }
+        "threads" => {
+            if let Ok(t) = value.parse::<usize>() {
+                *num_threads = t.clamp(1, 256);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -81,7 +135,12 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
     }
 }
 
-fn handle_go(board: &mut Board, searcher: &mut Searcher, tokens: &[&str]) {
+fn handle_go(
+    board: &mut Board,
+    tt: &Arc<TranspositionTable>,
+    threads: usize,
+    tokens: &[&str],
+) {
     let mut depth: u8 = 64;
     let mut movetime: Option<u128> = None;
     let mut wtime: Option<u128> = None;
@@ -156,6 +215,27 @@ fn handle_go(board: &mut Board, searcher: &mut Searcher, tokens: &[&str]) {
         }
     };
 
-    let best_move = searcher.search(board, depth, soft_time, hard_time);
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let mut main_searcher = Searcher::new(Arc::clone(tt), Arc::clone(&stop_signal));
+
+    let best_move = if threads > 1 {
+        std::thread::scope(|s| {
+            for _ in 1..threads {
+                let mut helper_searcher =
+                    Searcher::new(Arc::clone(tt), Arc::clone(&stop_signal));
+                let mut helper_board = board.clone();
+                s.spawn(move || {
+                    helper_searcher.search_helper(&mut helper_board, depth);
+                });
+            }
+
+            let m = main_searcher.search(board, depth, soft_time, hard_time);
+            stop_signal.store(true, Ordering::Relaxed);
+            m
+        })
+    } else {
+        main_searcher.search(board, depth, soft_time, hard_time)
+    };
+
     println!("bestmove {}", best_move);
 }

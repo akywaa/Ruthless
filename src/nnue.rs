@@ -20,9 +20,22 @@ pub struct Network {
 
 static NETWORK_BYTES: &[u8] = include_bytes!("../resources/ruthless.bin");
 
+static NETWORK_ALIGNED: std::sync::OnceLock<&'static Network> = std::sync::OnceLock::new();
+
 #[inline(always)]
 pub fn network() -> &'static Network {
-    unsafe { &*(NETWORK_BYTES.as_ptr() as *const Network) }
+    *NETWORK_ALIGNED.get_or_init(|| {
+        // include_bytes! gives no alignment guarantee; the AVX2 path needs a
+        // 64-byte-aligned Network, so copy into an aligned, never-freed block.
+        let layout = std::alloc::Layout::from_size_align(NETWORK_BYTES.len(), 64)
+            .expect("invalid network layout");
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        assert!(!ptr.is_null(), "out of memory allocating network");
+        unsafe {
+            std::ptr::copy_nonoverlapping(NETWORK_BYTES.as_ptr(), ptr, NETWORK_BYTES.len());
+            &*(ptr as *const Network)
+        }
+    })
 }
 
 #[repr(C, align(64))]

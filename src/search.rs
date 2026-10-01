@@ -4,6 +4,8 @@ use crate::movegen::{generate_legal_moves, generate_noisy_moves};
 use crate::see::see;
 use crate::tt::{TTFlag, TranspositionTable};
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const INFINITY: i32 = 1_000_000;
@@ -11,9 +13,9 @@ pub const MATE_SCORE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
 
 pub struct Searcher {
-    pub tt: TranspositionTable,
+    pub tt: Arc<TranspositionTable>,
     pub nodes: u64,
-    pub stop: bool,
+    pub stop: Arc<AtomicBool>,
     start_time: Instant,
     soft_time_ms: Option<u128>,
     hard_time_ms: Option<u128>,
@@ -52,11 +54,11 @@ fn update_history(val: &mut i32, bonus: i32) {
 }
 
 impl Searcher {
-    pub fn new(tt_mb: usize) -> Self {
+    pub fn new(tt: Arc<TranspositionTable>, stop: Arc<AtomicBool>) -> Self {
         Self {
-            tt: TranspositionTable::new(tt_mb),
+            tt,
             nodes: 0,
-            stop: false,
+            stop,
             start_time: Instant::now(),
             soft_time_ms: None,
             hard_time_ms: None,
@@ -95,7 +97,7 @@ impl Searcher {
         }
 
         self.nodes = 0;
-        self.stop = false;
+        self.stop.store(false, Ordering::Relaxed);
         self.start_time = Instant::now();
         self.soft_time_ms = soft_time;
         self.hard_time_ms = hard_time;
@@ -114,7 +116,7 @@ impl Searcher {
 
                 loop {
                     score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL);
-                    if self.stop {
+                    if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
 
@@ -137,7 +139,7 @@ impl Searcher {
                 score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL);
             }
 
-            if self.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 break;
             }
 
@@ -204,6 +206,47 @@ impl Searcher {
         best_move
     }
 
+    pub fn search_helper(&mut self, board: &mut Board, max_depth: u8) {
+        self.nodes = 0;
+        let mut score = 0;
+
+        for depth in 1..=max_depth {
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if depth >= 4 {
+                let mut delta = 20;
+                let mut alpha = (score - delta).max(-INFINITY);
+                let mut beta = (score + delta).min(INFINITY);
+
+                loop {
+                    score = self.negamax(board, depth, 0, alpha, beta, false, Move::NULL);
+                    if self.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    if score <= alpha {
+                        beta = (alpha + beta) / 2;
+                        alpha = (alpha - delta).max(-INFINITY);
+                    } else if score >= beta {
+                        beta = (beta + delta).min(INFINITY);
+                    } else {
+                        break;
+                    }
+
+                    delta += delta / 2;
+                    if delta > 1000 {
+                        alpha = -INFINITY;
+                        beta = INFINITY;
+                    }
+                }
+            } else {
+                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, false, Move::NULL);
+            }
+        }
+    }
+
     fn extract_pv(&self, board: &mut Board, depth: u8) -> Vec<Move> {
         let mut pv = Vec::new();
         let mut undos = Vec::new();
@@ -235,7 +278,7 @@ impl Searcher {
     fn check_time(&mut self) {
         if let Some(hard_limit) = self.hard_time_ms {
             if (self.nodes & 2047) == 0 && self.start_time.elapsed().as_millis() >= hard_limit {
-                self.stop = true;
+                self.stop.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -251,7 +294,7 @@ impl Searcher {
         excluded_move: Move,
     ) -> i32 {
         self.check_time();
-        if self.stop {
+        if self.stop.load(Ordering::Relaxed) {
             return 0;
         }
 
@@ -436,7 +479,7 @@ impl Searcher {
             board.undo_move(m, undo);
             moves_searched += 1;
 
-            if self.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 return 0;
             }
 
@@ -513,7 +556,7 @@ impl Searcher {
 
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u8) -> i32 {
         self.check_time();
-        if self.stop {
+        if self.stop.load(Ordering::Relaxed) {
             return 0;
         }
 
@@ -549,7 +592,7 @@ impl Searcher {
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             board.undo_move(m, undo);
 
-            if self.stop {
+            if self.stop.load(Ordering::Relaxed) {
                 return 0;
             }
 

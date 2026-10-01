@@ -1,8 +1,10 @@
+use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
 use crate::movegen::{generate_noisy_pseudo, generate_quiet_pseudo};
 use crate::see::see;
-use crate::types::{Move, MoveList, MoveType, Piece, PieceType};
+use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Stage {
@@ -30,11 +32,7 @@ pub struct MovePicker {
 }
 
 impl MovePicker {
-    pub fn new(
-        tt_move: Move,
-        killers: [Move; 2],
-        counter_move: Move,
-    ) -> Self {
+    pub fn new(tt_move: Move, killers: [Move; 2], counter_move: Move) -> Self {
         Self {
             stage: if tt_move != Move::NULL { Stage::TTMove } else { Stage::GenerateNoisy },
             tt_move,
@@ -67,11 +65,13 @@ impl MovePicker {
         board: &mut Board,
         history: &[[[i32; 64]; 64]; 2],
         pawn_history: &[[[i32; 64]; 12]; 512],
-        conthist: &[[[[i32; 64]; 64]; 12]; 4],
-        noisy_history: &[[[i32; 6]; 64]; 12],
+        conthist: &[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4],
+        noisy_history: &[[[[i32; 2]; 6]; 64]; 12],
         ply: u8,
         played_pieces: &[Piece; 64],
         played_moves: &[Move; 64],
+        prev_in_check: &[bool; 64],
+        prev_is_capture: &[bool; 64],
     ) -> Option<Move> {
         loop {
             match self.stage {
@@ -114,7 +114,11 @@ impl MovePicker {
                 Stage::Killers => {
                     self.stage = Stage::CounterMove;
                     for &k in &self.killers {
-                        if k != Move::NULL && k != self.tt_move && self.is_pseudo_legal(board, k) && self.is_legal(board, k) {
+                        if k != Move::NULL
+                            && k != self.tt_move
+                            && self.is_pseudo_legal(board, k)
+                            && self.is_legal(board, k)
+                        {
                             return Some(k);
                         }
                     }
@@ -135,7 +139,17 @@ impl MovePicker {
                 Stage::GenerateQuiets => {
                     self.moves.count = 0;
                     generate_quiet_pseudo(board, &mut self.moves);
-                    self.score_quiets(board, history, pawn_history, conthist, ply, played_pieces, played_moves);
+                    self.score_quiets(
+                        board,
+                        history,
+                        pawn_history,
+                        conthist,
+                        ply,
+                        played_pieces,
+                        played_moves,
+                        prev_in_check,
+                        prev_is_capture,
+                    );
                     self.cur_idx = 0;
                     self.stage = Stage::Quiets;
                 }
@@ -186,7 +200,9 @@ impl MovePicker {
         m
     }
 
-    fn score_noisy(&mut self, board: &Board, noisy_history: &[[[i32; 6]; 64]; 12]) {
+    fn score_noisy(&mut self, board: &Board, noisy_history: &[[[[i32; 2]; 6]; 64]; 12]) {
+        let threats = board.opponent_threats();
+
         for i in 0..self.moves.count {
             let m = self.moves.moves[i];
             let attacker = board.piece_on[m.from()];
@@ -197,8 +213,9 @@ impl MovePicker {
                 captured.piece_type()
             };
 
-            let mvv_lva = PIECE_VALUES[victim_pt as usize] * 10 - PIECE_VALUES[attacker.piece_type() as usize];
-            let hist = noisy_history[attacker as usize][m.to() as usize][victim_pt as usize];
+            let to_threatened = threats.contains(m.to()) as usize;
+            let mvv_lva = PIECE_VALUES[victim_pt as usize] * 12 - PIECE_VALUES[attacker.piece_type() as usize];
+            let hist = noisy_history[attacker as usize][m.to() as usize][victim_pt as usize][to_threatened];
             self.scores[i] = mvv_lva + hist;
         }
     }
@@ -208,31 +225,86 @@ impl MovePicker {
         board: &Board,
         history: &[[[i32; 64]; 64]; 2],
         pawn_history: &[[[i32; 64]; 12]; 512],
-        conthist: &[[[[i32; 64]; 64]; 12]; 4],
+        conthist: &[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4],
         ply: u8,
         played_pieces: &[Piece; 64],
         played_moves: &[Move; 64],
+        prev_in_check: &[bool; 64],
+        prev_is_capture: &[bool; 64],
     ) {
-        let us = board.side_to_move as usize;
+        let us = board.side_to_move;
+        let them = !us;
+        let threats = board.opponent_threats();
+        let pawn_threats = board.opponent_pawn_threats();
         let p_idx = (board.pawn_hash as usize) & 511;
         let offsets = [1usize, 2, 4, 6];
         let ply_idx = ply as usize;
 
+        // Wall pawns: protect the friendly king
+        let my_ksq = board.king_square(us);
+        let my_pawns = board.pieces[Piece::new(us, PieceType::Pawn)];
+        let king_wall_pawns = king_attacks(my_ksq) & my_pawns;
+
+        // Opponent attackable targets
+        let their_occ = board.occupied_co[them];
+        let occ = board.occupied;
+
+        let escape_bonus = [0, 2000, 2200, 3000, 4500, 0];
+
         for i in 0..self.moves.count {
             let m = self.moves.moves[i];
-            let piece = board.piece_on[m.from()] as usize;
+            let from = m.from();
+            let to = m.to();
+            let piece = board.piece_on[from];
+            let pt = piece.piece_type();
 
-            let mut score = history[us][m.from() as usize][m.to() as usize]
-                + pawn_history[p_idx][piece][m.to() as usize];
+            let mut score = history[us as usize][from as usize][to as usize]
+                + pawn_history[p_idx][piece as usize][to as usize];
 
             for (layer, &offset) in offsets.iter().enumerate() {
                 if ply_idx >= offset {
-                    let prev_piece = played_pieces[ply_idx - offset];
-                    let prev_move = played_moves[ply_idx - offset];
+                    let prev_idx = ply_idx - offset;
+                    let prev_piece = played_pieces[prev_idx];
+                    let prev_move = played_moves[prev_idx];
                     if prev_piece != Piece::None && prev_move != Move::NULL {
-                        score += conthist[layer][prev_piece as usize][prev_move.to() as usize][m.to() as usize];
+                        let chk = prev_in_check[prev_idx] as usize;
+                        let cap = prev_is_capture[prev_idx] as usize;
+                        score += conthist[layer][chk][cap][prev_piece as usize][prev_move.to() as usize][to as usize];
                     }
                 }
+            }
+
+            // Tactical adjustments
+            let from_threatened = threats.contains(from);
+            let to_threatened = threats.contains(to);
+
+            if from_threatened {
+                score += escape_bonus[pt as usize];
+            }
+            if to_threatened {
+                score -= escape_bonus[pt as usize] / 2;
+            }
+
+            if pawn_threats.contains(to) && pt != PieceType::Pawn {
+                score -= 3000;
+            }
+
+            // Give a bonus if the move attacks an undefended enemy piece
+            let attacks_from_to = match pt {
+                PieceType::Knight => knight_attacks(to),
+                PieceType::Bishop => bishop_attacks(to, occ),
+                PieceType::Rook => rook_attacks(to, occ),
+                PieceType::Queen => bishop_attacks(to, occ) | rook_attacks(to, occ),
+                _ => Bitboard::EMPTY,
+            };
+            let attacks_enemy = attacks_from_to & their_occ & !threats;
+            if !attacks_enemy.is_empty() {
+                score += 1500;
+            }
+
+            // Discourage moving king shield pawns
+            if pt == PieceType::Pawn && king_wall_pawns.contains(from) {
+                score -= 1200;
             }
 
             self.scores[i] = score;

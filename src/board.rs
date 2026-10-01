@@ -354,6 +354,50 @@ impl Board {
     }
 
     #[inline(always)]
+    pub fn opponent_pawn_threats(&self) -> Bitboard {
+        let them = !self.side_to_move;
+        let pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
+        match them {
+            Color::White => {
+                (pawns & !Bitboard(0x8080808080808080u64)) << 9
+                    | (pawns & !Bitboard(0x0101010101010101u64)) << 7
+            }
+            Color::Black => {
+                (pawns & !Bitboard(0x8080808080808080u64)) >> 7
+                    | (pawns & !Bitboard(0x0101010101010101u64)) >> 9
+            }
+        }
+    }
+
+    pub fn opponent_threats(&self) -> Bitboard {
+        let them = !self.side_to_move;
+        let mut threats = self.opponent_pawn_threats();
+
+        let mut knights = self.pieces[Piece::new(them, PieceType::Knight)];
+        while !knights.is_empty() {
+            threats |= knight_attacks(knights.pop_lsb());
+        }
+
+        let occ = self.occupied;
+        let mut bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
+            | self.pieces[Piece::new(them, PieceType::Queen)];
+        while !bishops_queens.is_empty() {
+            threats |= bishop_attacks(bishops_queens.pop_lsb(), occ);
+        }
+
+        let mut rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
+            | self.pieces[Piece::new(them, PieceType::Queen)];
+        while !rooks_queens.is_empty() {
+            threats |= rook_attacks(rooks_queens.pop_lsb(), occ);
+        }
+
+        let ksq = self.king_square(them);
+        threats |= king_attacks(ksq);
+
+        threats
+    }
+
+    #[inline(always)]
     pub fn is_repetition(&self) -> bool {
         let count = self.history.len();
         if count < 4 || self.halfmove_clock < 4 {

@@ -45,13 +45,15 @@ pub struct Searcher {
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     pawn_history: Box<[[[i32; 64]; 12]; 512]>,
-    noisy_history: Box<[[[i32; 6]; 64]; 12]>,
+    noisy_history: Box<[[[[i32; 2]; 6]; 64]; 12]>,
     counter_moves: [[Move; 64]; 64],
-    conthist: Box<[[[[i32; 64]; 64]; 12]; 4]>,
+    conthist: Box<[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4]>,
     pawn_corr: Box<[[i32; CORR_ENTRIES]; 2]>,
     non_pawn_corr: Box<[[[i32; CORR_ENTRIES]; 2]; 2]>,
     played_moves: [Move; MAX_PLY],
     played_pieces: [Piece; MAX_PLY],
+    prev_in_check: [bool; MAX_PLY],
+    prev_is_capture: [bool; MAX_PLY],
 }
 
 fn score_to_tt(score: i32, ply: u8) -> i32 {
@@ -93,13 +95,15 @@ impl Searcher {
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             pawn_history: vec![[[0; 64]; 12]; 512].into_boxed_slice().try_into().unwrap(),
-            noisy_history: vec![[[0; 6]; 64]; 12].into_boxed_slice().try_into().unwrap(),
+            noisy_history: vec![[[[0; 2]; 6]; 64]; 12].into_boxed_slice().try_into().unwrap(),
             counter_moves: [[Move::NULL; 64]; 64],
-            conthist: vec![[[[0; 64]; 64]; 12]; 4].into_boxed_slice().try_into().unwrap(),
+            conthist: vec![[[[[[0; 64]; 64]; 12]; 2]; 2]; 4].into_boxed_slice().try_into().unwrap(),
             pawn_corr: vec![[0; CORR_ENTRIES]; 2].into_boxed_slice().try_into().unwrap(),
             non_pawn_corr: vec![[[0; CORR_ENTRIES]; 2]; 2].into_boxed_slice().try_into().unwrap(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
+            prev_in_check: [false; MAX_PLY],
+            prev_is_capture: [false; MAX_PLY],
         }
     }
 
@@ -108,13 +112,15 @@ impl Searcher {
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
         self.pawn_history.fill([[0; 64]; 12]);
-        self.noisy_history.fill([[0; 6]; 64]);
+        self.noisy_history.fill([[[0; 2]; 6]; 64]);
         self.counter_moves = [[Move::NULL; 64]; 64];
-        self.conthist.fill([[[0; 64]; 64]; 12]);
+        self.conthist.fill([[[[[0; 64]; 64]; 12]; 2]; 2]);
         self.pawn_corr.fill([0; CORR_ENTRIES]);
         self.non_pawn_corr.fill([[0; CORR_ENTRIES]; 2]);
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
+        self.prev_in_check = [false; MAX_PLY];
+        self.prev_is_capture = [false; MAX_PLY];
     }
 
     #[inline(always)]
@@ -147,10 +153,13 @@ impl Searcher {
         let ply_idx = ply as usize;
         for (layer, &offset) in Self::CONT_OFFSETS.iter().enumerate() {
             if ply_idx >= offset {
-                let prev_piece = self.played_pieces[ply_idx - offset];
-                let prev_move = self.played_moves[ply_idx - offset];
+                let prev_idx = ply_idx - offset;
+                let prev_piece = self.played_pieces[prev_idx];
+                let prev_move = self.played_moves[prev_idx];
                 if prev_piece != Piece::None && prev_move != Move::NULL {
-                    score += self.conthist[layer][prev_piece as usize][prev_move.to() as usize][m.to() as usize];
+                    let chk = self.prev_in_check[prev_idx] as usize;
+                    let cap = self.prev_is_capture[prev_idx] as usize;
+                    score += self.conthist[layer][chk][cap][prev_piece as usize][prev_move.to() as usize][m.to() as usize];
                 }
             }
         }
@@ -161,11 +170,14 @@ impl Searcher {
         let ply_idx = ply as usize;
         for (layer, &offset) in Self::CONT_OFFSETS.iter().enumerate() {
             if ply_idx >= offset {
-                let prev_piece = self.played_pieces[ply_idx - offset];
-                let prev_move = self.played_moves[ply_idx - offset];
+                let prev_idx = ply_idx - offset;
+                let prev_piece = self.played_pieces[prev_idx];
+                let prev_move = self.played_moves[prev_idx];
                 if prev_piece != Piece::None && prev_move != Move::NULL {
+                    let chk = self.prev_in_check[prev_idx] as usize;
+                    let cap = self.prev_is_capture[prev_idx] as usize;
                     update_history(
-                        &mut self.conthist[layer][prev_piece as usize][prev_move.to() as usize][m.to() as usize],
+                        &mut self.conthist[layer][chk][cap][prev_piece as usize][prev_move.to() as usize][m.to() as usize],
                         bonus,
                     );
                 }
@@ -491,6 +503,8 @@ impl Searcher {
                 ply,
                 &self.played_pieces,
                 &self.played_moves,
+                &self.prev_in_check,
+                &self.prev_is_capture,
             ) {
                 if !see(board, m, probcut_beta - static_eval) {
                     continue;
@@ -612,6 +626,8 @@ impl Searcher {
             ply,
             &self.played_pieces,
             &self.played_moves,
+            &self.prev_in_check,
+            &self.prev_is_capture,
         ) {
             if m == excluded_move {
                 continue;
@@ -648,6 +664,8 @@ impl Searcher {
             if (ply as usize) < MAX_PLY {
                 self.played_moves[ply as usize] = m;
                 self.played_pieces[ply as usize] = board.piece_on[m.from()];
+                self.prev_in_check[ply as usize] = in_check;
+                self.prev_is_capture[ply as usize] = is_capture;
             }
 
             let undo = board.make_move(m);
@@ -755,7 +773,10 @@ impl Searcher {
                         board.piece_on[m.to()].piece_type()
                     } as usize;
 
-                    update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt], bonus);
+                    let threats = board.opponent_threats();
+                    let to_threatened = threats.contains(m.to()) as usize;
+
+                    update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt][to_threatened], bonus);
 
                     for j in 0..noisy_count.saturating_sub(1) {
                         let nm = noisy_moves[j];
@@ -765,7 +786,8 @@ impl Searcher {
                         } else {
                             board.piece_on[nm.to()].piece_type()
                         } as usize;
-                        update_history(&mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt], -bonus);
+                        let n_to_threatened = threats.contains(nm.to()) as usize;
+                        update_history(&mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt][n_to_threatened], -bonus);
                     }
                 }
                 break;
@@ -851,6 +873,8 @@ impl Searcher {
             ply,
             &self.played_pieces,
             &self.played_moves,
+            &self.prev_in_check,
+            &self.prev_is_capture,
         ) {
             moves_searched += 1;
             let undo = board.make_move(m);

@@ -66,9 +66,39 @@ impl Searcher {
         self.time_limit_ms = time_ms;
 
         let mut best_move = Move::NULL;
+        let mut score = 0;
 
         for depth in 1..=max_depth {
-            let score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true);
+            if depth >= 4 {
+                let mut delta = 20;
+                let mut alpha = (score - delta).max(-INFINITY);
+                let mut beta = (score + delta).min(INFINITY);
+
+                loop {
+                    score = self.negamax(board, depth, 0, alpha, beta, true);
+                    if self.stop {
+                        break;
+                    }
+
+                    if score <= alpha {
+                        beta = (alpha + beta) / 2;
+                        alpha = (alpha - delta).max(-INFINITY);
+                    } else if score >= beta {
+                        beta = (beta + delta).min(INFINITY);
+                    } else {
+                        break;
+                    }
+
+                    delta += delta / 2;
+                    if delta > 1000 {
+                        alpha = -INFINITY;
+                        beta = INFINITY;
+                    }
+                }
+            } else {
+                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true);
+            }
+
             if self.stop {
                 break;
             }

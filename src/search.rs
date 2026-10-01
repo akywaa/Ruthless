@@ -494,7 +494,7 @@ impl Searcher {
 
         let mut extension = 0;
 
-        if depth >= 7
+        if depth >= 6
             && has_tt
             && tt_move != Move::NULL
             && excluded_move == Move::NULL
@@ -504,7 +504,8 @@ impl Searcher {
             && (tt_flag == TTFlag::Exact || tt_flag == TTFlag::LowerBound)
             && tt_score.abs() < MATE_SCORE - 100
         {
-            let singular_beta = tt_score - (depth as i32) * 2;
+            let singular_margin = (depth as i32) * 2;
+            let singular_beta = tt_score - singular_margin;
             let singular_depth = (depth - 1) / 2;
 
             let score = self.negamax(
@@ -517,8 +518,28 @@ impl Searcher {
                 tt_move,
             );
 
+            if self.stop.load(Ordering::Relaxed) {
+                return 0;
+            }
+
             if score < singular_beta {
+                // The TT move is singular
+                let double_margin = singular_margin * 2;
+                let triple_margin = singular_margin * 3;
+
                 extension = 1;
+                if score < singular_beta - double_margin && !is_pv {
+                    extension = 2;
+                }
+                if score < singular_beta - triple_margin && !is_pv {
+                    extension = 3;
+                }
+            } else if singular_beta >= beta {
+                // Multi-Cut: another move already fails high
+                return singular_beta;
+            } else if tt_score >= beta {
+                // Negative extension for non-singular moves failing high
+                extension = -1;
             }
         }
 
@@ -605,7 +626,8 @@ impl Searcher {
             let undo = board.make_move(m);
 
             let score = if moves_searched == 0 {
-                -self.negamax(board, depth - 1 + extension, ply + 1, -beta, -alpha, is_pv, Move::NULL)
+                let next_depth = (depth as i32 - 1 + extension).max(1) as u8;
+                -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL)
             } else {
                 let mut r = 0;
 

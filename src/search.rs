@@ -11,6 +11,7 @@ use std::time::Instant;
 pub const INFINITY: i32 = 1_000_000;
 pub const MATE_SCORE: i32 = 100_000;
 pub const MAX_PLY: usize = 64;
+pub const PAWN_CORR_ENTRIES: usize = 16384;
 
 pub struct Searcher {
     pub tt: Arc<TranspositionTable>,
@@ -23,6 +24,7 @@ pub struct Searcher {
     history: [[[i32; 64]; 64]; 2],
     counter_moves: [[Move; 64]; 64],
     conthist: [[[i32; 64]; 64]; 12],
+    pawn_corr: Box<[[i32; PAWN_CORR_ENTRIES]; 2]>,
     played_moves: [Move; MAX_PLY],
     played_pieces: [Piece; MAX_PLY],
 }
@@ -66,6 +68,7 @@ impl Searcher {
             history: [[[0; 64]; 64]; 2],
             counter_moves: [[Move::NULL; 64]; 64],
             conthist: [[[0; 64]; 64]; 12],
+            pawn_corr: vec![[0; PAWN_CORR_ENTRIES]; 2].into_boxed_slice().try_into().unwrap(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
         }
@@ -77,8 +80,18 @@ impl Searcher {
         self.history = [[[0; 64]; 64]; 2];
         self.counter_moves = [[Move::NULL; 64]; 64];
         self.conthist = [[[0; 64]; 64]; 12];
+        self.pawn_corr.fill([0; PAWN_CORR_ENTRIES]);
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
+    }
+
+    #[inline(always)]
+    fn corrected_eval(&self, board: &Board) -> i32 {
+        let raw = evaluate(board);
+        let side = board.side_to_move as usize;
+        let idx = (board.pawn_hash as usize) & (PAWN_CORR_ENTRIES - 1);
+        let bonus = self.pawn_corr[side][idx] / 64;
+        (raw + bonus).clamp(-MATE_SCORE + 100, MATE_SCORE - 100)
     }
 
     pub fn search(
@@ -347,7 +360,7 @@ impl Searcher {
             }
         }
 
-        let static_eval = evaluate(board);
+        let static_eval = self.corrected_eval(board);
 
         if !is_pv && !in_check {
             if depth <= 3 && static_eval - 85 * (depth as i32) >= beta {
@@ -550,6 +563,22 @@ impl Searcher {
 
         if excluded_move == Move::NULL {
             self.tt.store(board.hash, score_to_tt(best_score, ply), depth, flag, best_move);
+
+            let tt_move_quiet = best_move == Move::NULL
+                || (board.piece_on[best_move.to()] == Piece::None
+                    && best_move.move_type() != MoveType::Promotion
+                    && best_move.move_type() != MoveType::EnPassant);
+
+            if !in_check
+                && tt_move_quiet
+                && !(flag == TTFlag::LowerBound && best_score <= static_eval)
+                && !(flag == TTFlag::UpperBound && best_score >= static_eval)
+            {
+                let bonus = ((best_score - static_eval) * (depth as i32)).clamp(-1600, 1600);
+                let side = board.side_to_move as usize;
+                let idx = (board.pawn_hash as usize) & (PAWN_CORR_ENTRIES - 1);
+                update_history(&mut self.pawn_corr[side][idx], bonus);
+            }
         }
         best_score
     }
@@ -571,7 +600,7 @@ impl Searcher {
             }
             legal
         } else {
-            let stand_pat = evaluate(board);
+            let stand_pat = self.corrected_eval(board);
             if stand_pat >= beta {
                 return beta;
             }

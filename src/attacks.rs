@@ -54,6 +54,7 @@ pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     attacks().slider_table[idx]
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn queen_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     bishop_attacks(sq, occ) | rook_attacks(sq, occ)

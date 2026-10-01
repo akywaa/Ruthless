@@ -5,6 +5,7 @@ mod eval;
 mod movegen;
 mod nnue;
 mod search;
+mod see;
 mod tt;
 mod types;
 mod uci;

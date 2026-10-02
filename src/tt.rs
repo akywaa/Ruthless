@@ -12,7 +12,6 @@ pub enum TTFlag {
 
 #[derive(Copy, Clone)]
 pub struct TTEntry {
-    pub key: u64,
     pub score: i32,
     pub depth: u8,
     pub flag: TTFlag,
@@ -122,7 +121,6 @@ impl TranspositionTable {
             let word = entry.load(Ordering::Relaxed);
             if key16_of(word) == key16 && bound(word) != TTFlag::None {
                 return Some(TTEntry {
-                    key,
                     score: score_of(word) as i32,
                     depth: depth_of(word),
                     flag: bound(word),

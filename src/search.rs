@@ -335,12 +335,13 @@ unsafe {
         for depth in 1..=max_depth {
             self.root_move_nodes = [0; 256];
             if depth >= 4 {
+                let mut temp_depth = depth;
                 let mut delta = 20;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
 
                 loop {
-                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false);
+                    score = self.negamax(board, temp_depth, 0, alpha, beta, true, Move::NULL, false);
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -348,8 +349,12 @@ unsafe {
                     if score <= alpha {
                         beta = (alpha + beta) / 2;
                         alpha = (alpha - delta).max(-INFINITY);
+                        temp_depth = depth;
                     } else if score >= beta {
                         beta = (beta + delta).min(INFINITY);
+                        if depth > 6 {
+                            temp_depth = temp_depth.saturating_sub(1).max(depth - 2);
+                        }
                     } else {
                         break;
                     }
@@ -463,12 +468,13 @@ unsafe {
             }
 
             if depth >= 4 {
+                let mut temp_depth = depth;
                 let mut delta = 20;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
 
                 loop {
-                    score = self.negamax(board, depth, 0, alpha, beta, false, Move::NULL, false);
+                    score = self.negamax(board, temp_depth, 0, alpha, beta, false, Move::NULL, false);
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -476,8 +482,12 @@ unsafe {
                     if score <= alpha {
                         beta = (alpha + beta) / 2;
                         alpha = (alpha - delta).max(-INFINITY);
+                        temp_depth = depth;
                     } else if score >= beta {
                         beta = (beta + delta).min(INFINITY);
+                        if depth > 6 {
+                            temp_depth = temp_depth.saturating_sub(1).max(depth - 2);
+                        }
                     } else {
                         break;
                     }

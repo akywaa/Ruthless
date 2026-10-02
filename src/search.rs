@@ -102,7 +102,7 @@ fn update_history(val: &mut i32, bonus: i32) {
 
 #[inline(always)]
 fn update_corr(val: &mut i16, bonus: i32) {
-    let clamped = bonus.clamp(-2400, 2400);
+    let clamped = bonus.clamp(-1200, 1200);
     *val += (clamped - (*val as i32 * clamped.abs()) / 16384) as i16;
 }
 
@@ -236,7 +236,7 @@ unsafe {
         cont_term *= 8;
 
         let total_bonus = (pawn_term + np_term + cont_term) / 512;
-        let clamped_bonus = total_bonus.clamp(-180, 180);
+        let clamped_bonus = (total_bonus / 3).clamp(-60, 60);
 
         let mut eval = raw + clamped_bonus;
 
@@ -269,13 +269,7 @@ unsafe {
 
     #[inline(always)]
     fn draw_score(&self) -> i32 {
-        let fuzz = (self.nodes as i32 & 3) - 2;
-        let contempt = if self.root_score.abs() < 500 {
-            -self.root_score / 16
-        } else {
-            0
-        };
-        fuzz + contempt
+        (self.nodes as i32 & 3) - 2
     }
 
     #[inline(always)]
@@ -609,8 +603,16 @@ unsafe {
         }
 
         let draw_score = self.draw_score();
-        if ply > 0 && (board.is_draw() || (alpha < draw_score && board.upcoming_repetition())) {
-            return draw_score;
+        if ply > 0 {
+            if board.is_draw() {
+                return draw_score;
+            }
+            if !is_pv && alpha < draw_score && board.upcoming_repetition() {
+                alpha = draw_score;
+                if alpha >= beta {
+                    return alpha;
+                }
+            }
         }
 
         if (ply as usize) >= MAX_PLY {
@@ -885,16 +887,16 @@ unsafe {
                         continue;
                     }
 
-                    if is_quiet && depth <= 6 && !see(board, m, -35 * (depth as i32) * (depth as i32)) {
-                        continue;
-                    }
-
                     if is_quiet && depth <= 7 {
                         let threshold = -1200 * (depth as i32) - if improving { 800 } else { 0 };
                         if hist < threshold {
                             continue;
                         }
                     }
+                }
+
+                if is_quiet && depth <= 6 && !see(board, m, -35 * (depth as i32) * (depth as i32)) {
+                    continue;
                 }
 
                 if !is_quiet && depth <= 6 && !see(board, m, -120 * (depth as i32)) {
@@ -982,13 +984,7 @@ unsafe {
                 let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL, true);
 
                 if s > alpha && reduced < depth - 1 {
-                    let mut re_search_depth = depth - 1;
-                    if s > best_score + 50 && !is_pv {
-                        re_search_depth = (re_search_depth + 1).min((MAX_PLY - 1) as u8);
-                    } else if s < best_score + 10 && re_search_depth as i32 > (reduced as i32 + 1) {
-                        re_search_depth -= 1;
-                    }
-                    s = -self.negamax(board, re_search_depth, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node);
+                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node);
                 }
 
                 if s > alpha && s < beta {
@@ -1155,7 +1151,7 @@ unsafe {
                 && !(flag == TTFlag::LowerBound && best_score <= static_eval)
                 && !(flag == TTFlag::UpperBound && best_score >= static_eval)
             {
-                let bonus = ((best_score - static_eval) * (depth as i32)).clamp(-2400, 2400);
+                let bonus = ((best_score - static_eval) * (depth as i32)).clamp(-1200, 1200);
                 let side = board.side_to_move as usize;
                 let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
 
@@ -1209,8 +1205,16 @@ unsafe {
         }
 
         let draw_score = self.draw_score();
-        if ply > 0 && (board.is_repetition() || board.halfmove_clock >= 100 || (alpha < draw_score && board.upcoming_repetition())) {
-            return draw_score;
+        if ply > 0 {
+            if board.is_repetition() || board.halfmove_clock >= 100 {
+                return draw_score;
+            }
+            if alpha < draw_score && board.upcoming_repetition() {
+                alpha = draw_score;
+                if alpha >= beta {
+                    return alpha;
+                }
+            }
         }
 
         if (ply as usize) >= MAX_PLY {
@@ -1244,16 +1248,6 @@ unsafe {
         if !in_check {
             raw_eval = self.raw_eval(board);
             stand_pat = self.corrected_eval(board, ply, raw_eval);
-
-            if let Some(s) = tt_score {
-                if s.abs() < MATE_SCORE - 100 {
-                    match tt_flag {
-                        TTFlag::LowerBound if s > stand_pat => stand_pat = s,
-                        TTFlag::UpperBound if s < stand_pat => stand_pat = s,
-                        _ => {}
-                    }
-                }
-            }
 
             if stand_pat >= beta {
                 return stand_pat;

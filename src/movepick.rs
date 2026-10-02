@@ -292,16 +292,18 @@ impl MovePicker {
                 }
             }
 
-            if board.gives_direct_check(m) {
-                score += 8000;
+            let is_threatened_to = pawn_threats.contains(to);
+
+            if board.gives_direct_check(m) && !is_threatened_to {
+                score += 2000;
             }
 
-            if pawn_threats.contains(from) && !pawn_threats.contains(to) {
-                score += 4000;
+            if pawn_threats.contains(from) && !is_threatened_to {
+                score += 2500;
             }
 
-            if pawn_threats.contains(to) {
-                score -= if pt != PieceType::Pawn { 3500 } else { 1500 };
+            if is_threatened_to {
+                score -= if pt != PieceType::Pawn { 3000 } else { 1200 };
             }
 
             self.scores[i] = score;

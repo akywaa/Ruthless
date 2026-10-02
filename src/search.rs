@@ -739,25 +739,16 @@ unsafe {
             }
 
             if score < singular_beta {
-                // The TT move is singular
-                let double_margin = singular_margin * 2;
-                let triple_margin = singular_margin * 3;
-
                 extension = 1;
-                if score < singular_beta - double_margin && !is_pv {
+                if score < singular_beta - singular_margin && (!is_pv || singular_beta <= beta) {
                     extension = 2;
                 }
-                if score < singular_beta - triple_margin && !is_pv {
-                    extension = 3;
-                }
             } else if singular_beta >= beta {
-                // Multi-Cut: another move already fails high
                 return singular_beta;
-            } else if tt_score >= beta {
-                // Negative extension for non-singular moves failing high
+            } else if !is_pv && tt_score >= beta {
                 extension = -1;
-            } else if cut_node {
-                extension = -2;
+            } else if !is_pv && cut_node {
+                extension = -1;
             }
         }
 
@@ -870,8 +861,10 @@ unsafe {
             let undo = board.make_move(m);
             let gives_check = board.in_check();
 
+            let ext = if m == tt_move { extension } else { 0 };
+
             let score = if moves_searched == 0 {
-                let next_depth = (depth as i32 - 1 + extension).max(0) as u8;
+                let next_depth = (depth as i32 - 1 + ext).max(0) as u8;
                 -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, false)
             } else {
                 let mut r = 0;

@@ -145,7 +145,13 @@ impl TranspositionTable {
             }
 
             let entry_age = (64 + curr_gen - age(meta)) & 0x3F;
-            let priority = (depth_of(meta) as i32) - (entry_age as i32 * 8);
+            let mut priority = (depth_of(meta) as i32) - (entry_age as i32 * 8);
+
+            // Always-replace slot: fresh tactical entries of the current
+            // iteration must always have a chance to land.
+            if i == cluster.entries.len() - 1 {
+                priority = i32::MIN;
+            }
 
             if priority < lowest_score {
                 lowest_score = priority;

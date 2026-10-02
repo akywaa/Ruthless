@@ -256,8 +256,6 @@ impl MovePicker {
         let their_occ = board.occupied_co[them];
         let occ = board.occupied;
 
-        let escape_bonus = [0, 2000, 2200, 3000, 4500, 0];
-
         for i in 0..self.moves.count {
             let m = self.moves.moves[i];
             let from = m.from();
@@ -279,17 +277,6 @@ impl MovePicker {
                         score += conthist[layer][chk][cap][prev_piece as usize][prev_move.to() as usize][to as usize];
                     }
                 }
-            }
-
-            // Tactical adjustments
-            let from_threatened = threats.contains(from);
-            let to_threatened = threats.contains(to);
-
-            if from_threatened {
-                score += escape_bonus[pt as usize];
-            }
-            if to_threatened {
-                score -= escape_bonus[pt as usize] / 2;
             }
 
             if pawn_threats.contains(to) && pt != PieceType::Pawn {

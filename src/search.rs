@@ -506,7 +506,7 @@ unsafe {
     if (self.nodes & 2047) == 0 {
         self.shared_nodes.fetch_add(2048, Ordering::Relaxed);
         let elapsed = self.start_time.elapsed().as_millis();
-        
+
         if let Some(hard_limit) = self.hard_time_ms {
             if elapsed >= hard_limit {
                 self.stop.store(true, Ordering::Relaxed);
@@ -869,7 +869,7 @@ unsafe {
                             r -= 1;
                         }
                     } else if !see(board, m, 0) {
-                        r += 1;
+                        r += 2;
                     }
 
                     // Side to move was flipped by make_move, get mover's side
@@ -1127,7 +1127,7 @@ unsafe {
             &self.prev_is_capture,
         ) {
             let is_promo = m.move_type() == MoveType::Promotion;
-            if moves_searched > 0 && !is_promo {
+            if !is_promo {
                 let cap_pt = match m.move_type() {
                     MoveType::EnPassant => PieceType::Pawn,
                     _ => board.piece_on[m.to()].piece_type(),

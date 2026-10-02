@@ -69,23 +69,17 @@ pub fn see_value(board: &Board, m: Move) -> i32 {
             break;
         }
 
-        if next_pt == PieceType::King {
-            let opp_attackers = attackers & occ & board.occupied_co[!side];
-            if !opp_attackers.is_empty() {
-                break;
-            }
-        }
-
         d += 1;
         gain[d] = PIECE_VALUES[pt as usize];
         pt = next_pt;
         occ.clear(next_sq);
 
-        if pt == PieceType::Pawn || pt == PieceType::Bishop || pt == PieceType::Queen {
-            attackers |= bishop_attacks(to, occ) & bishops;
-        }
-        if pt == PieceType::Rook || pt == PieceType::Queen {
-            attackers |= rook_attacks(to, occ) & rooks;
+        attackers |= bishop_attacks(to, occ) & bishops;
+        attackers |= rook_attacks(to, occ) & rooks;
+
+        let opp_attackers = attackers & occ & board.occupied_co[!side];
+        if pt == PieceType::King && !opp_attackers.is_empty() {
+            break;
         }
 
         side = !side;

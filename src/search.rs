@@ -438,10 +438,13 @@ unsafe {
 
                 let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor) as u128;
 
-                if elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
+                // Stop if we have exhausted our soft time or if starting another depth would likely blow it
+                if elapsed >= dynamic_soft.saturating_mul(6) / 10
+                    || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX)
+                {
                     let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
                     let majority = (self.num_threads * 65).div_ceil(100);
-                    if votes >= majority || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
+                    if votes >= majority || elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
                         self.stop.store(true, Ordering::Relaxed);
                     }
                     break;
@@ -569,7 +572,7 @@ unsafe {
             }
         }
         if let Some(soft_limit) = self.soft_time_ms {
-            if elapsed >= soft_limit.saturating_mul(3) / 2 {
+            if elapsed >= soft_limit.saturating_mul(12) / 10 {
                 self.stop.store(true, Ordering::Relaxed);
             }
         }
@@ -635,7 +638,7 @@ unsafe {
             }
         }
 
-        if excluded_move == Move::NULL && depth >= 4 && tt_move == Move::NULL && (is_pv || cut_node) {
+        if excluded_move == Move::NULL && depth >= 2 && tt_move == Move::NULL && (is_pv || cut_node) {
             depth -= 1;
         }
 
@@ -913,6 +916,9 @@ unsafe {
 
                     if !is_quiet {
                         r /= 2;
+                        if !see(board, m, 0) {
+                            r += 2;
+                        }
                     }
 
                     if !improving {
@@ -936,9 +942,6 @@ unsafe {
                         }
                         r -= (hist / 512).clamp(-2, 2);
                     } else {
-                        if !see(board, m, 0) {
-                            r += 1;
-                        }
                         r -= (hist / 400).clamp(-2, 2);
                     }
 

@@ -537,7 +537,7 @@ unsafe {
             return 0;
         }
 
-        if ply > 0 && (board.is_draw() || board.upcoming_repetition()) {
+        if ply > 0 && board.is_draw() {
             return 0;
         }
 

@@ -13,7 +13,7 @@ The design is heavily inspired by [Reckless](https://github.com/codedeliveryserv
 - NNUE eval, the net is `ruthless.bin`
 - UCI protocol
 
-The net was trained on [linrock's bullet-training-data (S1)](https://huggingface.co/datasets/linrock/bullet-training-data/tree/main/S1).
+The net was trained on [vondele's master-binpacks_relabel](https://huggingface.co/datasets/vondele/master-binpacks_relabel/tree/main).
 
 ## Building
 

@@ -271,6 +271,20 @@ unsafe {
             + self.get_conthist(ply, m)
     }
 
+    #[inline(always)]
+    fn noisy_history_score(&self, board: &Board, m: Move) -> i32 {
+        let moving_pc = board.piece_on[m.from()];
+        let victim_pt = match m.move_type() {
+            MoveType::EnPassant => PieceType::Pawn,
+            MoveType::Promotion => m.promo_type(),
+            _ => board.piece_on[m.to()].piece_type(),
+        };
+        let threats = board.opponent_threats();
+        let to_threatened = threats.contains(m.to()) as usize;
+
+        self.noisy_history[moving_pc as usize][m.to() as usize][victim_pt as usize][to_threatened]
+    }
+
     fn update_conthist(&mut self, ply: u8, m: Move, bonus: i32) {
         let ply_idx = ply as usize;
         for (layer, &offset) in Self::CONT_OFFSETS.iter().enumerate() {
@@ -815,7 +829,7 @@ unsafe {
             let hist = if is_quiet {
                 self.quiet_history_score(board, ply, m)
             } else {
-                0
+                self.noisy_history_score(board, m)
             };
 
             if !is_pv && !in_check && moves_searched > 0 {
@@ -875,7 +889,11 @@ unsafe {
             } else {
                 let mut r = 0;
 
-                if depth >= 3 && moves_searched >= 1 && (is_quiet || moves_searched >= 6) {
+                if depth >= 3
+                    && moves_searched >= 1
+                    && (!is_pv || is_quiet)
+                    && (is_quiet || moves_searched >= 2)
+                {
                     r = lmr(depth as usize, moves_searched);
 
                     if !is_quiet {
@@ -901,12 +919,12 @@ unsafe {
                         if m == counter_move {
                             r -= 1;
                         }
-                    } else if !see(board, m, 0) {
-                        r += 2;
-                    }
-
-                    if is_quiet {
                         r -= (hist / 512).clamp(-2, 2);
+                    } else {
+                        if !see(board, m, 0) {
+                            r += 1;
+                        }
+                        r -= (hist / 400).clamp(-2, 2);
                     }
 
                     if is_pv {

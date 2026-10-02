@@ -337,6 +337,119 @@ impl Board {
         pinned
     }
 
+    pub fn is_pseudo_legal(&self, m: Move) -> bool {
+        if m == Move::NULL {
+            return false;
+        }
+
+        let from = m.from();
+        let to = m.to();
+        let piece = self.piece_on[from];
+
+        if piece == Piece::None || piece.color() != self.side_to_move {
+            return false;
+        }
+
+        let us = self.side_to_move;
+        let them = !us;
+        let dest_piece = self.piece_on[to];
+
+        if dest_piece != Piece::None && dest_piece.color() == us {
+            return false;
+        }
+
+        match m.move_type() {
+            MoveType::Normal => {
+                let pt = piece.piece_type();
+                match pt {
+                    PieceType::Pawn => {
+                        let (forward, start_rank) = match us {
+                            Color::White => (8i8, 1u8),
+                            Color::Black => (-8i8, 6u8),
+                        };
+
+                        if dest_piece == Piece::None {
+                            if to as i8 == from as i8 + forward {
+                                return true;
+                            }
+                            if from.rank() == start_rank
+                                && to as i8 == from as i8 + forward * 2
+                                && self.piece_on[Square::new((from as i8 + forward) as u8)] == Piece::None
+                            {
+                                return true;
+                            }
+                            false
+                        } else {
+                            pawn_attacks(us, from).contains(to)
+                        }
+                    }
+                    PieceType::Knight => knight_attacks(from).contains(to),
+                    PieceType::Bishop => bishop_attacks(from, self.occupied).contains(to),
+                    PieceType::Rook => rook_attacks(from, self.occupied).contains(to),
+                    PieceType::Queen => (bishop_attacks(from, self.occupied) | rook_attacks(from, self.occupied)).contains(to),
+                    PieceType::King => king_attacks(from).contains(to),
+                    PieceType::None => false,
+                }
+            }
+            MoveType::Promotion => {
+                if piece.piece_type() != PieceType::Pawn {
+                    return false;
+                }
+                let promo_rank = if us == Color::White { 7 } else { 0 };
+                if to.rank() != promo_rank {
+                    return false;
+                }
+
+                let forward = if us == Color::White { 8i8 } else { -8i8 };
+                if dest_piece == Piece::None {
+                    to as i8 == from as i8 + forward
+                } else {
+                    pawn_attacks(us, from).contains(to)
+                }
+            }
+            MoveType::EnPassant => {
+                if piece.piece_type() != PieceType::Pawn || to != self.ep_square {
+                    return false;
+                }
+                pawn_attacks(us, from).contains(to)
+            }
+            MoveType::Castling => {
+                let occ = self.occupied;
+                match (us, to) {
+                    (Color::White, Square::G1) => {
+                        (self.castling_rights & Self::CASTLE_WK) != 0
+                            && (occ.0 & ((1u64 << Square::F1 as u8) | (1u64 << Square::G1 as u8))) == 0
+                            && !self.is_square_attacked(Square::E1, Color::Black)
+                            && !self.is_square_attacked(Square::F1, Color::Black)
+                            && !self.is_square_attacked(Square::G1, Color::Black)
+                    }
+                    (Color::White, Square::C1) => {
+                        (self.castling_rights & Self::CASTLE_WQ) != 0
+                            && (occ.0 & ((1u64 << Square::B1 as u8) | (1u64 << Square::C1 as u8) | (1u64 << Square::D1 as u8))) == 0
+                            && !self.is_square_attacked(Square::E1, Color::Black)
+                            && !self.is_square_attacked(Square::D1, Color::Black)
+                            && !self.is_square_attacked(Square::C1, Color::Black)
+                    }
+                    (Color::Black, Square::G8) => {
+                        (self.castling_rights & Self::CASTLE_BK) != 0
+                            && (occ.0 & ((1u64 << Square::F8 as u8) | (1u64 << Square::G8 as u8))) == 0
+                            && !self.is_square_attacked(Square::E8, Color::White)
+                            && !self.is_square_attacked(Square::F8, Color::White)
+                            && !self.is_square_attacked(Square::G8, Color::White)
+                    }
+                    (Color::Black, Square::C8) => {
+                        (self.castling_rights & Self::CASTLE_BQ) != 0
+                            && (occ.0 & ((1u64 << Square::B8 as u8) | (1u64 << Square::C8 as u8) | (1u64 << Square::D8 as u8))) == 0
+                            && !self.is_square_attacked(Square::E8, Color::White)
+                            && !self.is_square_attacked(Square::D8, Color::White)
+                            && !self.is_square_attacked(Square::C8, Color::White)
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
     pub fn is_legal(&self, m: Move) -> bool {
         let us = self.side_to_move;
         let them = !us;

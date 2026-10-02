@@ -305,33 +305,15 @@ impl MovePicker {
         }
     }
 
+    #[inline(always)]
     fn is_pseudo_legal(&self, board: &Board, m: Move) -> bool {
-        let from = m.from();
-        let to = m.to();
-        let pc = board.piece_on[from];
-        if pc == Piece::None || pc.color() != board.side_to_move {
-            return false;
-        }
-        if board.piece_on[to] != Piece::None || m.move_type() == MoveType::EnPassant {
-            return false;
-        }
-        let mut quiets = MoveList::new();
-        generate_quiet_pseudo(board, &mut quiets);
-        quiets.as_slice().contains(&m)
+        m.move_type() != MoveType::EnPassant
+            && board.piece_on[m.to()] == Piece::None
+            && board.is_pseudo_legal(m)
     }
 
+    #[inline(always)]
     fn is_pseudo_legal_any(&self, board: &Board, m: Move) -> bool {
-        if m == Move::NULL {
-            return false;
-        }
-        let from = m.from();
-        let pc = board.piece_on[from];
-        if pc == Piece::None || pc.color() != board.side_to_move {
-            return false;
-        }
-        let mut list = MoveList::new();
-        generate_noisy_pseudo(board, &mut list);
-        generate_quiet_pseudo(board, &mut list);
-        list.as_slice().contains(&m)
+        board.is_pseudo_legal(m)
     }
 }

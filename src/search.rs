@@ -835,7 +835,7 @@ unsafe {
                     continue;
                 }
 
-                if is_quiet && depth <= 4 && !see(board, m, -25 * (depth as i32) * (depth as i32)) {
+                if is_quiet && depth <= 6 && !see(board, m, -20 * (depth as i32) * (depth as i32)) {
                     continue;
                 }
 
@@ -846,7 +846,7 @@ unsafe {
                     }
                 }
 
-                if !is_quiet && depth <= 5 && !see(board, m, -80 * (depth as i32) * (depth as i32)) {
+                if !is_quiet && depth <= 6 && !see(board, m, -90 * (depth as i32)) {
                     continue;
                 }
             }

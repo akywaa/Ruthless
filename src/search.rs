@@ -60,6 +60,8 @@ pub struct Searcher {
     prev_in_check: [bool; MAX_PLY],
     prev_is_capture: [bool; MAX_PLY],
     eval_stack: [i32; MAX_PLY],
+    root_move_nodes: [u64; 256],
+    root_best_idx: usize,
     pub root_best_move: Move,
     pub root_score: i32,
     pub completed_depth: u8,
@@ -142,6 +144,8 @@ cont_corr: alloc_box_zeroed(),
             prev_in_check: [false; MAX_PLY],
             prev_is_capture: [false; MAX_PLY],
             eval_stack: [0; MAX_PLY],
+            root_move_nodes: [0; 256],
+            root_best_idx: 0,
             root_best_move: Move::NULL,
             root_score: 0,
             completed_depth: 0,
@@ -166,6 +170,8 @@ unsafe {
         self.prev_in_check = [false; MAX_PLY];
         self.prev_is_capture = [false; MAX_PLY];
         self.eval_stack = [0; MAX_PLY];
+        self.root_move_nodes = [0; 256];
+        self.root_best_idx = 0;
         self.root_best_move = Move::NULL;
         self.root_score = 0;
         self.completed_depth = 0;
@@ -287,6 +293,7 @@ unsafe {
         let mut stable_iterations = 0;
 
         for depth in 1..=max_depth {
+            self.root_move_nodes = [0; 256];
             if depth >= 4 {
                 let mut delta = 20;
                 let mut alpha = (score - delta).max(-INFINITY);
@@ -365,7 +372,21 @@ unsafe {
                 let pv_factor = (1.25 - 0.05 * (stable_iterations as f32)).max(0.7);
                 let eval_factor = if eval_stable { 0.85 } else { 1.15 };
 
-                let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor) as u128;
+                let root_total: u64 = self.root_move_nodes.iter().sum();
+                let best_share = if root_total > 0 {
+                    self.root_move_nodes[self.root_best_idx.min(255)] as f32 / root_total as f32
+                } else {
+                    0.5
+                };
+                let node_factor = if best_share > 0.70 {
+                    0.75
+                } else if best_share < 0.40 {
+                    1.25
+                } else {
+                    1.0
+                };
+
+                let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor) as u128;
 
                 if elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
                     let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
@@ -396,6 +417,7 @@ unsafe {
         let target_depth = (max_depth as usize + 8).min(MAX_PLY) as u8;
 
         for depth in start_depth..=target_depth {
+            self.root_move_nodes = [0; 256];
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -515,7 +537,7 @@ unsafe {
             return 0;
         }
 
-        if ply > 0 && board.is_draw() {
+        if ply > 0 && (board.is_draw() || board.upcoming_repetition()) {
             return 0;
         }
 
@@ -556,6 +578,10 @@ unsafe {
                     _ => {}
                 }
             }
+        }
+
+        if excluded_move == Move::NULL && depth >= 4 && tt_move == Move::NULL && (is_pv || cut_node) {
+            depth -= 1;
         }
 
         let static_eval = self.corrected_eval(board, ply);
@@ -777,6 +803,18 @@ unsafe {
                 if is_quiet && depth <= 4 && !see(board, m, -25 * (depth as i32) * (depth as i32)) {
                     continue;
                 }
+
+                if is_quiet && depth <= 4 {
+                    let us = board.side_to_move as usize;
+                    let hist = self.history[us][m.from() as usize][m.to() as usize] + self.get_conthist(ply, m);
+                    if hist < -2000 * (depth as i32) {
+                        continue;
+                    }
+                }
+
+                if !is_quiet && depth <= 5 && !see(board, m, -80 * (depth as i32) * (depth as i32)) {
+                    continue;
+                }
             }
 
             if is_quiet && quiet_count < 64 {
@@ -794,6 +832,7 @@ unsafe {
                 self.prev_is_capture[ply as usize] = is_capture;
             }
 
+            let nodes_before = if ply == 0 { self.nodes } else { 0 };
             let undo = board.make_move(m);
             let gives_check = board.in_check();
 
@@ -820,6 +859,17 @@ unsafe {
 
                     if gives_check {
                         r -= 1;
+                    }
+
+                    if is_quiet {
+                        if m == killers[0] || m == killers[1] {
+                            r -= 1;
+                        }
+                        if m == counter_move {
+                            r -= 1;
+                        }
+                    } else if !see(board, m, 0) {
+                        r += 1;
                     }
 
                     // Side to move was flipped by make_move, get mover's side
@@ -854,6 +904,10 @@ unsafe {
             };
 
             board.undo_move(m, undo);
+
+            if ply == 0 {
+                self.root_move_nodes[moves_searched] = self.nodes - nodes_before;
+            }
             moves_searched += 1;
 
             if self.stop.load(Ordering::Relaxed) {
@@ -865,6 +919,7 @@ unsafe {
                 best_move = m;
                 if ply == 0 {
                     self.root_best_move = m;
+                    self.root_best_idx = moves_searched - 1;
                 }
             }
 

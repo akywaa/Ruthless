@@ -18,58 +18,52 @@ pub struct TTEntry {
     pub best_move: Move,
 }
 
-#[repr(C, align(32))]
+#[repr(C, align(64))]
 struct Cluster {
-    entries: [AtomicU64; 3],
+    entries: [[AtomicU64; 2]; 3],
     _pad: u64,
 }
 
 impl Cluster {
     fn empty() -> Self {
         Self {
-            entries: [const { AtomicU64::new(0) }; 3],
+            entries: std::array::from_fn(|_| [AtomicU64::new(0), AtomicU64::new(0)]),
             _pad: 0,
         }
     }
 }
 
 #[inline(always)]
-fn pack(best_move: u16, key16: u16, score: i16, depth: u8, gen_bound: u8) -> u64 {
-    (best_move as u64)
-        | ((key16 as u64) << 16)
+fn pack_meta(key32: u32, score: i16, depth: u8, gen_bound: u8) -> u64 {
+    (key32 as u64)
         | (((score as u16) as u64) << 32)
         | ((depth as u64) << 48)
         | ((gen_bound as u64) << 56)
 }
 
 #[inline(always)]
-fn key16_of(word: u64) -> u16 {
-    ((word >> 16) & 0xFFFF) as u16
+fn key32_of(meta: u64) -> u32 {
+    (meta & 0xFFFF_FFFF) as u32
 }
 
 #[inline(always)]
-fn score_of(word: u64) -> i16 {
-    ((word >> 32) & 0xFFFF) as u16 as i16
+fn score_of(meta: u64) -> i16 {
+    ((meta >> 32) & 0xFFFF) as u16 as i16
 }
 
 #[inline(always)]
-fn depth_of(word: u64) -> u8 {
-    ((word >> 48) & 0xFF) as u8
+fn depth_of(meta: u64) -> u8 {
+    ((meta >> 48) & 0xFF) as u8
 }
 
 #[inline(always)]
-fn gen_bound_of(word: u64) -> u8 {
-    ((word >> 56) & 0xFF) as u8
+fn gen_bound_of(meta: u64) -> u8 {
+    ((meta >> 56) & 0xFF) as u8
 }
 
 #[inline(always)]
-fn best_move_of(word: u64) -> Move {
-    Move(word as u16)
-}
-
-#[inline(always)]
-fn bound(word: u64) -> TTFlag {
-    match gen_bound_of(word) & 3 {
+fn bound(meta: u64) -> TTFlag {
+    match gen_bound_of(meta) & 3 {
         1 => TTFlag::Exact,
         2 => TTFlag::LowerBound,
         3 => TTFlag::UpperBound,
@@ -78,8 +72,8 @@ fn bound(word: u64) -> TTFlag {
 }
 
 #[inline(always)]
-fn age(word: u64) -> u8 {
-    gen_bound_of(word) >> 2
+fn age(meta: u64) -> u8 {
+    gen_bound_of(meta) >> 2
 }
 
 pub struct TranspositionTable {
@@ -114,17 +108,18 @@ impl TranspositionTable {
     #[inline(always)]
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
         let idx = (key as usize) & self.mask;
-        let key16 = (key >> 48) as u16;
+        let key32 = (key >> 32) as u32;
         let cluster = &self.clusters[idx];
 
         for entry in &cluster.entries {
-            let word = entry.load(Ordering::Relaxed);
-            if key16_of(word) == key16 && bound(word) != TTFlag::None {
+            let meta = entry[0].load(Ordering::Relaxed);
+            if key32_of(meta) == key32 && bound(meta) != TTFlag::None {
+                let mv = entry[1].load(Ordering::Relaxed) as u16;
                 return Some(TTEntry {
-                    score: score_of(word) as i32,
-                    depth: depth_of(word),
-                    flag: bound(word),
-                    best_move: best_move_of(word),
+                    score: score_of(meta) as i32,
+                    depth: depth_of(meta),
+                    flag: bound(meta),
+                    best_move: Move(mv),
                 });
             }
         }
@@ -135,7 +130,7 @@ impl TranspositionTable {
     #[inline(always)]
     pub fn store(&self, key: u64, score: i32, depth: u8, flag: TTFlag, best_move: Move) {
         let idx = (key as usize) & self.mask;
-        let key16 = (key >> 48) as u16;
+        let key32 = (key >> 32) as u32;
         let cluster = &self.clusters[idx];
         let curr_gen = self.generation.load(Ordering::Relaxed) & 0x3F;
 
@@ -143,14 +138,14 @@ impl TranspositionTable {
         let mut lowest_score = i32::MAX;
 
         for (i, entry) in cluster.entries.iter().enumerate() {
-            let word = entry.load(Ordering::Relaxed);
-            if key16_of(word) == key16 || bound(word) == TTFlag::None {
+            let meta = entry[0].load(Ordering::Relaxed);
+            if key32_of(meta) == key32 || bound(meta) == TTFlag::None {
                 replace_idx = i;
                 break;
             }
 
-            let entry_age = (64 + curr_gen - age(word)) & 0x3F;
-            let priority = (depth_of(word) as i32) - (entry_age as i32 * 8);
+            let entry_age = (64 + curr_gen - age(meta)) & 0x3F;
+            let priority = (depth_of(meta) as i32) - (entry_age as i32 * 8);
 
             if priority < lowest_score {
                 lowest_score = priority;
@@ -160,34 +155,36 @@ impl TranspositionTable {
 
         let target = &cluster.entries[replace_idx];
 
-        // Keep existing best_move when storing a short/depth<=0 search for same key
-        let keep_move = best_move == Move::NULL && key16_of(target.load(Ordering::Relaxed)) == key16;
+        let keep_move = best_move == Move::NULL && key32_of(target[0].load(Ordering::Relaxed)) == key32;
         let entry_score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         let gen_bound = (curr_gen << 2) | (flag as u8);
 
-        if keep_move {
-            // Reload current word to preserve best_move, then store atomically
-            let mut word = target.load(Ordering::Relaxed);
-            while target
-                .compare_exchange_weak(
-                    word,
-                    pack(best_move_of(word).0, key16, entry_score, depth, gen_bound),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                word = target.load(Ordering::Relaxed);
-            }
+        let mv = if keep_move {
+            target[1].load(Ordering::Relaxed)
         } else {
-            target.store(pack(best_move.0, key16, entry_score, depth, gen_bound), Ordering::Relaxed);
+            best_move.0 as u64
+        };
+
+        let mut word = target[0].load(Ordering::Relaxed);
+        loop {
+            match target[0].compare_exchange_weak(
+                word,
+                pack_meta(key32, entry_score, depth, gen_bound),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => word = actual,
+            }
         }
+        target[1].store(mv, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
         for cluster in &self.clusters {
             for entry in &cluster.entries {
-                entry.store(0, Ordering::Relaxed);
+                entry[0].store(0, Ordering::Relaxed);
+                entry[1].store(0, Ordering::Relaxed);
             }
         }
         self.generation.store(0, Ordering::Relaxed);

@@ -89,30 +89,25 @@ pub fn side_key() -> u64 {
     zobrist().side
 }
 
-#[allow(dead_code)]
 pub struct CuckooTable {
     pub keys: [u64; 8192],
     pub sq_a: [Square; 8192],
     pub sq_b: [Square; 8192],
 }
 
-#[allow(dead_code)]
 static CUCKOO: OnceLock<CuckooTable> = OnceLock::new();
 
 #[inline(always)]
-#[allow(dead_code)]
 pub fn cuckoo() -> &'static CuckooTable {
     CUCKOO.get_or_init(init_cuckoo)
 }
 
 #[inline(always)]
-#[allow(dead_code)]
 pub fn h1(h: u64) -> usize {
     ((h >> 32) & 0x1FFF) as usize
 }
 
 #[inline(always)]
-#[allow(dead_code)]
 pub fn h2(h: u64) -> usize {
     ((h >> 48) & 0x1FFF) as usize
 }
@@ -121,7 +116,6 @@ use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, queen_attacks
 use crate::bitboard::Bitboard;
 use crate::types::PieceType;
 
-#[allow(dead_code)]
 fn init_cuckoo() -> CuckooTable {
     let mut keys = [0u64; 8192];
     let mut sq_a = [Square::None; 8192];

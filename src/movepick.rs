@@ -1,4 +1,4 @@
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, rook_attacks};
+use crate::attacks::{king_attacks, knight_attacks, pawn_attacks};
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
@@ -254,7 +254,6 @@ impl MovePicker {
 
         // Opponent attackable targets
         let their_occ = board.occupied_co[them];
-        let occ = board.occupied;
 
         for i in 0..self.moves.count {
             let m = self.moves.moves[i];
@@ -286,9 +285,7 @@ impl MovePicker {
             // Give a bonus if the move attacks an undefended enemy piece
             let attacks_from_to = match pt {
                 PieceType::Knight => knight_attacks(to),
-                PieceType::Bishop => bishop_attacks(to, occ),
-                PieceType::Rook => rook_attacks(to, occ),
-                PieceType::Queen => bishop_attacks(to, occ) | rook_attacks(to, occ),
+                PieceType::Pawn => pawn_attacks(us, to),
                 _ => Bitboard::EMPTY,
             };
             let attacks_enemy = attacks_from_to & their_occ & !threats;

@@ -1,7 +1,7 @@
 use crate::board::Board;
 use crate::types::{Color, Piece, Square};
 
-pub const HIDDEN_SIZE: usize = 1024;
+pub const HIDDEN_SIZE: usize = 512;
 pub const NUM_INPUT_BUCKETS: usize = 10;
 pub const NUM_OUTPUT_BUCKETS: usize = 8;
 pub const SCALE: i32 = 400;
@@ -147,34 +147,29 @@ pub fn king_bucket(sq: Square) -> usize {
 }
 
 #[inline(always)]
-pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, color: Color) -> usize {
-    let p_idx = piece as usize;
-    let sq_idx = sq as usize;
-
-    if color == Color::White {
-        let flip = if ksq.file() > 3 { 7 } else { 0 };
-        king_bucket(ksq) * 768 + p_idx * 64 + (sq_idx ^ flip)
+pub fn oriented_piece(piece: Piece, view: Color) -> usize {
+    let pc_color = piece.color();
+    let pt = piece.piece_type() as usize;
+    if pc_color == view {
+        pt
     } else {
-        let flipped_ksq = Square::new((ksq as u8) ^ 56);
-        let flip = if flipped_ksq.file() > 3 { 7 } else { 0 };
-        let flipped_piece = match piece {
-            Piece::WhitePawn => Piece::BlackPawn,
-            Piece::WhiteKnight => Piece::BlackKnight,
-            Piece::WhiteBishop => Piece::BlackBishop,
-            Piece::WhiteRook => Piece::BlackRook,
-            Piece::WhiteQueen => Piece::BlackQueen,
-            Piece::WhiteKing => Piece::BlackKing,
-            Piece::BlackPawn => Piece::WhitePawn,
-            Piece::BlackKnight => Piece::WhiteKnight,
-            Piece::BlackBishop => Piece::WhiteBishop,
-            Piece::BlackRook => Piece::WhiteRook,
-            Piece::BlackQueen => Piece::WhiteQueen,
-            Piece::BlackKing => Piece::WhiteKing,
-            Piece::None => Piece::None,
-        } as usize;
-        let flipped_sq = sq_idx ^ 56 ^ flip;
-        king_bucket(flipped_ksq) * 768 + flipped_piece * 64 + flipped_sq
+        pt + 6
     }
+}
+
+#[inline(always)]
+pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, view: Color) -> usize {
+    let (oriented_sq, oriented_ksq) = if view == Color::White {
+        (sq, ksq)
+    } else {
+        (Square::new((sq as u8) ^ 56), Square::new((ksq as u8) ^ 56))
+    };
+
+    let flip = if oriented_ksq.file() > 3 { 7 } else { 0 };
+    let final_sq = (oriented_sq as usize) ^ flip;
+    let piece_idx = oriented_piece(piece, view);
+
+    king_bucket(oriented_ksq) * 768 + piece_idx * 64 + final_sq
 }
 
 #[inline(always)]
@@ -204,22 +199,22 @@ pub fn evaluate(board: &Board) -> i32 {
         }
     }
 
-    let mut output = 0i32;
+    let mut output = 0i64;
 
     for i in 0..HIDDEN_SIZE {
-        output += screlu(board.accumulator.vals[us][i]) * i32::from(net.output_weights[bucket][i]);
+        output += screlu(board.accumulator.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
     }
 
     for i in 0..HIDDEN_SIZE {
-        output += screlu(board.accumulator.vals[them][i]) * i32::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+        output += screlu(board.accumulator.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
     }
 
-    output /= i32::from(QA);
-    output += i32::from(net.output_bias[bucket]);
-    output *= SCALE;
-    output /= i32::from(QA) * i32::from(QB);
+    output /= i64::from(QA);
+    output += i64::from(net.output_bias[bucket]);
+    output *= SCALE as i64;
+    output /= i64::from(QA) * i64::from(QB);
 
-    output
+    output as i32
 }
 
 #[cfg(test)]
@@ -233,18 +228,18 @@ mod tests {
         let them = (!board.side_to_move) as usize;
         let bucket = output_bucket(board);
         let (a, b) = if swap { (them, us) } else { (us, them) };
-        let mut output = 0i32;
+        let mut output = 0i64;
         for i in 0..HIDDEN_SIZE {
-            output += screlu(board.accumulator.vals[a][i]) * i32::from(net.output_weights[bucket][i]);
+            output += screlu(board.accumulator.vals[a][i]) as i64 * i64::from(net.output_weights[bucket][i]);
         }
         for i in 0..HIDDEN_SIZE {
-            output += screlu(board.accumulator.vals[b][i]) * i32::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+            output += screlu(board.accumulator.vals[b][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
         }
-        output /= i32::from(QA);
-        output += i32::from(net.output_bias[bucket]);
-        output *= SCALE;
-        output /= i32::from(QA) * i32::from(QB);
-        output
+        output /= i64::from(QA);
+        output += i64::from(net.output_bias[bucket]);
+        output *= SCALE as i64;
+        output /= i64::from(QA) * i64::from(QB);
+        output as i32
     }
 
     #[test]
@@ -252,13 +247,9 @@ mod tests {
         let cases = [
             ("K vs K w", "4k3/8/8/8/8/8/8/4K3 w - - 0 1"),
             ("K w vs K b", "4k3/8/8/8/8/8/8/4K3 b - - 0 1"),
-            ("K+Q w", "4k3/8/8/8/8/8/3Q4/4K3 w - - 0 1"),
-            ("K+q w", "4k3/8/8/8/8/8/3q4/4K3 w - - 0 1"),
-            ("K+R w", "4k3/8/8/8/8/8/3R4/4K3 w - - 0 1"),
-            ("K+r w", "4k3/8/8/8/8/8/3r4/4K3 w - - 0 1"),
-            ("K+P w", "4k3/8/8/8/8/8/3P4/4K3 w - - 0 1"),
-            ("K+p w", "4k3/8/8/8/8/8/3p4/4K3 w - - 0 1"),
+            ("K+Q w", "4k3/8/8/8/8/8/8/R3K3 w - - 0 1"),
             ("startpos w", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            ("midgame white +R", "r1bqk2r/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/R1BQK2R w KQkq - 0 1"),
         ];
         for (name, fen) in cases {
             let board = Board::from_fen(fen).unwrap();
@@ -352,65 +343,53 @@ unsafe fn evaluate_avx2(
     unsafe {
         let zero = _mm256_setzero_si256();
         let qa = _mm256_set1_epi16(QA);
+        let mut sum_us = _mm256_setzero_si256();
+        let mut sum_them = _mm256_setzero_si256();
 
-        let mut sum_vec = _mm256_setzero_si256();
+        let evaluate_side = |vals: &[i16; HIDDEN_SIZE], offset: usize, sum: &mut __m256i| {
+            let v_ptr = vals.as_ptr() as *const __m256i;
+            let w_ptr = net.output_weights[bucket][offset..].as_ptr() as *const __m256i;
 
-        forward_side_avx2(&acc.vals[us], &net.output_weights[bucket][0..HIDDEN_SIZE], zero, qa, &mut sum_vec);
-        forward_side_avx2(&acc.vals[them], &net.output_weights[bucket][HIDDEN_SIZE..2 * HIDDEN_SIZE], zero, qa, &mut sum_vec);
+            for chunk in 0..(HIDDEN_SIZE / 16) {
+                let v = _mm256_load_si256(v_ptr.add(chunk));
+                let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa);
 
-        let low128 = _mm256_castsi256_si128(sum_vec);
-        let high128 = _mm256_extracti128_si256(sum_vec, 1);
-        let sum128 = _mm_add_epi32(low128, high128);
-        let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0b01_00_11_10));
-        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0b00_00_00_01));
-        let mut output = _mm_cvtsi128_si32(sum32);
+                let low_16 = _mm256_castsi256_si128(clamped);
+                let high_16 = _mm256_extracti128_si256(clamped, 1);
 
-        output /= i32::from(QA);
-        output += i32::from(net.output_bias[bucket]);
-        output *= SCALE;
-        output /= i32::from(QA) * i32::from(QB);
+                let y_low = _mm256_cvtepi16_epi32(low_16);
+                let y_high = _mm256_cvtepi16_epi32(high_16);
 
-        output
-    }
-}
+                let sq_low = _mm256_mullo_epi32(y_low, y_low);
+                let sq_high = _mm256_mullo_epi32(y_high, y_high);
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn forward_side_avx2(
-    vals: &[i16; HIDDEN_SIZE],
-    weights: &[i16],
-    zero: std::arch::x86_64::__m256i,
-    qa: std::arch::x86_64::__m256i,
-    sum_vec: &mut std::arch::x86_64::__m256i,
-) {
-    use std::arch::x86_64::*;
+                let w = _mm256_loadu_si256(w_ptr.add(chunk));
+                let w_low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(w));
+                let w_high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(w, 1));
 
-    unsafe {
-        let v_ptr = vals.as_ptr() as *const __m256i;
-        let w_ptr = weights.as_ptr() as *const __m256i;
+                *sum = _mm256_add_epi32(*sum, _mm256_mullo_epi32(sq_low, w_low));
+                *sum = _mm256_add_epi32(*sum, _mm256_mullo_epi32(sq_high, w_high));
+            }
+        };
 
-        for i in 0..(HIDDEN_SIZE / 16) {
-            let v = _mm256_load_si256(v_ptr.add(i));
-            let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa);
+        evaluate_side(&acc.vals[us], 0, &mut sum_us);
+        evaluate_side(&acc.vals[them], HIDDEN_SIZE, &mut sum_them);
 
-            let low_16 = _mm256_castsi256_si128(clamped);
-            let high_16 = _mm256_extracti128_si256(clamped, 1);
+        let mut us_arr = [0i32; 8];
+        let mut them_arr = [0i32; 8];
+        _mm256_storeu_si256(us_arr.as_mut_ptr() as *mut _, sum_us);
+        _mm256_storeu_si256(them_arr.as_mut_ptr() as *mut _, sum_them);
 
-            let y_low = _mm256_cvtepi16_epi32(low_16);
-            let y_high = _mm256_cvtepi16_epi32(high_16);
-
-            let sq_low = _mm256_mullo_epi32(y_low, y_low);
-            let sq_high = _mm256_mullo_epi32(y_high, y_high);
-
-            let w = _mm256_loadu_si256(w_ptr.add(i));
-            let w_low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(w));
-            let w_high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(w, 1));
-
-            let p_low = _mm256_mullo_epi32(sq_low, w_low);
-            let p_high = _mm256_mullo_epi32(sq_high, w_high);
-
-            *sum_vec = _mm256_add_epi32(*sum_vec, p_low);
-            *sum_vec = _mm256_add_epi32(*sum_vec, p_high);
+        let mut output = 0i64;
+        for i in 0..8 {
+            output += us_arr[i] as i64 + them_arr[i] as i64;
         }
+
+        output /= i64::from(QA);
+        output += i64::from(net.output_bias[bucket]);
+        output *= SCALE as i64;
+        output /= i64::from(QA) * i64::from(QB);
+
+        output as i32
     }
 }

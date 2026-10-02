@@ -178,8 +178,17 @@ unsafe {
     }
 
     #[inline(always)]
-    fn corrected_eval(&self, board: &Board, ply: u8) -> i32 {
-        let raw = evaluate(board);
+    fn raw_eval(&self, board: &Board) -> i32 {
+        if let Some(entry) = self.tt.probe(board.tt_hash) {
+            if entry.raw_eval != crate::tt::RAW_EVAL_NONE {
+                return entry.raw_eval as i32;
+            }
+        }
+        evaluate(board)
+    }
+
+    #[inline(always)]
+    fn corrected_eval(&self, board: &Board, ply: u8, raw: i32) -> i32 {
         let side = board.side_to_move as usize;
         let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
 
@@ -243,6 +252,17 @@ unsafe {
             }
         }
         score
+    }
+
+    #[inline(always)]
+    fn quiet_history_score(&self, board: &Board, ply: u8, m: Move) -> i32 {
+        let us = board.side_to_move as usize;
+        let piece = board.piece_on[m.from()];
+        let p_idx = (board.pawn_hash as usize) & 511;
+
+        self.history[us][m.from() as usize][m.to() as usize]
+            + self.pawn_history[p_idx][piece as usize][m.to() as usize]
+            + self.get_conthist(ply, m)
     }
 
     fn update_conthist(&mut self, ply: u8, m: Move, bonus: i32) {
@@ -503,7 +523,7 @@ unsafe {
     }
 
     fn check_time(&mut self) {
-    if (self.nodes & 2047) == 0 {
+    if self.nodes > 0 && (self.nodes & 2047) == 0 {
         self.shared_nodes.fetch_add(2048, Ordering::Relaxed);
         let elapsed = self.start_time.elapsed().as_millis();
 
@@ -584,7 +604,8 @@ unsafe {
             depth -= 1;
         }
 
-        let static_eval = self.corrected_eval(board, ply);
+        let raw_eval = self.raw_eval(board);
+        let static_eval = self.corrected_eval(board, ply, raw_eval);
         if (ply as usize) < MAX_PLY {
             self.eval_stack[ply as usize] = static_eval;
         }
@@ -790,6 +811,11 @@ unsafe {
 
             let is_capture = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
             let is_quiet = !is_capture && m.move_type() != MoveType::Promotion;
+            let hist = if is_quiet {
+                self.quiet_history_score(board, ply, m)
+            } else {
+                0
+            };
 
             if !is_pv && !in_check && moves_searched > 0 {
                 if is_quiet && depth <= 8 && moves_searched >= lmp_threshold {
@@ -804,10 +830,9 @@ unsafe {
                     continue;
                 }
 
-                if is_quiet && depth <= 4 {
-                    let us = board.side_to_move as usize;
-                    let hist = self.history[us][m.from() as usize][m.to() as usize] + self.get_conthist(ply, m);
-                    if hist < -2000 * (depth as i32) {
+                if is_quiet && depth <= 5 {
+                    let threshold = -1800 * (depth as i32) - if improving { 1200 } else { 0 };
+                    if hist < threshold {
                         continue;
                     }
                 }
@@ -872,10 +897,9 @@ unsafe {
                         r += 2;
                     }
 
-                    // Side to move was flipped by make_move, get mover's side
-                    let us = (!board.side_to_move) as usize;
-                    let hist = self.history[us][m.from() as usize][m.to() as usize] + self.get_conthist(ply, m);
-                    r -= (hist / 512).clamp(-2, 2);
+                    if is_quiet {
+                        r -= (hist / 512).clamp(-2, 2);
+                    }
 
                     if is_pv {
                         r -= 1;
@@ -1005,7 +1029,7 @@ unsafe {
         };
 
         if excluded_move == Move::NULL {
-            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), depth, flag, best_move);
+            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), depth, flag, best_move, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
 
             let tt_move_quiet = best_move == Move::NULL
                 || (board.piece_on[best_move.to()] == Piece::None
@@ -1025,10 +1049,12 @@ unsafe {
                 let w_np_idx = (board.non_pawn_hash[0] as usize) & (CORR_ENTRIES - 1);
                 let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
 
-                update_corr(&mut self.pawn_corr[bucket][side][p_idx], bonus);
-                update_corr(&mut self.non_pawn_corr[bucket][0][side][w_np_idx], bonus);
-                update_corr(&mut self.non_pawn_corr[bucket][1][side][b_np_idx], bonus);
+                let main_bonus = bonus / 3;
+                update_corr(&mut self.pawn_corr[bucket][side][p_idx], main_bonus);
+                update_corr(&mut self.non_pawn_corr[bucket][0][side][w_np_idx], main_bonus);
+                update_corr(&mut self.non_pawn_corr[bucket][1][side][b_np_idx], main_bonus);
 
+                let cont_bonus = bonus / 3;
                 let ply_idx = ply as usize;
                 if ply_idx >= 1 {
                     let p1_piece = self.played_pieces[ply_idx - 1];
@@ -1042,7 +1068,7 @@ unsafe {
                                 update_corr(
                                     &mut self.cont_corr[p2_piece as usize][p2_move.to() as usize]
                                         [p1_piece as usize][p1_move.to() as usize],
-                                    bonus,
+                                    cont_bonus,
                                 );
                             }
                         }
@@ -1053,7 +1079,7 @@ unsafe {
                                 update_corr(
                                     &mut self.cont_corr[p4_piece as usize][p4_move.to() as usize]
                                         [p1_piece as usize][p1_move.to() as usize],
-                                    bonus,
+                                    cont_bonus,
                                 );
                             }
                         }
@@ -1083,7 +1109,8 @@ unsafe {
 
         let mut stand_pat = -INFINITY;
         if !in_check {
-            stand_pat = self.corrected_eval(board, ply);
+            let raw = self.raw_eval(board);
+            stand_pat = self.corrected_eval(board, ply, raw);
             if stand_pat >= beta {
                 return beta;
             }

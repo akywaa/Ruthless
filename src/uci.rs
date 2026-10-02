@@ -225,15 +225,9 @@ fn handle_go(
                 let hard = ((base * 4.5) as u128).min(usable_time * 85 / 100).max(soft);
                 (Some(soft), Some(hard))
             } else {
-                let fullmove = board.fullmove_number as f64;
-                let soft_scale = 0.0594 - 0.0492 * (-0.0386 * fullmove).exp();
-                let hard_scale = 0.7281;
-
-                let soft = (soft_scale * usable_time as f64 + 0.75 * my_inc as f64) as u128;
-                let hard = (hard_scale * usable_time as f64 + 0.75 * my_inc as f64) as u128;
-
-                let soft = soft.clamp(5, usable_time);
-                let hard = hard.min(usable_time * 85 / 100).max(soft);
+                let base_time = usable_time / 25 + (my_inc * 3) / 4;
+                let soft = base_time.clamp(10, usable_time / 3);
+                let hard = (base_time * 3).min(usable_time * 80 / 100).max(soft);
                 (Some(soft), Some(hard))
             }
         } else {

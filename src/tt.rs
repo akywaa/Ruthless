@@ -13,10 +13,14 @@ pub enum TTFlag {
 #[derive(Copy, Clone)]
 pub struct TTEntry {
     pub score: i32,
+    pub raw_eval: i16,
     pub depth: u8,
     pub flag: TTFlag,
     pub best_move: Move,
 }
+
+pub const RAW_EVAL_NONE: i16 = i16::MIN;
+const HAS_EVAL_MASK: u64 = 1 << 32;
 
 #[repr(C, align(64))]
 struct Cluster {
@@ -114,9 +118,16 @@ impl TranspositionTable {
         for entry in &cluster.entries {
             let meta = entry[0].load(Ordering::Relaxed);
             if key32_of(meta) == key32 && bound(meta) != TTFlag::None {
-                let mv = entry[1].load(Ordering::Relaxed) as u16;
+                let data1 = entry[1].load(Ordering::Relaxed);
+                let mv = data1 as u16;
+                let raw_eval = if data1 & HAS_EVAL_MASK != 0 {
+                    ((data1 >> 16) & 0xFFFF) as u16 as i16
+                } else {
+                    RAW_EVAL_NONE
+                };
                 return Some(TTEntry {
                     score: score_of(meta) as i32,
+                    raw_eval,
                     depth: depth_of(meta),
                     flag: bound(meta),
                     best_move: Move(mv),
@@ -128,7 +139,15 @@ impl TranspositionTable {
     }
 
     #[inline(always)]
-    pub fn store(&self, key: u64, score: i32, depth: u8, flag: TTFlag, best_move: Move) {
+    pub fn store(
+        &self,
+        key: u64,
+        score: i32,
+        depth: u8,
+        flag: TTFlag,
+        best_move: Move,
+        raw_eval: i16,
+    ) {
         let idx = (key as usize) & self.mask;
         let key32 = (key >> 32) as u32;
         let cluster = &self.clusters[idx];
@@ -145,13 +164,7 @@ impl TranspositionTable {
             }
 
             let entry_age = (64 + curr_gen - age(meta)) & 0x3F;
-            let mut priority = (depth_of(meta) as i32) - (entry_age as i32 * 8);
-
-            // Always-replace slot: fresh tactical entries of the current
-            // iteration must always have a chance to land.
-            if i == cluster.entries.len() - 1 {
-                priority = i32::MIN;
-            }
+            let priority = (depth_of(meta) as i32) - (entry_age as i32 * 8);
 
             if priority < lowest_score {
                 lowest_score = priority;
@@ -166,9 +179,10 @@ impl TranspositionTable {
         let gen_bound = (curr_gen << 2) | (flag as u8);
 
         let mv = if keep_move {
-            target[1].load(Ordering::Relaxed)
+            let prev = target[1].load(Ordering::Relaxed);
+            (prev & 0xFFFF) | ((raw_eval as u16 as u64) << 16) | HAS_EVAL_MASK
         } else {
-            best_move.0 as u64
+            (best_move.0 as u64) | ((raw_eval as u16 as u64) << 16) | HAS_EVAL_MASK
         };
 
         let mut word = target[0].load(Ordering::Relaxed);

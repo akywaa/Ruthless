@@ -1007,6 +1007,24 @@ unsafe {
                         update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -bonus);
                         self.update_conthist(ply, qm, -bonus);
                     }
+
+                    if noisy_count > 0 {
+                        let threats = board.opponent_threats();
+                        for j in 0..noisy_count {
+                            let nm = noisy_moves[j];
+                            let n_pc = board.piece_on[nm.from()] as usize;
+                            let n_victim_pt = match nm.move_type() {
+                                MoveType::EnPassant => PieceType::Pawn,
+                                MoveType::Promotion => nm.promo_type(),
+                                _ => board.piece_on[nm.to()].piece_type(),
+                            } as usize;
+                            let n_to_threatened = threats.contains(nm.to()) as usize;
+                            update_history(
+                                &mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt][n_to_threatened],
+                                -bonus,
+                            );
+                        }
+                    }
                 } else {
                     let moving_pc = board.piece_on[m.from()] as usize;
                     let victim_pt = match m.move_type() {

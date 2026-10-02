@@ -766,8 +766,12 @@ unsafe {
         let mut moves_searched = 0;
 
         let lmp_threshold = (3 + (depth as usize) * (depth as usize) / (1 + (!improving as usize))).max(3);
-        let futility_margin = (80 + 35 * depth as i32) * (depth as i32);
-        let futility_pruning = !is_pv && !in_check && depth <= 8 && (static_eval + futility_margin <= alpha);
+        let futility_margin = 60 + (65 - 25 * improving as i32) * (depth as i32);
+        let futility_pruning = !is_pv
+            && !in_check
+            && depth <= 6
+            && alpha.abs() < MATE_SCORE - 100
+            && (static_eval + futility_margin <= alpha);
 
         let mut quiet_moves = [Move::NULL; 64];
         let mut quiet_count = 0;
@@ -822,7 +826,12 @@ unsafe {
                     continue;
                 }
 
-                if is_quiet && futility_pruning {
+                if is_quiet
+                    && futility_pruning
+                    && m != killers[0]
+                    && m != killers[1]
+                    && m != counter_move
+                {
                     continue;
                 }
 

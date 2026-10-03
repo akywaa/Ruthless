@@ -22,8 +22,7 @@ fn init_lmr() -> [[i32; 64]; 64] {
     let mut table = [[0; 64]; 64];
     for d in 1..64 {
         for m in 1..64 {
-            // Formula calibrated closer to modern engines to prune cold quiet branches
-            let base = 0.5 + ((d as f64).ln() * (m as f64).ln()) / 1.95;
+            let base = 0.75 + ((d as f64).ln() * (m as f64).ln()) / 2.25;
             table[d][m] = (base as i32).max(1);
         }
     }
@@ -285,8 +284,8 @@ unsafe {
             MoveType::Promotion => m.promo_type(),
             _ => board.piece_on[m.to()].piece_type(),
         };
-        let threats = board.opponent_threats();
-        let to_threatened = threats.contains(m.to()) as usize;
+        let pawn_threats = board.opponent_pawn_threats();
+        let to_threatened = pawn_threats.contains(m.to()) as usize;
 
         self.noisy_history[moving_pc as usize][m.to() as usize][victim_pt as usize][to_threatened]
     }
@@ -341,10 +340,11 @@ unsafe {
         for depth in 1..=max_depth {
             self.root_move_nodes = [0; 256];
             if depth >= 4 {
-                let mut temp_depth = depth;
-                let mut delta = 20;
+                let temp_depth = depth;
+                let mut delta = 25;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
+                let mut fails = 0;
 
                 loop {
                     score = self.negamax(board, temp_depth, 0, alpha, beta, true, Move::NULL, false);
@@ -353,22 +353,23 @@ unsafe {
                     }
 
                     if score <= alpha {
-                        beta = (alpha + beta) / 2;
+                        fails += 1;
                         alpha = (alpha - delta).max(-INFINITY);
-                        temp_depth = depth;
+                        delta += delta / 2;
+                        if fails >= 2 || delta > 300 {
+                            alpha = -INFINITY;
+                            beta = INFINITY;
+                        }
                     } else if score >= beta {
+                        fails += 1;
                         beta = (beta + delta).min(INFINITY);
-                        if depth > 6 {
-                            temp_depth = temp_depth.saturating_sub(1).max(depth - 2);
+                        delta += delta / 2;
+                        if fails >= 2 || delta > 300 {
+                            alpha = -INFINITY;
+                            beta = INFINITY;
                         }
                     } else {
                         break;
-                    }
-
-                    delta += delta / 2;
-                    if delta > 1000 {
-                        alpha = -INFINITY;
-                        beta = INFINITY;
                     }
                 }
             } else {
@@ -477,10 +478,11 @@ unsafe {
             }
 
             if depth >= 4 {
-                let mut temp_depth = depth;
-                let mut delta = 20;
+                let temp_depth = depth;
+                let mut delta = 25;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
+                let mut fails = 0;
 
                 loop {
                     score = self.negamax(board, temp_depth, 0, alpha, beta, false, Move::NULL, false);
@@ -489,22 +491,23 @@ unsafe {
                     }
 
                     if score <= alpha {
-                        beta = (alpha + beta) / 2;
+                        fails += 1;
                         alpha = (alpha - delta).max(-INFINITY);
-                        temp_depth = depth;
+                        delta += delta / 2;
+                        if fails >= 2 || delta > 300 {
+                            alpha = -INFINITY;
+                            beta = INFINITY;
+                        }
                     } else if score >= beta {
+                        fails += 1;
                         beta = (beta + delta).min(INFINITY);
-                        if depth > 6 {
-                            temp_depth = temp_depth.saturating_sub(1).max(depth - 2);
+                        delta += delta / 2;
+                        if fails >= 2 || delta > 300 {
+                            alpha = -INFINITY;
+                            beta = INFINITY;
                         }
                     } else {
                         break;
-                    }
-
-                    delta += delta / 2;
-                    if delta > 1000 {
-                        alpha = -INFINITY;
-                        beta = INFINITY;
                     }
                 }
             } else {
@@ -677,7 +680,7 @@ unsafe {
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
-                let r = 4 + depth / 4 + ((static_eval - beta) / 160).clamp(0, 3) as u8 + improving as u8;
+                let r = 3 + depth / 4 + ((static_eval - beta) / 200).clamp(0, 3) as u8;
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = Move::NULL;
                     self.played_pieces[ply as usize] = Piece::None;
@@ -685,7 +688,7 @@ unsafe {
                 let undo = board.make_null_move();
                 let score = -self.negamax(
                     board,
-                    depth.saturating_sub(r + 1),
+                    depth.saturating_sub(r),
                     ply + 1,
                     -beta,
                     -beta + 1,
@@ -898,6 +901,8 @@ unsafe {
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
+            let is_see_ge_zero = !is_quiet && see(board, m, 0);
+
             let undo = board.make_move(m);
             let gives_check = board.in_check();
 
@@ -918,7 +923,7 @@ unsafe {
 
                     if !is_quiet {
                         r /= 2;
-                        if !see(board, m, 0) {
+                        if !is_see_ge_zero {
                             r += 2;
                         }
                     }
@@ -1020,9 +1025,13 @@ unsafe {
                     update_history(&mut self.pawn_history[p_idx][moving_pc][m.to() as usize], bonus);
                     self.update_conthist(ply, m, bonus);
 
-                    for j in 0..quiet_count.saturating_sub(1) {
+                    for j in 0..quiet_count {
                         let qm = quiet_moves[j];
+                        if qm == m || qm == Move::NULL { continue; }
+
                         let q_pc = board.piece_on[qm.from()] as usize;
+                        if q_pc >= 12 { continue; }
+
                         update_history(&mut self.history[us][qm.from() as usize][qm.to() as usize], -bonus);
                         update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -bonus);
                         self.update_conthist(ply, qm, -bonus);
@@ -1032,12 +1041,19 @@ unsafe {
                         let threats = board.opponent_threats();
                         for j in 0..noisy_count {
                             let nm = noisy_moves[j];
+                            if nm == m || nm == Move::NULL { continue; }
+
                             let n_pc = board.piece_on[nm.from()] as usize;
+                            if n_pc >= 12 { continue; }
+
                             let n_victim_pt = match nm.move_type() {
                                 MoveType::EnPassant => PieceType::Pawn,
                                 MoveType::Promotion => nm.promo_type(),
                                 _ => board.piece_on[nm.to()].piece_type(),
                             } as usize;
+
+                            if n_victim_pt >= 6 { continue; }
+
                             let n_to_threatened = threats.contains(nm.to()) as usize;
                             update_history(
                                 &mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt][n_to_threatened],
@@ -1058,14 +1074,21 @@ unsafe {
 
                     update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt][to_threatened], bonus);
 
-                    for j in 0..noisy_count.saturating_sub(1) {
+                    for j in 0..noisy_count {
                         let nm = noisy_moves[j];
+                        if nm == m || nm == Move::NULL { continue; }
+
                         let n_pc = board.piece_on[nm.from()] as usize;
+                        if n_pc >= 12 { continue; }
+
                         let n_victim_pt = match nm.move_type() {
                             MoveType::EnPassant => PieceType::Pawn,
                             MoveType::Promotion => nm.promo_type(),
                             _ => board.piece_on[nm.to()].piece_type(),
                         } as usize;
+
+                        if n_victim_pt >= 6 { continue; }
+
                         let n_to_threatened = threats.contains(nm.to()) as usize;
                         update_history(&mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt][n_to_threatened], -bonus);
                     }
@@ -1167,7 +1190,6 @@ unsafe {
         }
 
         let in_check = board.in_check();
-        let alpha_orig = alpha;
         let mut tt_move = Move::NULL;
 
         if let Some(entry) = self.tt.probe(board.tt_hash) {
@@ -1195,6 +1217,12 @@ unsafe {
             alpha = alpha.max(stand_pat);
         }
 
+        let raw_eval_to_store = if in_check {
+            crate::tt::RAW_EVAL_NONE
+        } else {
+            raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        };
+
         if in_check {
             let moves = generate_legal_moves(board);
             if moves.count == 0 {
@@ -1218,14 +1246,18 @@ unsafe {
                 }
 
                 if score >= beta {
-                    self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+                    self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store);
                     return beta;
                 }
                 alpha = alpha.max(score);
             }
 
-            let flag = if best_score <= alpha_orig { TTFlag::UpperBound } else { TTFlag::Exact };
-            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+            let flag = if best_score >= beta {
+                TTFlag::LowerBound
+            } else {
+                TTFlag::UpperBound
+            };
+            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval_to_store);
             return alpha;
         }
 
@@ -1251,6 +1283,9 @@ unsafe {
                     MoveType::EnPassant => PieceType::Pawn,
                     _ => board.piece_on[m.to()].piece_type(),
                 };
+                if cap_pt == PieceType::None {
+                    continue;
+                }
                 let gain = crate::eval::PIECE_VALUES[cap_pt as usize];
                 if stand_pat + gain + 200 < alpha {
                     continue;
@@ -1274,14 +1309,18 @@ unsafe {
             }
 
             if score >= beta {
-                self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+                self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store);
                 return beta;
             }
             alpha = alpha.max(score);
         }
 
-        let flag = if best_score <= alpha_orig { TTFlag::UpperBound } else { TTFlag::Exact };
-        self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        let flag = if best_score >= beta {
+            TTFlag::LowerBound
+        } else {
+            TTFlag::UpperBound
+        };
+        self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval_to_store);
 
         best_score
     }

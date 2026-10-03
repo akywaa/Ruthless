@@ -20,7 +20,6 @@ pub struct TTEntry {
 }
 
 pub const RAW_EVAL_NONE: i16 = i16::MIN;
-const HAS_EVAL_MASK: u64 = 1 << 32;
 
 #[repr(C, align(64))]
 struct Cluster {
@@ -38,36 +37,17 @@ impl Cluster {
 }
 
 #[inline(always)]
-fn pack_meta(key32: u32, score: i16, depth: u8, gen_bound: u8) -> u64 {
-    (key32 as u64)
+fn pack_data(score: i16, raw_eval: i16, depth: u8, gen_bound: u8, mv: u16) -> u64 {
+    (mv as u64)
+        | ((gen_bound as u64) << 16)
+        | ((depth as u64) << 24)
         | (((score as u16) as u64) << 32)
-        | ((depth as u64) << 48)
-        | ((gen_bound as u64) << 56)
+        | (((raw_eval as u16) as u64) << 48)
 }
 
 #[inline(always)]
-fn key32_of(meta: u64) -> u32 {
-    (meta & 0xFFFF_FFFF) as u32
-}
-
-#[inline(always)]
-fn score_of(meta: u64) -> i16 {
-    ((meta >> 32) & 0xFFFF) as u16 as i16
-}
-
-#[inline(always)]
-fn depth_of(meta: u64) -> u8 {
-    ((meta >> 48) & 0xFF) as u8
-}
-
-#[inline(always)]
-fn gen_bound_of(meta: u64) -> u8 {
-    ((meta >> 56) & 0xFF) as u8
-}
-
-#[inline(always)]
-fn bound(meta: u64) -> TTFlag {
-    match gen_bound_of(meta) & 3 {
+fn bound_of(gen_bound: u8) -> TTFlag {
+    match gen_bound & 3 {
         1 => TTFlag::Exact,
         2 => TTFlag::LowerBound,
         3 => TTFlag::UpperBound,
@@ -76,8 +56,8 @@ fn bound(meta: u64) -> TTFlag {
 }
 
 #[inline(always)]
-fn age(meta: u64) -> u8 {
-    gen_bound_of(meta) >> 2
+fn age_of(data: u64) -> u8 {
+    (((data >> 16) & 0xFF) >> 2) as u8
 }
 
 pub struct TranspositionTable {
@@ -112,26 +92,23 @@ impl TranspositionTable {
     #[inline(always)]
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
         let idx = (key as usize) & self.mask;
-        let key32 = (key >> 32) as u32;
         let cluster = &self.clusters[idx];
 
         for entry in &cluster.entries {
-            let meta = entry[0].load(Ordering::Relaxed);
-            if key32_of(meta) == key32 && bound(meta) != TTFlag::None {
-                let data1 = entry[1].load(Ordering::Relaxed);
-                let mv = data1 as u16;
-                let raw_eval = if data1 & HAS_EVAL_MASK != 0 {
-                    ((data1 >> 16) & 0xFFFF) as u16 as i16
-                } else {
-                    RAW_EVAL_NONE
-                };
-                return Some(TTEntry {
-                    score: score_of(meta) as i32,
-                    raw_eval,
-                    depth: depth_of(meta),
-                    flag: bound(meta),
-                    best_move: Move(mv),
-                });
+            let stored_key = entry[0].load(Ordering::Relaxed);
+            if stored_key == key {
+                let data = entry[1].load(Ordering::Relaxed);
+                let gen_bound = ((data >> 16) & 0xFF) as u8;
+                let flag = bound_of(gen_bound);
+                if flag != TTFlag::None {
+                    return Some(TTEntry {
+                        best_move: Move((data & 0xFFFF) as u16),
+                        depth: ((data >> 24) & 0xFF) as u8,
+                        score: (((data >> 32) & 0xFFFF) as u16 as i16) as i32,
+                        raw_eval: ((data >> 48) & 0xFFFF) as u16 as i16,
+                        flag,
+                    });
+                }
             }
         }
 
@@ -149,7 +126,6 @@ impl TranspositionTable {
         raw_eval: i16,
     ) {
         let idx = (key as usize) & self.mask;
-        let key32 = (key >> 32) as u32;
         let cluster = &self.clusters[idx];
         let curr_gen = self.generation.load(Ordering::Relaxed) & 0x3F;
 
@@ -157,14 +133,16 @@ impl TranspositionTable {
         let mut lowest_score = i32::MAX;
 
         for (i, entry) in cluster.entries.iter().enumerate() {
-            let meta = entry[0].load(Ordering::Relaxed);
-            if key32_of(meta) == key32 || bound(meta) == TTFlag::None {
+            let stored_key = entry[0].load(Ordering::Relaxed);
+            let data = entry[1].load(Ordering::Relaxed);
+            if stored_key == key || bound_of(((data >> 16) & 0xFF) as u8) == TTFlag::None {
                 replace_idx = i;
                 break;
             }
 
-            let entry_age = (64 + curr_gen - age(meta)) & 0x3F;
-            let priority = (depth_of(meta) as i32) - (entry_age as i32 * 8);
+            let entry_age = (64 + curr_gen - age_of(data)) & 0x3F;
+            let depth = ((data >> 24) & 0xFF) as i32;
+            let priority = depth - (entry_age as i32 * 8);
 
             if priority < lowest_score {
                 lowest_score = priority;
@@ -174,22 +152,22 @@ impl TranspositionTable {
 
         let target = &cluster.entries[replace_idx];
 
-        let keep_move = best_move == Move::NULL && key32_of(target[0].load(Ordering::Relaxed)) == key32;
+        let keep_move = best_move == Move::NULL
+            && target[0].load(Ordering::Relaxed) == key;
         let entry_score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         let gen_bound = (curr_gen << 2) | (flag as u8);
 
         let mv = if keep_move {
-            let prev = target[1].load(Ordering::Relaxed);
-            (prev & 0xFFFF) | ((raw_eval as u16 as u64) << 16) | HAS_EVAL_MASK
+            (target[1].load(Ordering::Relaxed) & 0xFFFF) as u16
         } else {
-            (best_move.0 as u64) | ((raw_eval as u16 as u64) << 16) | HAS_EVAL_MASK
+            best_move.0
         };
 
         let mut word = target[0].load(Ordering::Relaxed);
         loop {
             match target[0].compare_exchange_weak(
                 word,
-                pack_meta(key32, entry_score, depth, gen_bound),
+                key,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -197,7 +175,7 @@ impl TranspositionTable {
                 Err(actual) => word = actual,
             }
         }
-        target[1].store(mv, Ordering::Relaxed);
+        target[1].store(pack_data(entry_score, raw_eval, depth, gen_bound, mv), Ordering::Relaxed);
     }
 
     pub fn clear(&self) {

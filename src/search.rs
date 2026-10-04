@@ -452,10 +452,10 @@ unsafe {
                 if elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
                     let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
                     let majority = (self.num_threads * 65).div_ceil(100);
-                    if votes >= majority || elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
+                    if votes >= majority || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
                         self.stop.store(true, Ordering::Relaxed);
+                        break;
                     }
-                    break;
                 }
             }
 
@@ -636,6 +636,7 @@ unsafe {
         let mut tt_depth = 0;
         let mut tt_flag = TTFlag::Exact;
         let mut has_tt = false;
+        let mut tt_raw_eval = crate::tt::RAW_EVAL_NONE;
 
         if let Some(entry) = self.tt.probe(board.tt_hash) {
             has_tt = true;
@@ -643,25 +644,31 @@ unsafe {
             tt_depth = entry.depth;
             tt_flag = entry.flag;
             tt_move = entry.best_move;
+            tt_raw_eval = entry.raw_eval;
+        }
 
-            if excluded_move == Move::NULL && entry.depth >= depth && ply > 0 && !is_pv {
-                match entry.flag {
-                    TTFlag::Exact => return tt_score,
-                    TTFlag::LowerBound if tt_score >= beta => return tt_score,
-                    TTFlag::UpperBound if tt_score <= alpha => return tt_score,
-                    _ => {}
-                }
+        let raw_eval = if has_tt && tt_raw_eval != crate::tt::RAW_EVAL_NONE {
+            tt_raw_eval as i32
+        } else {
+            evaluate(board)
+        };
+
+        let static_eval = self.corrected_eval(board, ply, raw_eval);
+        if (ply as usize) < MAX_PLY {
+            self.eval_stack[ply as usize] = static_eval;
+        }
+
+        if has_tt && excluded_move == Move::NULL && tt_depth >= depth && ply > 0 && !is_pv {
+            match tt_flag {
+                TTFlag::Exact => return tt_score,
+                TTFlag::LowerBound if tt_score >= beta => return tt_score,
+                TTFlag::UpperBound if tt_score <= alpha => return tt_score,
+                _ => {}
             }
         }
 
         if excluded_move == Move::NULL && depth >= 2 && tt_move == Move::NULL && (is_pv || cut_node) {
             depth -= 1;
-        }
-
-        let raw_eval = self.raw_eval(board);
-        let static_eval = self.corrected_eval(board, ply, raw_eval);
-        if (ply as usize) < MAX_PLY {
-            self.eval_stack[ply as usize] = static_eval;
         }
 
         let improving = if in_check || ply < 2 {

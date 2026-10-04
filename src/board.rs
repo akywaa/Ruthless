@@ -719,7 +719,18 @@ impl Board {
                 let sq1 = cuckoo.sq_a[c_idx];
                 let sq2 = cuckoo.sq_b[c_idx];
                 if (crate::attacks::between(sq1, sq2) & self.occupied).is_empty() {
-                    return true;
+                    let p1 = self.piece_on[sq1];
+                    let (from, to) = if p1 != crate::types::Piece::None && p1.color() == self.side_to_move {
+                        (sq1, sq2)
+                    } else {
+                        (sq2, sq1)
+                    };
+
+                    // Build a pseudo-legal move and strictly verify it (king safety)
+                    let m = crate::types::Move::new(from, to, crate::types::PieceType::None, crate::types::MoveType::Normal);
+                    if self.is_legal(m) {
+                        return true;
+                    }
                 }
             }
             compared_ply += 2;

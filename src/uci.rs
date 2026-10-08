@@ -187,6 +187,7 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
             for &m in moves.as_slice() {
                 if m.to_string() == m_lower {
                     board.make_move(m);
+                    board.reset_accumulator_stack();
                     break;
                 }
             }

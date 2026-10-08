@@ -1,7 +1,7 @@
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks, between};
 use crate::bitboard::Bitboard;
 use crate::nnue::Accumulator;
-use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB};
+use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB, ACC_STACK_SIZE};
 use crate::zobrist::{castling_key, ep_key, fiftymove_key, piece_key, side_key};
 
 pub const STARTING_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -43,7 +43,8 @@ pub struct Board {
     pub pawn_hash: u64,
     pub non_pawn_hash: [u64; 2],
     pub history: Vec<u64>,
-    pub accumulator: Accumulator,
+    pub accumulators: Box<[Accumulator; ACC_STACK_SIZE]>,
+    pub acc_index: usize,
 }
 
 impl Board {
@@ -68,18 +69,27 @@ impl Board {
             pawn_hash: 0,
             non_pawn_hash: [0; 2],
             history: Vec::with_capacity(256),
-            accumulator: Accumulator::new(),
+            accumulators: vec![Accumulator::new(); ACC_STACK_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            acc_index: 0,
         }
     }
 
+    pub fn reset_accumulator_stack(&mut self) {
+        self.accumulators[0] = self.accumulators[self.acc_index];
+        self.acc_index = 0;
+    }
+
     pub fn refresh_accumulator(&mut self) {
-        self.accumulator = Accumulator::new();
+        self.accumulators[self.acc_index] = Accumulator::new();
         let w_ksq = self.king_square(Color::White);
         let b_ksq = self.king_square(Color::Black);
         for sq in 0..64 {
             let piece = self.piece_on[sq];
             if piece != Piece::None {
-                self.accumulator
+                self.accumulators[self.acc_index]
                     .add_feature(piece, Square::new(sq as u8), w_ksq, b_ksq);
             }
         }
@@ -88,11 +98,12 @@ impl Board {
     pub fn refresh_accumulator_side(&mut self, color: Color) {
         let piece_on = self.piece_on;
         let ksq = self.king_square(color);
-        self.accumulator.refresh_side(&piece_on, ksq, color);
+        self.accumulators[self.acc_index].refresh_side(&piece_on, ksq, color);
     }
 
     pub fn from_fen(fen: &str) -> Result<Self, String> {
         let mut board = Self::new();
+        board.acc_index = 0;
         let parts: Vec<&str> = fen.split_whitespace().collect();
         if parts.is_empty() {
             return Err("Empty FEN string".to_string());
@@ -751,6 +762,10 @@ impl Board {
 
         self.history.push(self.hash);
 
+        // Copy current accumulator to next ply
+        self.accumulators[self.acc_index + 1] = self.accumulators[self.acc_index];
+        self.acc_index += 1;
+
         if self.ep_square.is_valid() {
             self.hash ^= ep_key(self.ep_square.file());
             self.ep_square = Square::None;
@@ -766,6 +781,7 @@ impl Board {
 
     pub fn undo_null_move(&mut self, undo: UndoState) {
         self.history.pop();
+        self.acc_index -= 1;
         self.side_to_move = !self.side_to_move;
         self.castling_rights = undo.castling_rights;
         self.ep_square = undo.ep_square;
@@ -797,6 +813,10 @@ impl Board {
 
         self.history.push(self.hash);
 
+        // Copy current accumulator to next ply
+        self.accumulators[self.acc_index + 1] = self.accumulators[self.acc_index];
+        self.acc_index += 1;
+
         if self.ep_square.is_valid() {
             self.hash ^= ep_key(self.ep_square.file());
             self.ep_square = Square::None;
@@ -810,10 +830,10 @@ impl Board {
         self.remove_piece(from);
 
         if !is_king_move {
-            self.accumulator.remove_feature(moving_piece, from, w_ksq, b_ksq);
+            self.accumulators[self.acc_index].remove_feature(moving_piece, from, w_ksq, b_ksq);
         } else {
             // For the opponent, king bucket never changes; update incrementally
-            self.accumulator.remove_feature_side(moving_piece, from, self.king_square(them), them);
+            self.accumulators[self.acc_index].remove_feature_side(moving_piece, from, self.king_square(them), them);
         }
 
         match move_type {
@@ -821,16 +841,16 @@ impl Board {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
                     if !is_king_move {
-                        self.accumulator.remove_feature(undo.captured, to, w_ksq, b_ksq);
+                        self.accumulators[self.acc_index].remove_feature(undo.captured, to, w_ksq, b_ksq);
                     } else {
-                        self.accumulator.remove_feature_side(undo.captured, to, self.king_square(them), them);
+                        self.accumulators[self.acc_index].remove_feature_side(undo.captured, to, self.king_square(them), them);
                     }
                 }
                 self.put_piece(moving_piece, to);
                 if !is_king_move {
-                    self.accumulator.add_feature(moving_piece, to, w_ksq, b_ksq);
+                    self.accumulators[self.acc_index].add_feature(moving_piece, to, w_ksq, b_ksq);
                 } else {
-                    self.accumulator.add_feature_side(moving_piece, to, self.king_square(them), them);
+                    self.accumulators[self.acc_index].add_feature_side(moving_piece, to, self.king_square(them), them);
                 }
 
                 if moving_piece.piece_type() == PieceType::Pawn && ((from as i8) - (to as i8)).abs() == 16 {
@@ -840,7 +860,7 @@ impl Board {
             }
             MoveType::Castling => {
                 self.put_piece(moving_piece, to);
-                self.accumulator.add_feature_side(moving_piece, to, self.king_square(them), them);
+                self.accumulators[self.acc_index].add_feature_side(moving_piece, to, self.king_square(them), them);
 
                 let (rook_from, rook_to) = match to {
                     Square::G1 => (Square::H1, Square::F1),
@@ -852,25 +872,25 @@ impl Board {
                 let rook = self.remove_piece(rook_from);
                 self.put_piece(rook, rook_to);
 
-                self.accumulator.remove_feature_side(rook, rook_from, self.king_square(them), them);
-                self.accumulator.add_feature_side(rook, rook_to, self.king_square(them), them);
+                self.accumulators[self.acc_index].remove_feature_side(rook, rook_from, self.king_square(them), them);
+                self.accumulators[self.acc_index].add_feature_side(rook, rook_to, self.king_square(them), them);
             }
             MoveType::EnPassant => {
                 let cap_sq = Square::from_coords(to.file(), from.rank());
                 let cap_pawn = self.remove_piece(cap_sq);
-                self.accumulator.remove_feature(cap_pawn, cap_sq, w_ksq, b_ksq);
+                self.accumulators[self.acc_index].remove_feature(cap_pawn, cap_sq, w_ksq, b_ksq);
 
                 self.put_piece(moving_piece, to);
-                self.accumulator.add_feature(moving_piece, to, w_ksq, b_ksq);
+                self.accumulators[self.acc_index].add_feature(moving_piece, to, w_ksq, b_ksq);
             }
             MoveType::Promotion => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
-                    self.accumulator.remove_feature(undo.captured, to, w_ksq, b_ksq);
+                    self.accumulators[self.acc_index].remove_feature(undo.captured, to, w_ksq, b_ksq);
                 }
                 let promo_piece = Piece::new(us, m.promo_type());
                 self.put_piece(promo_piece, to);
-                self.accumulator.add_feature(promo_piece, to, w_ksq, b_ksq);
+                self.accumulators[self.acc_index].add_feature(promo_piece, to, w_ksq, b_ksq);
             }
         }
 
@@ -948,64 +968,7 @@ impl Board {
         self.hash = undo.hash;
         self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
-
-        let them = !us;
-        let is_king_move = moved_piece.piece_type() == PieceType::King;
-
-        if is_king_move {
-            let ksq_them = self.king_square(them);
-            match move_type {
-                MoveType::Castling => {
-                    let (rook_from, rook_to) = match to {
-                        Square::G1 => (Square::H1, Square::F1),
-                        Square::C1 => (Square::A1, Square::D1),
-                        Square::G8 => (Square::H8, Square::F8),
-                        Square::C8 => (Square::A8, Square::D8),
-                        _ => unreachable!(),
-                    };
-                    let rook = self.piece_on[rook_from];
-                    self.accumulator.add_feature_side(moved_piece, from, ksq_them, them);
-                    self.accumulator.remove_feature_side(moved_piece, to, ksq_them, them);
-                    self.accumulator.add_feature_side(rook, rook_from, ksq_them, them);
-                    self.accumulator.remove_feature_side(rook, rook_to, ksq_them, them);
-                }
-                _ => {
-                    self.accumulator.add_feature_side(moved_piece, from, ksq_them, them);
-                    self.accumulator.remove_feature_side(moved_piece, to, ksq_them, them);
-                    if undo.captured != Piece::None {
-                        self.accumulator.add_feature_side(undo.captured, to, ksq_them, them);
-                    }
-                }
-            }
-            self.refresh_accumulator_side(us);
-        } else {
-            let w_ksq = self.king_square(Color::White);
-            let b_ksq = self.king_square(Color::Black);
-            match move_type {
-                MoveType::EnPassant => {
-                    let cap_sq = Square::from_coords(to.file(), from.rank());
-                    let cap_pawn = Piece::new(them, PieceType::Pawn);
-                    self.accumulator.remove_feature(moved_piece, to, w_ksq, b_ksq);
-                    self.accumulator.add_feature(cap_pawn, cap_sq, w_ksq, b_ksq);
-                    self.accumulator.add_feature(moved_piece, from, w_ksq, b_ksq);
-                }
-                MoveType::Promotion => {
-                    let pawn = Piece::new(us, PieceType::Pawn);
-                    self.accumulator.remove_feature(moved_piece, to, w_ksq, b_ksq);
-                    if undo.captured != Piece::None {
-                        self.accumulator.add_feature(undo.captured, to, w_ksq, b_ksq);
-                    }
-                    self.accumulator.add_feature(pawn, from, w_ksq, b_ksq);
-                }
-                _ => {
-                    self.accumulator.remove_feature(moved_piece, to, w_ksq, b_ksq);
-                    if undo.captured != Piece::None {
-                        self.accumulator.add_feature(undo.captured, to, w_ksq, b_ksq);
-                    }
-                    self.accumulator.add_feature(moved_piece, from, w_ksq, b_ksq);
-                }
-            }
-        }
+        self.acc_index -= 1;
     }
 }
 
@@ -1072,19 +1035,20 @@ mod tests {
                 break;
             }
             for &m in moves.as_slice() {
-                let before = board.accumulator.vals;
+                let before = board.accumulators[board.acc_index].vals;
                 let undo = board.make_move(m);
                 let mut check = board.clone();
                 check.refresh_accumulator();
-                assert_eq!(board.accumulator.vals, check.accumulator.vals, "make mismatch on {}", m);
+                assert_eq!(board.accumulators[board.acc_index].vals, check.accumulators[check.acc_index].vals, "make mismatch on {}", m);
                 board.undo_move(m, undo);
-                assert_eq!(board.accumulator.vals, before, "undo mismatch on {}", m);
+                assert_eq!(board.accumulators[board.acc_index].vals, before, "undo mismatch on {}", m);
             }
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
             let pick = (rng as usize) % moves.count;
             board.make_move(moves.moves[pick]);
+            board.reset_accumulator_stack();
         }
     }
 

@@ -5,6 +5,8 @@ pub const PIECE_NB: usize = 12;
 #[allow(dead_code)]
 pub const PIECE_TYPE_NB: usize = 6;
 pub const COLOR_NB: usize = 2;
+pub const MAX_PLY: usize = 128;
+pub const ACC_STACK_SIZE: usize = 256;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]

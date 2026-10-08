@@ -54,7 +54,7 @@ pub fn network() -> &'static Network {
 }
 
 #[repr(C, align(64))]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Accumulator {
     pub vals: [[i16; HIDDEN_SIZE]; 2],
 }
@@ -190,13 +190,14 @@ fn screlu(x: i16) -> i32 {
 pub fn evaluate(board: &Board) -> i32 {
     let net = network();
     let bucket = output_bucket(board);
+    let acc = &board.accumulators[board.acc_index];
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         unsafe {
             let us = board.side_to_move as usize;
             let them = us ^ 1;
-            return evaluate_avx2(&board.accumulator, us, them, bucket, net);
+            return evaluate_avx2(acc, us, them, bucket, net);
         }
     }
 
@@ -209,11 +210,11 @@ pub fn evaluate(board: &Board) -> i32 {
         let us = board.side_to_move as usize;
         let them = us ^ 1;
         for i in 0..HIDDEN_SIZE {
-            output += screlu(board.accumulator.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
+            output += screlu(acc.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
         }
 
         for i in 0..HIDDEN_SIZE {
-            output += screlu(board.accumulator.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+            output += screlu(acc.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
         }
 
         output /= i64::from(QA);
@@ -237,12 +238,13 @@ mod tests {
         let them = (!board.side_to_move) as usize;
         let bucket = output_bucket(board);
         let (a, b) = if swap { (them, us) } else { (us, them) };
+        let acc = &board.accumulators[board.acc_index];
         let mut output = 0i64;
         for i in 0..HIDDEN_SIZE {
-            output += screlu(board.accumulator.vals[a][i]) as i64 * i64::from(net.output_weights[bucket][i]);
+            output += screlu(acc.vals[a][i]) as i64 * i64::from(net.output_weights[bucket][i]);
         }
         for i in 0..HIDDEN_SIZE {
-            output += screlu(board.accumulator.vals[b][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+            output += screlu(acc.vals[b][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
         }
         output /= i64::from(QA);
         output += i64::from(net.output_bias[bucket]);
@@ -273,9 +275,9 @@ mod tests {
         let net = network();
         let k = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         let kq = Board::from_fen("4k3/8/8/8/8/8/3Q4/4K3 w - - 0 1").unwrap();
-        let changed = k.accumulator.vals[0]
+        let changed = k.accumulators[k.acc_index].vals[0]
             .iter()
-            .zip(kq.accumulator.vals[0].iter())
+            .zip(kq.accumulators[kq.acc_index].vals[0].iter())
             .filter(|(a, b)| a != b)
             .count();
         println!("hidden units changed by adding white Q: {}", changed);
@@ -326,21 +328,22 @@ mod tests {
                 let bucket = output_bucket(&board);
                 let us = board.side_to_move as usize;
                 let them = us ^ 1;
+                let acc = &board.accumulators[board.acc_index];
                 // Scalar reference in the same [side-to-move, non-side-to-move]
                 // ordering and perspective used by the production evaluate().
                 let mut out = 0i64;
                 for i in 0..HIDDEN_SIZE {
-                    out += screlu(board.accumulator.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
+                    out += screlu(acc.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
                 }
                 for i in 0..HIDDEN_SIZE {
-                    out += screlu(board.accumulator.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+                    out += screlu(acc.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
                 }
                 out /= i64::from(QA);
                 out += i64::from(net.output_bias[bucket]);
                 out *= SCALE as i64;
                 out /= i64::from(QA) * i64::from(QB);
                 let expected = out as i32;
-                let got = unsafe { evaluate_avx2(&board.accumulator, us, them, bucket, net) };
+                let got = unsafe { evaluate_avx2(acc, us, them, bucket, net) };
                 assert_eq!(got, expected, "AVX2 mismatch after {}", m);
                 board.undo_move(m, undo);
             }

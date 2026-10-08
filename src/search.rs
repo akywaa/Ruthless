@@ -449,10 +449,13 @@ unsafe {
 
                 let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor) as u128;
 
-                if elapsed >= dynamic_soft || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
+                let past_hard = elapsed >= self.hard_time_ms.unwrap_or(u128::MAX);
+                let past_soft = depth >= 6 && elapsed >= dynamic_soft;
+
+                if past_soft || past_hard {
                     let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
                     let majority = (self.num_threads * 65).div_ceil(100);
-                    if votes >= majority || elapsed >= self.hard_time_ms.unwrap_or(u128::MAX) {
+                    if votes >= majority || past_hard {
                         self.stop.store(true, Ordering::Relaxed);
                         break;
                     }

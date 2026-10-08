@@ -248,7 +248,7 @@ fn handle_go(
         i += 1;
     }
 
-    let overhead_ms = 50;
+    let overhead_ms = 10;
 
     let (soft_time, hard_time) = if let Some(mt) = movetime {
         let t = mt.saturating_sub(overhead_ms).max(5);
@@ -265,16 +265,16 @@ fn handle_go(
 
             if let Some(moves) = movestogo {
                 let moves = (moves.clamp(1, 50) as f64).min(20.0);
-                let base = (usable_time as f64 / moves) + 0.75 * my_inc as f64;
-                let soft = (base as u128).min(usable_time * 4 / 10).max(1);
-                let hard = ((base * 3.0) as u128).min(usable_time * 85 / 100).max(soft);
+                let base = (usable_time as f64 / moves) + 0.8 * my_inc as f64;
+                let soft = (base as u128).min(usable_time * 4 / 10).max(5);
+                let hard = ((base * 2.5) as u128).min(usable_time * 80 / 100).max(soft);
                 (Some(soft), Some(hard))
             } else {
-                let base_time = usable_time / 25 + (my_inc * 3) / 4;
-                let min_time = (my_inc * 8 / 10).max(15);
-                let max_soft = usable_time * 3 / 10;
-                let soft = base_time.max(min_time).min(max_soft).max(1);
-                let hard = (base_time * 3).min(usable_time * 85 / 100).max(soft);
+                let base_time = usable_time / 20 + (my_inc * 4) / 5;
+                let min_time = (my_inc * 8 / 10).max(10);
+                let max_soft = usable_time * 35 / 100;
+                let soft = base_time.max(min_time).min(max_soft).max(5);
+                let hard = ((base_time * 25) / 10).min(usable_time * 80 / 100).max(soft);
                 (Some(soft), Some(hard))
             }
         } else {

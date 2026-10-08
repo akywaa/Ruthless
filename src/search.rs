@@ -69,6 +69,10 @@ pub struct Searcher {
     eval_stack: [i32; MAX_PLY],
     root_move_nodes: [u64; 256],
     root_best_idx: usize,
+    // Best root move of the iteration currently in progress. It is promoted to
+    // root_best_move only once the whole depth iteration finishes, so an
+    // interrupted search can never commit a move from a half-searched iteration.
+    root_best_move_pending: Move,
     pub root_best_move: Move,
     pub root_score: i32,
     pub completed_depth: u8,
@@ -153,6 +157,7 @@ cont_corr: alloc_box_zeroed(),
             eval_stack: [0; MAX_PLY],
             root_move_nodes: [0; 256],
             root_best_idx: 0,
+            root_best_move_pending: Move::NULL,
             root_best_move: Move::NULL,
             root_score: 0,
             completed_depth: 0,
@@ -179,6 +184,7 @@ unsafe {
         self.eval_stack = [0; MAX_PLY];
         self.root_move_nodes = [0; 256];
         self.root_best_idx = 0;
+        self.root_best_move_pending = Move::NULL;
         self.root_best_move = Move::NULL;
         self.root_score = 0;
         self.completed_depth = 0;
@@ -337,6 +343,7 @@ unsafe {
         self.tt.new_search();
         self.soft_time_ms = soft_time;
         self.hard_time_ms = hard_time;
+        self.root_best_move_pending = Move::NULL;
 
         let mut best_move = legal_moves.moves[0];
         let mut prev_best_move = Move::NULL;
@@ -390,8 +397,8 @@ unsafe {
             }
 
             // Only commit the new root move once the iteration finished without interruption
-            if self.root_best_move != Move::NULL {
-                best_move = self.root_best_move;
+            if self.root_best_move_pending != Move::NULL {
+                best_move = self.root_best_move_pending;
             }
 
             let elapsed = self.start_time.elapsed().as_millis().max(1);
@@ -448,7 +455,10 @@ unsafe {
                     1.0
                 };
 
-                let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor) as u128;
+                // Cap the soft-limit extension: the factors above can compound to
+                // more than 2x, which would let a single iteration burn the bank.
+                let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor)
+                    .min(soft_limit as f32 * 1.4) as u128;
 
                 let past_hard = elapsed >= self.hard_time_ms.unwrap_or(u128::MAX);
                 let past_soft = depth >= 6 && elapsed >= dynamic_soft;
@@ -987,6 +997,12 @@ unsafe {
                     }
 
                     r = r.clamp(0, depth as i32 - 2);
+
+                    // Keep capture reductions shallow: cap whatever the factors
+                    // above produced so a capture is never reduced too deeply.
+                    if !is_quiet {
+                        r = r.min(2);
+                    }
                 }
 
                 let reduced = (depth as i32 - 1 - r).max(0) as u8;
@@ -1019,7 +1035,7 @@ unsafe {
                 best_score = score;
                 best_move = m;
                 if ply == 0 && !self.stop.load(Ordering::Relaxed) {
-                    self.root_best_move = m;
+                    self.root_best_move_pending = m;
                     self.root_best_idx = moves_searched - 1;
                 }
             }

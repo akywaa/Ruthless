@@ -728,7 +728,7 @@ impl Board {
 
                     // Build a pseudo-legal move and strictly verify it (king safety)
                     let m = crate::types::Move::new(from, to, crate::types::PieceType::None, crate::types::MoveType::Normal);
-                    if self.is_legal(m) {
+                    if self.is_pseudo_legal(m) && self.is_legal(m) {
                         return true;
                     }
                 }

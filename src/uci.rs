@@ -248,7 +248,8 @@ fn handle_go(
         i += 1;
     }
 
-    let overhead_ms = 10;
+    // Keep a healthy margin for input lag and OS scheduling on fast controls.
+    let overhead_ms = 25;
 
     let (soft_time, hard_time) = if let Some(mt) = movetime {
         let t = mt.saturating_sub(overhead_ms).max(5);
@@ -270,7 +271,7 @@ fn handle_go(
                 let hard = ((base * 2.5) as u128).min(usable_time * 80 / 100).max(soft);
                 (Some(soft), Some(hard))
             } else {
-                let base_time = usable_time / 20 + (my_inc * 4) / 5;
+                let base_time = usable_time / 24 + (my_inc * 3) / 4;
                 let min_time = (my_inc * 8 / 10).max(10);
                 let max_soft = usable_time * 35 / 100;
                 let soft = base_time.max(min_time).min(max_soft).max(5);

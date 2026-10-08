@@ -75,18 +75,19 @@ impl Accumulator {
         let weights = &net.feature_weights[idx].vals;
         let side = color as usize;
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            if is_x86_feature_detected!("avx2") {
-                unsafe {
-                    vec_add_avx2(&mut self.vals[side], weights);
-                    return;
-                }
+            unsafe {
+                vec_add_avx2(&mut self.vals[side], weights);
+                return;
             }
         }
 
-        for i in 0..HIDDEN_SIZE {
-            self.vals[side][i] += weights[i];
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            for i in 0..HIDDEN_SIZE {
+                self.vals[side][i] += weights[i];
+            }
         }
     }
 
@@ -97,18 +98,19 @@ impl Accumulator {
         let weights = &net.feature_weights[idx].vals;
         let side = color as usize;
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            if is_x86_feature_detected!("avx2") {
-                unsafe {
-                    vec_sub_avx2(&mut self.vals[side], weights);
-                    return;
-                }
+            unsafe {
+                vec_sub_avx2(&mut self.vals[side], weights);
+                return;
             }
         }
 
-        for i in 0..HIDDEN_SIZE {
-            self.vals[side][i] -= weights[i];
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            for i in 0..HIDDEN_SIZE {
+                self.vals[side][i] -= weights[i];
+            }
         }
     }
 
@@ -177,6 +179,7 @@ pub fn output_bucket(board: &Board) -> usize {
     ((board.occupied.count() as usize - 2) / 4).min(7)
 }
 
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
 #[inline(always)]
 fn screlu(x: i16) -> i32 {
     let y = i32::from(x).clamp(0, i32::from(QA));
@@ -188,38 +191,38 @@ pub fn evaluate(board: &Board) -> i32 {
     let net = network();
     let bucket = output_bucket(board);
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
-        if is_x86_feature_detected!("avx2") {
-            unsafe {
-                // Feed the accumulators in [side-to-move, non-side-to-move] order.
-                let us = board.side_to_move as usize;
-                let them = us ^ 1;
-                return evaluate_avx2(&board.accumulator, us, them, bucket, net);
-            }
+        unsafe {
+            let us = board.side_to_move as usize;
+            let them = us ^ 1;
+            return evaluate_avx2(&board.accumulator, us, them, bucket, net);
         }
     }
 
-    let mut output = 0i64;
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let mut output = 0i64;
 
-    // First weight half pairs with the side to move, the second half with the
-    // opponent (dual-perspective training).
-    let us = board.side_to_move as usize;
-    let them = us ^ 1;
-    for i in 0..HIDDEN_SIZE {
-        output += screlu(board.accumulator.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
+        // First weight half pairs with the side to move, the second half with the
+        // opponent (dual-perspective training).
+        let us = board.side_to_move as usize;
+        let them = us ^ 1;
+        for i in 0..HIDDEN_SIZE {
+            output += screlu(board.accumulator.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
+        }
+
+        for i in 0..HIDDEN_SIZE {
+            output += screlu(board.accumulator.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+        }
+
+        output /= i64::from(QA);
+        output += i64::from(net.output_bias[bucket]);
+        output *= SCALE as i64;
+        output /= i64::from(QA) * i64::from(QB);
+
+        output as i32
     }
-
-    for i in 0..HIDDEN_SIZE {
-        output += screlu(board.accumulator.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
-    }
-
-    output /= i64::from(QA);
-    output += i64::from(net.output_bias[bucket]);
-    output *= SCALE as i64;
-    output /= i64::from(QA) * i64::from(QB);
-
-    output as i32
 }
 
 #[cfg(test)]

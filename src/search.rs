@@ -389,6 +389,7 @@ unsafe {
                 break;
             }
 
+            // Only commit the new root move once the iteration finished without interruption
             if self.root_best_move != Move::NULL {
                 best_move = self.root_best_move;
             }
@@ -1017,7 +1018,7 @@ unsafe {
             if score > best_score {
                 best_score = score;
                 best_move = m;
-                if ply == 0 {
+                if ply == 0 && !self.stop.load(Ordering::Relaxed) {
                     self.root_best_move = m;
                     self.root_best_idx = moves_searched - 1;
                 }
@@ -1147,7 +1148,7 @@ unsafe {
             }
         }
 
-        if excluded_move == Move::NULL {
+        if excluded_move == Move::NULL && !self.stop.load(Ordering::Relaxed) {
             self.tt.store(board.tt_hash, score_to_tt(best_score, ply), depth, flag, best_move, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
 
             let tt_move_quiet = best_move == Move::NULL

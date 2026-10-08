@@ -639,7 +639,7 @@ unsafe {
         }
 
         if depth == 0 {
-            return self.quiescence(board, alpha, beta, ply);
+            return self.quiescence(board, alpha, beta, ply, 0);
         }
 
         self.nodes += 1;
@@ -699,7 +699,7 @@ unsafe {
 
             // Razoring
             if depth <= 2 && static_eval + 400 + 150 * (depth as i32) <= alpha {
-                let qscore = self.quiescence(board, alpha, beta, ply);
+                let qscore = self.quiescence(board, alpha, beta, ply, 0);
                 if qscore <= alpha {
                     return qscore;
                 }
@@ -758,7 +758,7 @@ unsafe {
                 }
 
                 let undo = board.make_move(m);
-                let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1);
+                let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0);
 
                 if score >= probcut_beta {
                     score = -self.negamax(
@@ -814,11 +814,10 @@ unsafe {
 
             if score < singular_beta {
                 extension = 1;
-                if score < singular_beta - depth as i32 * 2 {
-                    extension += 1;
-                }
-                if score < singular_beta - depth as i32 * 4 {
-                    extension += 1;
+                // Double extension only when far below singular beta and not too
+                // deep into the tree to avoid an explosive tactical growth.
+                if score < singular_beta - (depth as i32) * 3 && (ply as usize) < depth as usize {
+                    extension = 2;
                 }
             } else if singular_beta >= beta {
                 return singular_beta;
@@ -835,7 +834,7 @@ unsafe {
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
 
-        let lmp_threshold = 3 + (depth as usize) * (depth as usize) / (1 + (!improving as usize));
+        let lmp_threshold = 2 + (depth as usize) * (depth as usize) / (2 + (!improving as usize));
         let futility_margin = FUTILITY_BASE.load(Ordering::Relaxed) + FUTILITY_MARGIN.load(Ordering::Relaxed) * (depth as i32);
         let futility_pruning = !is_pv
             && !in_check
@@ -895,7 +894,7 @@ unsafe {
                 let is_direct_check = board.gives_direct_check(m);
 
                 if !is_direct_check {
-                    if is_quiet && depth <= 10 && moves_searched >= lmp_threshold {
+                    if is_quiet && depth <= 8 && moves_searched >= lmp_threshold {
                         continue;
                     }
 
@@ -908,8 +907,8 @@ unsafe {
                         continue;
                     }
 
-                    if is_quiet && depth <= 7 {
-                        let threshold = -1200 * (depth as i32) - if improving { 800 } else { 0 };
+                    if is_quiet && depth <= 6 {
+                        let threshold = -700 * (depth as i32) - if improving { 400 } else { 0 };
                         if hist < threshold {
                             continue;
                         }
@@ -998,9 +997,9 @@ unsafe {
 
                     r = r.clamp(0, depth as i32 - 2);
 
-                    // Keep capture reductions shallow: cap whatever the factors
-                    // above produced so a capture is never reduced too deeply.
-                    if !is_quiet {
+                    // Winning/equal captures stay shallow, but losing (bad SEE)
+                    // captures may reduce deeper so refuted trades do not waste nodes.
+                    if !is_quiet && is_see_ge_zero {
                         r = r.min(2);
                     }
                 }
@@ -1224,7 +1223,7 @@ unsafe {
         best_score
     }
 
-    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u8) -> i32 {
+    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u8, qply: u8) -> i32 {
         self.check_time();
         if self.stop.load(Ordering::Relaxed) {
             return 0;
@@ -1245,6 +1244,12 @@ unsafe {
 
         if (ply as usize) >= MAX_PLY {
             return evaluate(board);
+        }
+
+        // Hard cap on qsearch depth so long check sequences cannot explode
+        // the tree beyond the main search line.
+        if qply >= 16 {
+            return if board.in_check() { 0 } else { evaluate(board) };
         }
 
         let in_check = board.in_check();
@@ -1324,7 +1329,7 @@ unsafe {
 
                 let m = moves.moves[i];
                 let undo = board.make_move(m);
-                let score = -self.quiescence(board, -beta, -alpha, ply + 1);
+                let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1);
                 board.undo_move(m, undo);
 
                 if self.stop.load(Ordering::Relaxed) {
@@ -1386,7 +1391,7 @@ unsafe {
             }
 
             let undo = board.make_move(m);
-            let score = -self.quiescence(board, -beta, -alpha, ply + 1);
+            let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1);
             board.undo_move(m, undo);
 
             if self.stop.load(Ordering::Relaxed) {

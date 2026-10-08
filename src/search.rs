@@ -682,12 +682,12 @@ unsafe {
 
         if !is_pv && !in_check {
             let rfp_margin = (RFP_BASE.load(Ordering::Relaxed) - RFP_IMPROVING.load(Ordering::Relaxed) * improving as i32) * (depth as i32);
-            if depth <= 10 && static_eval - rfp_margin >= beta {
+            if depth <= 6 && static_eval - rfp_margin >= beta {
                 return (static_eval + beta) / 2;
             }
 
             // Razoring
-            if depth <= 3 && static_eval + 300 + 150 * (depth as i32) <= alpha {
+            if depth <= 2 && static_eval + 400 + 150 * (depth as i32) <= alpha {
                 let qscore = self.quiescence(board, alpha, beta, ply);
                 if qscore <= alpha {
                     return qscore;
@@ -824,7 +824,7 @@ unsafe {
         let mut best_move = Move::NULL;
         let mut moves_searched = 0;
 
-        let lmp_threshold = 2 + (depth as usize) * (depth as usize) / (1 + (!improving as usize) * 2);
+        let lmp_threshold = 3 + (depth as usize) * (depth as usize) / (1 + (!improving as usize));
         let futility_margin = FUTILITY_BASE.load(Ordering::Relaxed) + FUTILITY_MARGIN.load(Ordering::Relaxed) * (depth as i32);
         let futility_pruning = !is_pv
             && !in_check
@@ -943,10 +943,9 @@ unsafe {
             } else {
                 let mut r = 0;
 
-                if depth >= 3
-                    && moves_searched >= 1
+                if depth >= 4
+                    && moves_searched >= 2
                     && (!is_pv || is_quiet)
-                    && (is_quiet || moves_searched >= 2)
                 {
                     r = lmr(depth as usize, moves_searched);
 

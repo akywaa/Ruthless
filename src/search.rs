@@ -1401,14 +1401,17 @@ unsafe {
             alpha = alpha.max(score);
         }
 
-        let flag = if best_score >= beta {
-            TTFlag::LowerBound
-        } else if best_score > alpha_orig {
-            TTFlag::Exact
-        } else {
-            TTFlag::UpperBound
-        };
-        self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval_to_store);
+        // Only store beta cutoffs from qsearch to avoid polluting the TT with shallow upper bounds
+        if best_score >= beta {
+            self.tt.store(
+                board.tt_hash,
+                score_to_tt(best_score, ply),
+                0,
+                TTFlag::LowerBound,
+                best_move,
+                raw_eval_to_store,
+            );
+        }
 
         best_score
     }

@@ -5,7 +5,7 @@ use crate::movepick::MovePicker;
 use crate::see::see;
 use crate::tt::{TTFlag, TranspositionTable};
 use crate::types::{Move, MoveType, Piece, PieceType};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -49,7 +49,6 @@ pub struct Searcher {
     pub thread_id: usize,
     pub num_threads: usize,
     pub shared_nodes: Arc<AtomicU64>,
-    pub soft_stop_votes: Arc<AtomicUsize>,
     start_time: Instant,
     soft_time_ms: Option<u128>,
     hard_time_ms: Option<u128>,
@@ -127,7 +126,6 @@ impl Searcher {
         thread_id: usize,
         num_threads: usize,
         shared_nodes: Arc<AtomicU64>,
-        soft_stop_votes: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             tt,
@@ -136,7 +134,6 @@ impl Searcher {
             thread_id,
             num_threads,
             shared_nodes,
-            soft_stop_votes,
             start_time: Instant::now(),
             soft_time_ms: None,
             hard_time_ms: None,
@@ -458,12 +455,8 @@ unsafe {
                 let past_soft = depth >= 6 && elapsed >= dynamic_soft;
 
                 if past_soft || past_hard {
-                    let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
-                    let majority = (self.num_threads * 65).div_ceil(100);
-                    if votes >= majority || past_hard {
-                        self.stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
+                    self.stop.store(true, Ordering::Relaxed);
+                    break;
                 }
             }
 
@@ -536,18 +529,6 @@ unsafe {
             if let Some(entry) = self.tt.probe(board.tt_hash) {
                 if entry.best_move != Move::NULL {
                     self.root_best_move = entry.best_move;
-                }
-            }
-
-            if let Some(soft_limit) = self.soft_time_ms {
-                let elapsed = self.start_time.elapsed().as_millis();
-                if depth >= 6 && elapsed >= soft_limit {
-                    let votes = self.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
-                    let majority = (self.num_threads * 65).div_ceil(100);
-                    if votes >= majority {
-                        self.stop.store(true, Ordering::Relaxed);
-                    }
-                    break;
                 }
             }
         }

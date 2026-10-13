@@ -34,6 +34,7 @@ pub fn uci_loop() {
                 println!("option name NmpEvalDiv type spin default 200 min 50 max 500");
                 println!("option name SyzygyPath type string default <empty>");
                 println!("uciok");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             "setoption" => {
                 handle_setoption(&tokens[1..], &mut pool);
@@ -43,6 +44,7 @@ pub fn uci_loop() {
             }
             "isready" => {
                 println!("readyok");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             "ucinewgame" => {
                 pool.clear();
@@ -212,6 +214,7 @@ fn handle_go(board: &mut Board, pool: &mut ThreadPool, tokens: &[&str]) {
     let limits = TimeManager::allocate(board, &tc);
     let best_move = pool.start_search(board, depth, limits);
     println!("bestmove {}", best_move);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 pub fn run_bench_cli() {

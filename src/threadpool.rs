@@ -4,7 +4,7 @@ use crate::search::Searcher;
 use crate::time::TimeLimits;
 use crate::tt::TranspositionTable;
 use crate::types::Move;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -36,7 +36,6 @@ pub struct ThreadPool {
     shared_state: Arc<(Mutex<PoolState>, Condvar)>,
     handles: Vec<thread::JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
-    soft_stop_votes: Arc<AtomicUsize>,
     num_threads: usize,
 }
 
@@ -45,7 +44,6 @@ impl ThreadPool {
         let tt = Arc::new(TranspositionTable::new(mb));
         let stop_signal = Arc::new(AtomicBool::new(false));
         let shared_nodes = Arc::new(AtomicU64::new(0));
-        let soft_stop_votes = Arc::new(AtomicUsize::new(0));
 
         let main_searcher = Searcher::new(
             Arc::clone(&tt),
@@ -53,7 +51,6 @@ impl ThreadPool {
             0,
             num_threads,
             Arc::clone(&shared_nodes),
-            Arc::clone(&soft_stop_votes),
         );
 
         bind_thread(0);
@@ -71,7 +68,6 @@ impl ThreadPool {
             )),
             handles: Vec::new(),
             stop_signal,
-            soft_stop_votes,
             num_threads: 1, // Resized correctly below
         };
 
@@ -124,7 +120,6 @@ impl ThreadPool {
             let tt_clone = Arc::clone(&self.tt);
             let stop_clone = Arc::clone(&self.stop_signal);
             let nodes_clone = Arc::clone(&self.shared_nodes);
-            let votes_clone = Arc::clone(&self.soft_stop_votes);
             let total_threads = target_num;
 
             let handle = thread::spawn(move || {
@@ -135,7 +130,6 @@ impl ThreadPool {
                     id,
                     total_threads,
                     nodes_clone,
-                    votes_clone,
                 );
 
                 let mut last_gen = 0;
@@ -183,7 +177,6 @@ impl ThreadPool {
     pub fn start_search(&mut self, board: &mut Board, depth: u8, limits: TimeLimits) -> Move {
         self.stop_signal.store(false, Ordering::Relaxed);
         self.shared_nodes.store(0, Ordering::Relaxed);
-        self.soft_stop_votes.store(0, Ordering::Relaxed);
 
         let params = SearchParams {
             board: board.clone(),

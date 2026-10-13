@@ -21,19 +21,23 @@ pub struct TTEntry {
 
 pub const RAW_EVAL_NONE: i16 = i16::MIN;
 
-// 32 bytes exact: 8 bytes for signatures + 24 bytes for 3 entries.
-// Perfect fit for a half cache-line, minimizing cache misses during probe.
-#[repr(C, align(32))]
+#[repr(C, align(64))]
 struct Cluster {
-    signatures: AtomicU64,
-    entries: [AtomicU64; 3],
+    entries: [CacheEntry; 4],
+}
+
+struct CacheEntry {
+    key: AtomicU64,
+    data: AtomicU64,
 }
 
 impl Cluster {
     fn empty() -> Self {
         Self {
-            signatures: AtomicU64::new(0),
-            entries: std::array::from_fn(|_| AtomicU64::new(0)),
+            entries: std::array::from_fn(|_| CacheEntry {
+                key: AtomicU64::new(0),
+                data: AtomicU64::new(0),
+            }),
         }
     }
 }
@@ -95,14 +99,11 @@ impl TranspositionTable {
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
         let idx = (key as usize) & self.mask;
         let cluster = &self.clusters[idx];
-        let key_sig = (key >> 48) as u16 as u64;
 
-        let sigs = cluster.signatures.load(Ordering::Relaxed);
-
-        for i in 0..3 {
-            let sig = (sigs >> (16 * i)) & 0xFFFF;
-            if sig == key_sig {
-                let data = cluster.entries[i].load(Ordering::Relaxed);
+        for entry in &cluster.entries {
+            let stored_key = entry.key.load(Ordering::Relaxed);
+            if stored_key == key {
+                let data = entry.data.load(Ordering::Relaxed) ^ key;
                 let gen_bound = ((data >> 16) & 0xFF) as u8;
                 let flag = bound_of(gen_bound);
 
@@ -134,25 +135,22 @@ impl TranspositionTable {
         let idx = (key as usize) & self.mask;
         let cluster = &self.clusters[idx];
         let curr_gen = self.generation.load(Ordering::Relaxed) & 0x3F;
-        let key_sig = (key >> 48) as u16 as u64;
 
-        let mut sigs = cluster.signatures.load(Ordering::Relaxed);
         let mut replace_idx = 0;
         let mut lowest_score = i32::MAX;
         let mut found_match = false;
 
-        for i in 0..3 {
-            let sig = (sigs >> (16 * i)) & 0xFFFF;
-            if sig == key_sig {
+        for i in 0..4 {
+            let stored_key = cluster.entries[i].key.load(Ordering::Relaxed);
+            if stored_key == key {
                 replace_idx = i;
                 found_match = true;
                 break;
             }
 
-            let data = cluster.entries[i].load(Ordering::Relaxed);
+            let data = cluster.entries[i].data.load(Ordering::Relaxed) ^ stored_key;
             let gen_bound = ((data >> 16) & 0xFF) as u8;
 
-            // Prefer empty slots instantly
             if bound_of(gen_bound) == TTFlag::None {
                 replace_idx = i;
                 lowest_score = i32::MIN;
@@ -170,10 +168,9 @@ impl TranspositionTable {
         }
 
         let target_entry = &cluster.entries[replace_idx];
-        let old_data = target_entry.load(Ordering::Relaxed);
 
-        let keep_move = best_move == Move::NULL && found_match;
-        let mv = if keep_move {
+        let mv = if best_move == Move::NULL && found_match {
+            let old_data = target_entry.data.load(Ordering::Relaxed) ^ key;
             (old_data & 0xFFFF) as u16
         } else {
             best_move.0
@@ -183,33 +180,15 @@ impl TranspositionTable {
         let gen_bound = (curr_gen << 2) | (flag as u8);
         let new_data = pack_data(entry_score, raw_eval, depth, gen_bound, mv);
 
-        // Store data first to avoid a reader grabbing our new signature with old data
-        target_entry.store(new_data, Ordering::Relaxed);
-
-        if !found_match {
-            loop {
-                let mut new_sigs = sigs;
-                new_sigs &= !(0xFFFF << (16 * replace_idx));
-                new_sigs |= key_sig << (16 * replace_idx);
-
-                match cluster.signatures.compare_exchange_weak(
-                    sigs,
-                    new_sigs,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => sigs = actual,
-                }
-            }
-        }
+        target_entry.data.store(new_data ^ key, Ordering::Relaxed);
+        target_entry.key.store(key, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
         for cluster in &self.clusters {
-            cluster.signatures.store(0, Ordering::Relaxed);
             for entry in &cluster.entries {
-                entry.store(0, Ordering::Relaxed);
+                entry.key.store(0, Ordering::Relaxed);
+                entry.data.store(0, Ordering::Relaxed);
             }
         }
         self.generation.store(0, Ordering::Relaxed);

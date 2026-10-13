@@ -8,3 +8,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[dependencies]
+core_affinity = "0.8"

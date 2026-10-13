@@ -1,30 +1,13 @@
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
-use crate::search::Searcher;
-use crate::time::{TimeControl, TimeManager};
-use crate::tt::TranspositionTable;
+use crate::threadpool::ThreadPool;
+use crate::time::{TimeControl, TimeLimits, TimeManager};
 use std::io::{self, BufRead};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub fn uci_loop() {
     let mut board = Board::default();
-    let mut tt_size_mb = 32;
-    let mut num_threads = 1;
-    let mut tt = Arc::new(TranspositionTable::new(tt_size_mb));
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    let shared_nodes = Arc::new(AtomicU64::new(0));
-    let soft_stop_votes = Arc::new(AtomicUsize::new(0));
-
-    let mut searcher = Searcher::new(
-        Arc::clone(&tt),
-        Arc::clone(&stop_signal),
-        0,
-        num_threads,
-        Arc::clone(&shared_nodes),
-        Arc::clone(&soft_stop_votes),
-    );
-    let mut helpers: Vec<Searcher> = Vec::new();
+    let mut pool = ThreadPool::new(32, 1);
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -52,22 +35,7 @@ pub fn uci_loop() {
                 println!("uciok");
             }
             "setoption" => {
-                handle_setoption(&tokens[1..], &mut tt_size_mb, &mut num_threads, &mut tt);
-                searcher.tt = Arc::clone(&tt);
-                searcher.num_threads = num_threads;
-
-                // Keep helper searchers persistent across searches
-                helpers.clear();
-                for id in 1..num_threads {
-                    helpers.push(Searcher::new(
-                        Arc::clone(&tt),
-                        Arc::clone(&stop_signal),
-                        id,
-                        num_threads,
-                        Arc::clone(&shared_nodes),
-                        Arc::clone(&soft_stop_votes),
-                    ));
-                }
+                handle_setoption(&tokens[1..], &mut pool);
             }
             "eval" => {
                 println!("nnue eval: {} cp", crate::eval::evaluate(&board));
@@ -76,20 +44,17 @@ pub fn uci_loop() {
                 println!("readyok");
             }
             "ucinewgame" => {
-                searcher.clear();
-                for helper in &mut helpers {
-                    helper.clear();
-                }
+                pool.clear();
                 board = Board::default();
             }
             "position" => {
                 handle_position(&mut board, &tokens[1..]);
             }
             "go" => {
-                handle_go(&mut board, &mut searcher, &mut helpers, &tokens[1..]);
+                handle_go(&mut board, &mut pool, &tokens[1..]);
             }
             "bench" => {
-                run_bench(&mut searcher);
+                run_bench(&mut pool);
             }
             "quit" => break,
             _ => {}
@@ -97,12 +62,7 @@ pub fn uci_loop() {
     }
 }
 
-fn handle_setoption(
-    tokens: &[&str],
-    tt_size_mb: &mut usize,
-    num_threads: &mut usize,
-    tt: &mut Arc<TranspositionTable>,
-) {
+fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
     let mut name = String::new();
     let mut value = String::new();
     let mut is_name = false;
@@ -128,32 +88,31 @@ fn handle_setoption(
     match name.to_lowercase().as_str() {
         "hash" => {
             if let Ok(mb) = value.parse::<usize>() {
-                *tt_size_mb = mb.clamp(1, 1048576);
-                *tt = Arc::new(TranspositionTable::new(*tt_size_mb));
+                pool.set_hash(mb.clamp(1, 1048576));
             }
         }
         "threads" => {
             if let Ok(t) = value.parse::<usize>() {
-                *num_threads = t.clamp(1, 256);
+                pool.set_threads(t.clamp(1, 256));
             }
         }
         "rfpbase" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::RFP_BASE.store(v, std::sync::atomic::Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() { crate::search::RFP_BASE.store(v, Ordering::Relaxed); }
         }
         "rfpimproving" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::RFP_IMPROVING.store(v, std::sync::atomic::Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() { crate::search::RFP_IMPROVING.store(v, Ordering::Relaxed); }
         }
         "futilitybase" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::FUTILITY_BASE.store(v, std::sync::atomic::Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() { crate::search::FUTILITY_BASE.store(v, Ordering::Relaxed); }
         }
         "futilitymargin" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::FUTILITY_MARGIN.store(v, std::sync::atomic::Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() { crate::search::FUTILITY_MARGIN.store(v, Ordering::Relaxed); }
         }
         "nmpbase" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::NMP_BASE.store(v, std::sync::atomic::Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() { crate::search::NMP_BASE.store(v, Ordering::Relaxed); }
         }
         "nmpevaldiv" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::NMP_EVAL_DIV.store(v, std::sync::atomic::Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() { crate::search::NMP_EVAL_DIV.store(v, Ordering::Relaxed); }
         }
         _ => {}
     }
@@ -198,12 +157,7 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
     }
 }
 
-fn handle_go(
-    board: &mut Board,
-    main_searcher: &mut Searcher,
-    helpers: &mut Vec<Searcher>,
-    tokens: &[&str],
-) {
+fn handle_go(board: &mut Board, pool: &mut ThreadPool, tokens: &[&str]) {
     let mut depth: u8 = 64;
     let mut tc = TimeControl::default();
 
@@ -248,56 +202,16 @@ fn handle_go(
     }
 
     let limits = TimeManager::allocate(board, &tc);
-
-    main_searcher.soft_stop_votes.store(0, Ordering::Relaxed);
-    main_searcher.shared_nodes.store(0, Ordering::Relaxed);
-    main_searcher.stop.store(false, Ordering::Relaxed);
-
-    let stop_signal = Arc::clone(&main_searcher.stop);
-
-    let best_move = if helpers.is_empty() {
-        let m = main_searcher.search(board, depth, limits.soft_limit, limits.hard_limit);
-        stop_signal.store(true, Ordering::Relaxed);
-        m
-    } else {
-        std::thread::scope(|s| {
-            for helper in helpers.iter_mut() {
-                let mut helper_board = board.clone();
-                let soft = limits.soft_limit;
-                s.spawn(move || {
-                    helper.search_helper(&mut helper_board, depth, soft);
-                });
-            }
-
-            let m = main_searcher.search(board, depth, limits.soft_limit, limits.hard_limit);
-            stop_signal.store(true, Ordering::Relaxed);
-            m
-        })
-    };
-
+    let best_move = pool.start_search(board, depth, limits);
     println!("bestmove {}", best_move);
 }
 
 pub fn run_bench_cli() {
-    let tt = Arc::new(TranspositionTable::new(32));
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    let shared_nodes = Arc::new(AtomicU64::new(0));
-    let soft_stop_votes = Arc::new(AtomicUsize::new(0));
-
-    let mut searcher = Searcher::new(
-        Arc::clone(&tt),
-        Arc::clone(&stop_signal),
-        0,
-        1,
-        Arc::clone(&shared_nodes),
-        Arc::clone(&soft_stop_votes),
-    );
-
-    run_bench(&mut searcher);
+    let mut pool = ThreadPool::new(32, 1);
+    run_bench(&mut pool);
 }
 
-fn run_bench(searcher: &mut Searcher) {
-    // A diverse set of positions to evaluate engine performance and train the PGO
+fn run_bench(pool: &mut ThreadPool) {
     let fens = [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
@@ -319,9 +233,16 @@ fn run_bench(searcher: &mut Searcher) {
 
     for fen in fens {
         if let Ok(mut board) = Board::from_fen(fen) {
-            searcher.shared_nodes.store(0, Ordering::Relaxed);
-            searcher.search(&mut board, 12, None, None);
-            total_nodes += searcher.shared_nodes.load(Ordering::Relaxed) + (searcher.nodes & 1023);
+            pool.start_search(
+                &mut board,
+                12,
+                TimeLimits {
+                    soft_limit: None,
+                    hard_limit: None,
+                },
+            );
+            total_nodes += pool.shared_nodes.load(Ordering::Relaxed)
+                + (pool.main_searcher.nodes & 1023);
         }
     }
 

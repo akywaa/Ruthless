@@ -20,6 +20,12 @@ fn main() {
         let _ = std::fs::write(path, format!("{info}\n{bt}"));
     }));
 
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "bench" {
+        uci::run_bench_cli();
+        return;
+    }
+
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(uci::uci_loop)

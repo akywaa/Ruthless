@@ -88,6 +88,9 @@ pub fn uci_loop() {
             "go" => {
                 handle_go(&mut board, &mut searcher, &mut helpers, &tokens[1..]);
             }
+            "bench" => {
+                run_bench(&mut searcher);
+            }
             "quit" => break,
             _ => {}
         }
@@ -310,4 +313,58 @@ fn handle_go(
     };
 
     println!("bestmove {}", best_move);
+}
+
+pub fn run_bench_cli() {
+    let tt = Arc::new(TranspositionTable::new(32));
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let shared_nodes = Arc::new(AtomicU64::new(0));
+    let soft_stop_votes = Arc::new(AtomicUsize::new(0));
+
+    let mut searcher = Searcher::new(
+        Arc::clone(&tt),
+        Arc::clone(&stop_signal),
+        0,
+        1,
+        Arc::clone(&shared_nodes),
+        Arc::clone(&soft_stop_votes),
+    );
+
+    run_bench(&mut searcher);
+}
+
+fn run_bench(searcher: &mut Searcher) {
+    // A diverse set of positions to evaluate engine performance and train the PGO
+    let fens = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "8/8/1k1NK3/r7/2R2P1P/3n2P1/8/8 b - - 0 59",
+        "r1r3k1/1bqnbp1N/ppn1p1p1/4P1B1/8/2N5/PPB1QPPP/R3R1K1 w - - 3 9",
+        "2kr1b1r/pp1qpp2/1np4p/3n1Pp1/3PN2B/2N2Q2/1PP3PP/2KRR3 w - g6 0 12",
+        "6k1/8/pB2p1p1/3p3p/7q/PB6/Q7/2R3K1 w - - 0 37",
+        "8/8/1p2k2P/1P6/P3B3/4B1K1/1b3P2/4n3 w - - 7 77",
+        "7r/p1r1p2p/2k5/1p2n1N1/1Pp5/2R1P1P1/P4P1P/3R1K2 w - - 2 31",
+        "5rk1/1p2r1p1/p4np1/P2p4/2pNbP2/2P1PB2/6PP/3RR1K1 w - - 2 23",
+        "8/3k4/3b3p/R1p1p2P/p1Pr4/P2P1r2/2K1R3/4B3 b - - 4 75",
+    ];
+
+    let mut total_nodes = 0;
+    let start = std::time::Instant::now();
+
+    for fen in fens {
+        if let Ok(mut board) = Board::from_fen(fen) {
+            searcher.shared_nodes.store(0, Ordering::Relaxed);
+            searcher.search(&mut board, 12, None, None);
+            total_nodes += searcher.shared_nodes.load(Ordering::Relaxed) + (searcher.nodes & 1023);
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let nps = (total_nodes as f64 / elapsed) as u64;
+
+    println!();
+    println!("Bench: {total_nodes} nodes {nps} nps");
 }

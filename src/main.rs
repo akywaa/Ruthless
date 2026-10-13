@@ -7,6 +7,7 @@ mod movepick;
 mod nnue;
 mod search;
 mod see;
+mod time;
 mod tt;
 mod types;
 mod uci;

@@ -1,8 +1,8 @@
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::search::Searcher;
+use crate::time::{TimeControl, TimeManager};
 use crate::tt::TranspositionTable;
-use crate::types::Color;
 use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -205,12 +205,7 @@ fn handle_go(
     tokens: &[&str],
 ) {
     let mut depth: u8 = 64;
-    let mut movetime: Option<u128> = None;
-    let mut wtime: Option<u128> = None;
-    let mut btime: Option<u128> = None;
-    let mut winc: u128 = 0;
-    let mut binc: u128 = 0;
-    let mut movestogo: Option<u128> = None;
+    let mut tc = TimeControl::default();
 
     let mut i = 0;
     while i < tokens.len() {
@@ -223,28 +218,28 @@ fn handle_go(
             }
             "movetime" => {
                 if let Some(val) = tokens.get(i + 1).and_then(|s| s.parse().ok()) {
-                    movetime = Some(val);
+                    tc.movetime = Some(val);
                 }
                 i += 1;
             }
             "wtime" => {
-                wtime = tokens.get(i + 1).and_then(|s| s.parse().ok());
+                tc.wtime = tokens.get(i + 1).and_then(|s| s.parse().ok());
                 i += 1;
             }
             "btime" => {
-                btime = tokens.get(i + 1).and_then(|s| s.parse().ok());
+                tc.btime = tokens.get(i + 1).and_then(|s| s.parse().ok());
                 i += 1;
             }
             "winc" => {
-                winc = tokens.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                tc.winc = tokens.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 i += 1;
             }
             "binc" => {
-                binc = tokens.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                tc.binc = tokens.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 i += 1;
             }
             "movestogo" => {
-                movestogo = tokens.get(i + 1).and_then(|s| s.parse().ok());
+                tc.movestogo = tokens.get(i + 1).and_then(|s| s.parse().ok());
                 i += 1;
             }
             _ => {}
@@ -252,40 +247,7 @@ fn handle_go(
         i += 1;
     }
 
-    // Keep a healthy margin for input lag and OS scheduling on fast controls.
-    let overhead_ms = 25;
-
-    let (soft_time, hard_time) = if let Some(mt) = movetime {
-        let t = mt.saturating_sub(overhead_ms).max(5);
-        (Some(t), Some(t))
-    } else {
-        let (my_time, my_inc) = if board.side_to_move == Color::White {
-            (wtime, winc)
-        } else {
-            (btime, binc)
-        };
-
-        if let Some(time) = my_time {
-            let usable_time = time.saturating_sub(overhead_ms);
-
-            if let Some(moves) = movestogo {
-                let moves = (moves.clamp(1, 50) as f64).min(20.0);
-                let base = (usable_time as f64 / moves) + 0.8 * my_inc as f64;
-                let soft = (base as u128).min(usable_time * 4 / 10).max(5);
-                let hard = ((base * 2.5) as u128).min(usable_time * 80 / 100).max(soft);
-                (Some(soft), Some(hard))
-            } else {
-                let base_time = usable_time / 24 + (my_inc * 3) / 4;
-                let min_time = (my_inc * 8 / 10).max(10);
-                let max_soft = usable_time * 35 / 100;
-                let soft = base_time.max(min_time).min(max_soft).max(5);
-                let hard = ((base_time * 25) / 10).min(usable_time * 80 / 100).max(soft);
-                (Some(soft), Some(hard))
-            }
-        } else {
-            (None, None)
-        }
-    };
+    let limits = TimeManager::allocate(board, &tc);
 
     main_searcher.soft_stop_votes.store(0, Ordering::Relaxed);
     main_searcher.shared_nodes.store(0, Ordering::Relaxed);
@@ -294,19 +256,20 @@ fn handle_go(
     let stop_signal = Arc::clone(&main_searcher.stop);
 
     let best_move = if helpers.is_empty() {
-        let m = main_searcher.search(board, depth, soft_time, hard_time);
+        let m = main_searcher.search(board, depth, limits.soft_limit, limits.hard_limit);
         stop_signal.store(true, Ordering::Relaxed);
         m
     } else {
         std::thread::scope(|s| {
             for helper in helpers.iter_mut() {
                 let mut helper_board = board.clone();
+                let soft = limits.soft_limit;
                 s.spawn(move || {
-                    helper.search_helper(&mut helper_board, depth, soft_time);
+                    helper.search_helper(&mut helper_board, depth, soft);
                 });
             }
 
-            let m = main_searcher.search(board, depth, soft_time, hard_time);
+            let m = main_searcher.search(board, depth, limits.soft_limit, limits.hard_limit);
             stop_signal.store(true, Ordering::Relaxed);
             m
         })

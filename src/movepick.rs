@@ -264,7 +264,70 @@ impl MovePicker {
         prev_is_capture: &[bool; MAX_PLY],
     ) {
         let us = board.side_to_move;
+        let them = !us;
+        let occ = board.occupied;
         let pawn_threats = board.opponent_pawn_threats();
+        let all_threats = board.opponent_threats();
+
+        let mut minor_threats = pawn_threats;
+        let mut knights = board.pieces[Piece::new(them, PieceType::Knight)];
+        while !knights.is_empty() { minor_threats |= crate::attacks::knight_attacks(knights.pop_lsb()); }
+        let bishops = board.pieces[Piece::new(them, PieceType::Bishop)];
+        let mut b_threats = bishops;
+        while !b_threats.is_empty() { minor_threats |= crate::attacks::bishop_attacks(b_threats.pop_lsb(), occ); }
+
+        let mut rook_threats = minor_threats;
+        let rooks = board.pieces[Piece::new(them, PieceType::Rook)];
+        let mut r_threats = rooks;
+        while !r_threats.is_empty() { rook_threats |= crate::attacks::rook_attacks(r_threats.pop_lsb(), occ); }
+
+        let threatened = [
+            crate::bitboard::Bitboard::EMPTY,
+            pawn_threats,
+            pawn_threats,
+            minor_threats,
+            rook_threats,
+            crate::bitboard::Bitboard::EMPTY,
+        ];
+
+        let escape = [0, 8854, 8170, 14051, 20357, 0];
+
+        let queens = board.pieces[Piece::new(them, PieceType::Queen)];
+
+        let mut n_off = crate::bitboard::Bitboard::EMPTY;
+        let mut kv = (bishops & !all_threats) | rooks | queens;
+        while !kv.is_empty() { n_off |= crate::attacks::knight_attacks(kv.pop_lsb()); }
+        n_off &= !all_threats;
+
+        let mut b_off = crate::bitboard::Bitboard::EMPTY;
+        let mut bv = rooks | queens;
+        while !bv.is_empty() { b_off |= crate::attacks::bishop_attacks(bv.pop_lsb(), occ); }
+        b_off &= !all_threats;
+
+        let mut q_off = crate::bitboard::Bitboard::EMPTY;
+        let mut qov = bishops & !all_threats;
+        while !qov.is_empty() { q_off |= crate::attacks::rook_attacks(qov.pop_lsb(), occ); }
+        let mut qdv = rooks & !all_threats;
+        while !qdv.is_empty() { q_off |= crate::attacks::bishop_attacks(qdv.pop_lsb(), occ); }
+        q_off &= !all_threats;
+
+        let offense = [
+            crate::bitboard::Bitboard::EMPTY,
+            n_off,
+            b_off,
+            crate::bitboard::Bitboard::EMPTY,
+            q_off,
+            crate::bitboard::Bitboard::EMPTY
+        ];
+
+        let ksq = board.king_square(us);
+        let back_rank = if us == crate::types::Color::White { 0 } else { 7 };
+        let wall_pawns = if ksq.rank() == back_rank {
+            crate::attacks::king_attacks(ksq) & board.pieces[Piece::new(us, PieceType::Pawn)]
+        } else {
+            crate::bitboard::Bitboard::EMPTY
+        };
+
         let p_idx = (board.pawn_hash as usize) & 511;
         let offsets = [1usize, 2, 4, 6];
         let ply_idx = ply as usize;
@@ -275,6 +338,7 @@ impl MovePicker {
             let to = m.to();
             let piece = board.piece_on[from];
             let pt = piece.piece_type();
+            let pt_idx = pt as usize;
 
             let mut score = history[us as usize][from as usize][to as usize]
                 + pawn_history[p_idx][piece as usize][to as usize];
@@ -292,18 +356,26 @@ impl MovePicker {
                 }
             }
 
-            let is_threatened_to = pawn_threats.contains(to);
+            let is_threatened_to = all_threats.contains(to);
 
             if board.gives_direct_check(m) && !is_threatened_to {
                 score += 2000;
             }
 
-            if pawn_threats.contains(from) && !is_threatened_to {
-                score += 2500;
+            if threatened[pt_idx].contains(from) && !is_threatened_to {
+                score += escape[pt_idx];
             }
 
             if is_threatened_to {
                 score -= if pt != PieceType::Pawn { 3000 } else { 1200 };
+            }
+
+            if offense[pt_idx].contains(to) {
+                score += 3446;
+            }
+
+            if wall_pawns.contains(from) {
+                score -= 4494;
             }
 
             self.scores[i] = score;

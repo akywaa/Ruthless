@@ -75,7 +75,23 @@ impl Accumulator {
         let weights = &net.feature_weights[idx].vals;
         let side = color as usize;
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        ))]
+        {
+            unsafe {
+                vec_add_avx512(&mut self.vals[side], weights);
+                return;
+            }
+        }
+
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        ))]
         {
             unsafe {
                 vec_add_avx2(&mut self.vals[side], weights);
@@ -83,7 +99,23 @@ impl Accumulator {
             }
         }
 
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe {
+                vec_add_neon(&mut self.vals[side], weights);
+                return;
+            }
+        }
+
+        #[cfg(not(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw"
+            ),
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            target_arch = "aarch64"
+        )))]
         {
             for i in 0..HIDDEN_SIZE {
                 self.vals[side][i] += weights[i];
@@ -98,7 +130,23 @@ impl Accumulator {
         let weights = &net.feature_weights[idx].vals;
         let side = color as usize;
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        ))]
+        {
+            unsafe {
+                vec_sub_avx512(&mut self.vals[side], weights);
+                return;
+            }
+        }
+
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        ))]
         {
             unsafe {
                 vec_sub_avx2(&mut self.vals[side], weights);
@@ -106,7 +154,23 @@ impl Accumulator {
             }
         }
 
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe {
+                vec_sub_neon(&mut self.vals[side], weights);
+                return;
+            }
+        }
+
+        #[cfg(not(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw"
+            ),
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            target_arch = "aarch64"
+        )))]
         {
             for i in 0..HIDDEN_SIZE {
                 self.vals[side][i] -= weights[i];
@@ -192,7 +256,24 @@ pub fn evaluate(board: &Board) -> i32 {
     let bucket = output_bucket(board);
     let acc = &board.accumulators[board.acc_index];
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        unsafe {
+            let us = board.side_to_move as usize;
+            let them = us ^ 1;
+            return evaluate_avx512(acc, us, them, bucket, net);
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    ))]
     {
         unsafe {
             let us = board.side_to_move as usize;
@@ -201,7 +282,24 @@ pub fn evaluate(board: &Board) -> i32 {
         }
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            let us = board.side_to_move as usize;
+            let them = us ^ 1;
+            return evaluate_neon(acc, us, them, bucket, net);
+        }
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw"
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        target_arch = "aarch64"
+    )))]
     {
         let mut output = 0i64;
 
@@ -352,6 +450,9 @@ mod tests {
             rng ^= rng << 17;
             let pick = (rng as usize) % moves.count;
             board.make_move(moves.moves[pick]);
+            // Collapse the accumulator stack; otherwise the walk overflows the
+            // 256-ply stack and panics at board.rs make_move.
+            board.reset_accumulator_stack();
         }
     }
 }
@@ -449,6 +550,209 @@ unsafe fn evaluate_avx2(
         let mut output = 0i64;
         for i in 0..4 {
             output += arr[i];
+        }
+
+        output /= i64::from(QA);
+        output += i64::from(net.output_bias[bucket]);
+        output *= SCALE as i64;
+        output /= i64::from(QA) * i64::from(QB);
+
+        output as i32
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn vec_add_avx512(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let a_ptr = acc.as_mut_ptr() as *mut __m512i;
+        let w_ptr = weights.as_ptr() as *const __m512i;
+        for i in 0..(HIDDEN_SIZE / 32) {
+            let va = _mm512_loadu_si512(a_ptr.add(i));
+            let vw = _mm512_loadu_si512(w_ptr.add(i));
+            _mm512_storeu_si512(a_ptr.add(i), _mm512_add_epi16(va, vw));
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn vec_sub_avx512(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let a_ptr = acc.as_mut_ptr() as *mut __m512i;
+        let w_ptr = weights.as_ptr() as *const __m512i;
+        for i in 0..(HIDDEN_SIZE / 32) {
+            let va = _mm512_loadu_si512(a_ptr.add(i));
+            let vw = _mm512_loadu_si512(w_ptr.add(i));
+            _mm512_storeu_si512(a_ptr.add(i), _mm512_sub_epi16(va, vw));
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn evaluate_avx512(
+    acc: &Accumulator,
+    us: usize,
+    them: usize,
+    bucket: usize,
+    net: &'static Network,
+) -> i32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let zero = _mm512_setzero_si512();
+        let qa = _mm512_set1_epi16(QA);
+        let mut acc64 = _mm512_setzero_si512();
+
+        let mut evaluate_side = |vals: &[i16; HIDDEN_SIZE], offset: usize| {
+            let v_ptr = vals.as_ptr() as *const __m512i;
+            let w_ptr = net.output_weights[bucket][offset..].as_ptr() as *const __m512i;
+            let mut l_acc = _mm512_setzero_si512();
+
+            for chunk in 0..(HIDDEN_SIZE / 32) {
+                let v = _mm512_loadu_si512(v_ptr.add(chunk));
+                let clamped = _mm512_min_epi16(_mm512_max_epi16(v, zero), qa);
+
+                let low_16 = _mm512_castsi512_si256(clamped);
+                let high_16 = _mm512_extracti64x4_epi64::<1>(clamped);
+                let y_low = _mm512_cvtepi16_epi32(low_16);
+                let y_high = _mm512_cvtepi16_epi32(high_16);
+
+                let w = _mm512_loadu_si512(w_ptr.add(chunk));
+                let w_low = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(w));
+                let w_high = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(w));
+
+                let p_low = _mm512_mullo_epi32(_mm512_mullo_epi32(y_low, y_low), w_low);
+                let p_high = _mm512_mullo_epi32(_mm512_mullo_epi32(y_high, y_high), w_high);
+
+                l_acc = _mm512_add_epi64(l_acc, _mm512_cvtepi32_epi64(_mm512_castsi512_si256(p_low)));
+                l_acc = _mm512_add_epi64(
+                    l_acc,
+                    _mm512_cvtepi32_epi64(_mm512_extracti64x4_epi64::<1>(p_low)),
+                );
+                l_acc = _mm512_add_epi64(
+                    l_acc,
+                    _mm512_cvtepi32_epi64(_mm512_castsi512_si256(p_high)),
+                );
+                l_acc = _mm512_add_epi64(
+                    l_acc,
+                    _mm512_cvtepi32_epi64(_mm512_extracti64x4_epi64::<1>(p_high)),
+                );
+            }
+
+            acc64 = _mm512_add_epi64(acc64, l_acc);
+        };
+
+        evaluate_side(&acc.vals[us], 0);
+        evaluate_side(&acc.vals[them], HIDDEN_SIZE);
+
+        let res = _mm512_reduce_add_epi64(acc64);
+
+        let mut output = res;
+        output /= i64::from(QA);
+        output += i64::from(net.output_bias[bucket]);
+        output *= SCALE as i64;
+        output /= i64::from(QA) * i64::from(QB);
+
+        output as i32
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_add_neon(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let a_ptr = acc.as_mut_ptr();
+        let w_ptr = weights.as_ptr();
+        for i in (0..HIDDEN_SIZE).step_by(8) {
+            let va = vld1q_s16(a_ptr.add(i));
+            let vw = vld1q_s16(w_ptr.add(i));
+            vst1q_s16(a_ptr.add(i), vaddq_s16(va, vw));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_sub_neon(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let a_ptr = acc.as_mut_ptr();
+        let w_ptr = weights.as_ptr();
+        for i in (0..HIDDEN_SIZE).step_by(8) {
+            let va = vld1q_s16(a_ptr.add(i));
+            let vw = vld1q_s16(w_ptr.add(i));
+            vst1q_s16(a_ptr.add(i), vsubq_s16(va, vw));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn evaluate_neon(
+    acc: &Accumulator,
+    us: usize,
+    them: usize,
+    bucket: usize,
+    net: &'static Network,
+) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let qa = vdupq_n_s16(QA);
+        let zero = vdupq_n_s16(0);
+
+        let mut sum0 = vdupq_n_s32(0);
+        let mut sum1 = vdupq_n_s32(0);
+
+        let mut evaluate_side = |vals: &[i16; HIDDEN_SIZE], offset: usize| {
+            let v_ptr = vals.as_ptr();
+            let w_ptr = net.output_weights[bucket][offset..].as_ptr();
+
+            for chunk in (0..HIDDEN_SIZE).step_by(8) {
+                let v = vld1q_s16(v_ptr.add(chunk));
+                let clamped = vminq_s16(vmaxq_s16(v, zero), qa);
+
+                let y_low = vmovl_s16(vget_low_s16(clamped));
+                let y_high = vmovl_high_s16(clamped);
+
+                let w = vld1q_s16(w_ptr.add(chunk));
+                let w_low = vmovl_s16(vget_low_s16(w));
+                let w_high = vmovl_high_s16(w);
+
+                let sq_low = vmulq_s32(y_low, y_low);
+                let sq_high = vmulq_s32(y_high, y_high);
+
+                let p_low = vmulq_s32(sq_low, w_low);
+                let p_high = vmulq_s32(sq_high, w_high);
+
+                sum0 = vaddq_s32(sum0, p_low);
+                sum1 = vaddq_s32(sum1, p_high);
+            }
+        };
+
+        evaluate_side(&acc.vals[us], 0);
+        evaluate_side(&acc.vals[them], HIDDEN_SIZE);
+
+        let mut arr = [0i32; 8];
+        vst1q_s32(arr.as_mut_ptr(), sum0);
+        vst1q_s32(arr.as_mut_ptr().add(4), sum1);
+
+        let mut output = 0i64;
+        for i in 0..8 {
+            output += arr[i] as i64;
         }
 
         output /= i64::from(QA);

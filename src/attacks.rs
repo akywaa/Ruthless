@@ -4,6 +4,8 @@ use std::sync::OnceLock;
 
 pub struct Magic {
     pub mask: u64,
+    // Only consulted on non-BMI2 builds, where the index is a magic
+    // multiply-shift; with BMI2 the index is a PEXT of `mask`.
     pub magic: u64,
     pub shift: u8,
     pub offset: usize,
@@ -44,14 +46,14 @@ pub fn king_attacks(sq: Square) -> Bitboard {
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let m = &attacks().bishop_magics[sq as usize];
-    let idx = m.offset + (((occ.0 & m.mask).wrapping_mul(m.magic)) >> m.shift) as usize;
+    let idx = crate::setwise::pext_slider_idx(occ.0, m.mask, m.offset, m.shift, m.magic);
     attacks().slider_table[idx]
 }
 
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let m = &attacks().rook_magics[sq as usize];
-    let idx = m.offset + (((occ.0 & m.mask).wrapping_mul(m.magic)) >> m.shift) as usize;
+    let idx = crate::setwise::pext_slider_idx(occ.0, m.mask, m.offset, m.shift, m.magic);
     attacks().slider_table[idx]
 }
 
@@ -208,6 +210,13 @@ impl AttackTables {
                 let mut fail = false;
 
                 for i in 0..size {
+                    // On BMI2 the lookup is a PEXT of the relevant-mask bits, so
+                    // the table must be stored in compressed-index order.
+                    // `index_to_occupancy` guarantees pext(occupancies[i], mask) == i,
+                    // so the two layouts below are each self-consistent.
+                    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                    let idx = offset + crate::setwise::compressed_index(occupancies[i], mask);
+                    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
                     let idx = offset + (((occupancies[i].wrapping_mul(magic)) >> shift) as usize);
                     if table[idx] == Bitboard::EMPTY {
                         table[idx] = attacks[i];

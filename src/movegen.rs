@@ -1,6 +1,10 @@
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::attacks::{king_attacks, pawn_attacks};
 use crate::bitboard::Bitboard;
 use crate::board::Board;
+use crate::setwise::{
+    extract_moves, generate_bishop_moves, generate_knight_moves, generate_queen_moves,
+    generate_rook_moves,
+};
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType, Square};
 
 pub fn generate_legal_moves(board: &Board) -> MoveList {
@@ -28,52 +32,14 @@ pub fn generate_noisy_pseudo(board: &Board, list: &mut MoveList) {
     generate_pawn_captures_pseudo(board, us, their_occ, list);
     generate_pawn_promotions_pseudo(board, us, empty, list);
 
-    let mut knights = board.pieces[Piece::new(us, PieceType::Knight)];
-    while !knights.is_empty() {
-        let from = knights.pop_lsb();
-        let mut attacks = knight_attacks(from) & their_occ;
-        while !attacks.is_empty() {
-            let to = attacks.pop_lsb();
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-        }
-    }
-
-    let mut bishops = board.pieces[Piece::new(us, PieceType::Bishop)];
-    while !bishops.is_empty() {
-        let from = bishops.pop_lsb();
-        let mut attacks = bishop_attacks(from, all_occ) & their_occ;
-        while !attacks.is_empty() {
-            let to = attacks.pop_lsb();
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-        }
-    }
-
-    let mut rooks = board.pieces[Piece::new(us, PieceType::Rook)];
-    while !rooks.is_empty() {
-        let from = rooks.pop_lsb();
-        let mut attacks = rook_attacks(from, all_occ) & their_occ;
-        while !attacks.is_empty() {
-            let to = attacks.pop_lsb();
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-        }
-    }
-
-    let mut queens = board.pieces[Piece::new(us, PieceType::Queen)];
-    while !queens.is_empty() {
-        let from = queens.pop_lsb();
-        let mut attacks = (bishop_attacks(from, all_occ) | rook_attacks(from, all_occ)) & their_occ;
-        while !attacks.is_empty() {
-            let to = attacks.pop_lsb();
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-        }
-    }
+    generate_knight_moves(board, us, their_occ, list);
+    generate_bishop_moves(board, us, their_occ, all_occ, list);
+    generate_rook_moves(board, us, their_occ, all_occ, list);
+    generate_queen_moves(board, us, their_occ, all_occ, list);
 
     let king_sq = board.king_square(us);
-    let mut king_moves = king_attacks(king_sq) & their_occ;
-    while !king_moves.is_empty() {
-        let to = king_moves.pop_lsb();
-        list.push(Move::new(king_sq, to, PieceType::None, MoveType::Normal));
-    }
+    let king_moves = king_attacks(king_sq) & their_occ;
+    extract_moves(king_sq, king_moves, list, PieceType::None, MoveType::Normal);
 }
 
 pub fn generate_quiet_pseudo(board: &Board, list: &mut MoveList) {
@@ -83,52 +49,14 @@ pub fn generate_quiet_pseudo(board: &Board, list: &mut MoveList) {
 
     generate_pawn_pushes_pseudo(board, us, empty, list);
 
-    let mut knights = board.pieces[Piece::new(us, PieceType::Knight)];
-    while !knights.is_empty() {
-        let from = knights.pop_lsb();
-        let mut attacks = knight_attacks(from) & empty;
-        while !attacks.is_empty() {
-            let to = attacks.pop_lsb();
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-        }
-    }
-
-    let mut bishops = board.pieces[Piece::new(us, PieceType::Bishop)];
-    while !bishops.is_empty() {
-        let from = bishops.pop_lsb();
-        let mut attacks = bishop_attacks(from, all_occ) & empty;
-        while !attacks.is_empty() {
-            let to = attacks.pop_lsb();
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-        }
-    }
-
-    let mut rooks = board.pieces[Piece::new(us, PieceType::Rook)];
-    while !rooks.is_empty() {
-        let from = rooks.pop_lsb();
-        let mut attacks = rook_attacks(from, all_occ) & empty;
-        while !attacks.is_empty() {
-            let to = attacks.pop_lsb();
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-        }
-    }
-
-    let mut queens = board.pieces[Piece::new(us, PieceType::Queen)];
-    while !queens.is_empty() {
-        let from = queens.pop_lsb();
-        let mut attacks = (bishop_attacks(from, all_occ) | rook_attacks(from, all_occ)) & empty;
-        while !attacks.is_empty() {
-            let to = attacks.pop_lsb();
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-        }
-    }
+    generate_knight_moves(board, us, empty, list);
+    generate_bishop_moves(board, us, empty, all_occ, list);
+    generate_rook_moves(board, us, empty, all_occ, list);
+    generate_queen_moves(board, us, empty, all_occ, list);
 
     let king_sq = board.king_square(us);
-    let mut king_moves = king_attacks(king_sq) & empty;
-    while !king_moves.is_empty() {
-        let to = king_moves.pop_lsb();
-        list.push(Move::new(king_sq, to, PieceType::None, MoveType::Normal));
-    }
+    let king_moves = king_attacks(king_sq) & empty;
+    extract_moves(king_sq, king_moves, list, PieceType::None, MoveType::Normal);
 
     generate_castling_moves(board, us, all_occ, list);
 }

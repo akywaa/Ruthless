@@ -8,6 +8,7 @@ mod nnue;
 mod numa;
 mod search;
 mod see;
+mod setwise;
 mod threadpool;
 mod time;
 mod tt;

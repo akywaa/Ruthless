@@ -596,12 +596,6 @@ unsafe {
             if board.is_draw() {
                 return draw_score;
             }
-            if !is_pv && alpha < draw_score && board.upcoming_repetition() {
-                alpha = draw_score;
-                if alpha >= beta {
-                    return alpha;
-                }
-            }
         }
 
         if (ply as usize) >= MAX_PLY {
@@ -1277,12 +1271,6 @@ unsafe {
         if ply > 0 {
             if board.is_repetition() || board.halfmove_clock >= 100 {
                 return draw_score;
-            }
-            if alpha < draw_score && board.upcoming_repetition() {
-                alpha = draw_score;
-                if alpha >= beta {
-                    return alpha;
-                }
             }
         }
 

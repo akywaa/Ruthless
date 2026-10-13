@@ -706,44 +706,41 @@ impl Board {
 
         let current_key = self.hash;
         let mut index = count - 1;
-        let mut other = current_key ^ self.history[index] ^ side_key();
 
         let mut compared_ply = 3;
         while compared_ply <= max_steps {
-            index -= 1;
-            other ^= self.history[index] ^ self.history[index - 1] ^ side_key();
-            index -= 1;
+            index -= 2;
 
-            if other == 0 {
-                let diff = current_key ^ self.history[index];
-                let mut c_idx = crate::zobrist::h1(diff);
+            // Exact xor difference between the current and an older position.
+            let diff = current_key ^ self.history[index];
+            let mut c_idx = crate::zobrist::h1(diff);
 
-                let cuckoo = crate::zobrist::cuckoo();
+            let cuckoo = crate::zobrist::cuckoo();
+            if cuckoo.keys[c_idx] != diff {
+                c_idx = crate::zobrist::h2(diff);
                 if cuckoo.keys[c_idx] != diff {
-                    c_idx = crate::zobrist::h2(diff);
-                    if cuckoo.keys[c_idx] != diff {
-                        compared_ply += 2;
-                        continue;
-                    }
-                }
-
-                let sq1 = cuckoo.sq_a[c_idx];
-                let sq2 = cuckoo.sq_b[c_idx];
-                if (crate::attacks::between(sq1, sq2) & self.occupied).is_empty() {
-                    let p1 = self.piece_on[sq1];
-                    let (from, to) = if p1 != crate::types::Piece::None && p1.color() == self.side_to_move {
-                        (sq1, sq2)
-                    } else {
-                        (sq2, sq1)
-                    };
-
-                    // Build a pseudo-legal move and strictly verify it (king safety)
-                    let m = crate::types::Move::new(from, to, crate::types::PieceType::None, crate::types::MoveType::Normal);
-                    if self.is_pseudo_legal(m) && self.is_legal(m) {
-                        return true;
-                    }
+                    compared_ply += 2;
+                    continue;
                 }
             }
+
+            let sq1 = cuckoo.sq_a[c_idx];
+            let sq2 = cuckoo.sq_b[c_idx];
+            if (crate::attacks::between(sq1, sq2) & self.occupied).is_empty() {
+                let p1 = self.piece_on[sq1];
+                let (from, to) = if p1 != crate::types::Piece::None && p1.color() == self.side_to_move {
+                    (sq1, sq2)
+                } else {
+                    (sq2, sq1)
+                };
+
+                // Build a pseudo-legal move and strictly verify it (king safety).
+                let m = crate::types::Move::new(from, to, crate::types::PieceType::None, crate::types::MoveType::Normal);
+                if self.is_pseudo_legal(m) && self.is_legal(m) {
+                    return true;
+                }
+            }
+
             compared_ply += 2;
         }
 

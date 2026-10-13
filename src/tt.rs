@@ -101,9 +101,13 @@ impl TranspositionTable {
         let cluster = &self.clusters[idx];
 
         for entry in &cluster.entries {
+            // Load data first, then the xored key. If a concurrent store
+            // races between the two loads, the xor check simply fails
+            // instead of returning garbage.
+            let data = entry.data.load(Ordering::Relaxed);
             let stored_key = entry.key.load(Ordering::Relaxed);
-            if stored_key == key {
-                let data = entry.data.load(Ordering::Relaxed) ^ key;
+
+            if stored_key ^ data == key {
                 let gen_bound = ((data >> 16) & 0xFF) as u8;
                 let flag = bound_of(gen_bound);
 
@@ -139,16 +143,20 @@ impl TranspositionTable {
         let mut replace_idx = 0;
         let mut lowest_score = i32::MAX;
         let mut found_match = false;
+        let mut old_data = 0; // cached entry data, avoids a second load
 
         for i in 0..4 {
+            let data = cluster.entries[i].data.load(Ordering::Relaxed);
             let stored_key = cluster.entries[i].key.load(Ordering::Relaxed);
-            if stored_key == key {
+
+            // A race with a concurrent store makes this xor check fail.
+            if stored_key ^ data == key {
                 replace_idx = i;
                 found_match = true;
+                old_data = data;
                 break;
             }
 
-            let data = cluster.entries[i].data.load(Ordering::Relaxed) ^ stored_key;
             let gen_bound = ((data >> 16) & 0xFF) as u8;
 
             if bound_of(gen_bound) == TTFlag::None {
@@ -170,7 +178,6 @@ impl TranspositionTable {
         let target_entry = &cluster.entries[replace_idx];
 
         let mv = if best_move == Move::NULL && found_match {
-            let old_data = target_entry.data.load(Ordering::Relaxed) ^ key;
             (old_data & 0xFFFF) as u16
         } else {
             best_move.0
@@ -180,8 +187,10 @@ impl TranspositionTable {
         let gen_bound = (curr_gen << 2) | (flag as u8);
         let new_data = pack_data(entry_score, raw_eval, depth, gen_bound, mv);
 
-        target_entry.data.store(new_data ^ key, Ordering::Relaxed);
-        target_entry.key.store(key, Ordering::Relaxed);
+        // Write plain data first, then the xored key so a racing reader
+        // either sees a consistent pair or fails the xor check.
+        target_entry.data.store(new_data, Ordering::Relaxed);
+        target_entry.key.store(key ^ new_data, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {

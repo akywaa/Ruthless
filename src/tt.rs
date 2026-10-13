@@ -21,17 +21,19 @@ pub struct TTEntry {
 
 pub const RAW_EVAL_NONE: i16 = i16::MIN;
 
-#[repr(C, align(64))]
+// 32 bytes exact: 8 bytes for signatures + 24 bytes for 3 entries.
+// Perfect fit for a half cache-line, minimizing cache misses during probe.
+#[repr(C, align(32))]
 struct Cluster {
-    entries: [[AtomicU64; 2]; 3],
-    _pad: u64,
+    signatures: AtomicU64,
+    entries: [AtomicU64; 3],
 }
 
 impl Cluster {
     fn empty() -> Self {
         Self {
-            entries: std::array::from_fn(|_| [AtomicU64::new(0), AtomicU64::new(0)]),
-            _pad: 0,
+            signatures: AtomicU64::new(0),
+            entries: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -93,13 +95,17 @@ impl TranspositionTable {
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
         let idx = (key as usize) & self.mask;
         let cluster = &self.clusters[idx];
+        let key_sig = (key >> 48) as u16 as u64;
 
-        for entry in &cluster.entries {
-            let stored_key = entry[0].load(Ordering::Relaxed);
-            if stored_key == key {
-                let data = entry[1].load(Ordering::Relaxed);
+        let sigs = cluster.signatures.load(Ordering::Relaxed);
+
+        for i in 0..3 {
+            let sig = (sigs >> (16 * i)) & 0xFFFF;
+            if sig == key_sig {
+                let data = cluster.entries[i].load(Ordering::Relaxed);
                 let gen_bound = ((data >> 16) & 0xFF) as u8;
                 let flag = bound_of(gen_bound);
+
                 if flag != TTFlag::None {
                     return Some(TTEntry {
                         best_move: Move((data & 0xFFFF) as u16),
@@ -128,21 +134,34 @@ impl TranspositionTable {
         let idx = (key as usize) & self.mask;
         let cluster = &self.clusters[idx];
         let curr_gen = self.generation.load(Ordering::Relaxed) & 0x3F;
+        let key_sig = (key >> 48) as u16 as u64;
 
+        let mut sigs = cluster.signatures.load(Ordering::Relaxed);
         let mut replace_idx = 0;
         let mut lowest_score = i32::MAX;
+        let mut found_match = false;
 
-        for (i, entry) in cluster.entries.iter().enumerate() {
-            let stored_key = entry[0].load(Ordering::Relaxed);
-            let data = entry[1].load(Ordering::Relaxed);
-            if stored_key == key || bound_of(((data >> 16) & 0xFF) as u8) == TTFlag::None {
+        for i in 0..3 {
+            let sig = (sigs >> (16 * i)) & 0xFFFF;
+            if sig == key_sig {
                 replace_idx = i;
+                found_match = true;
                 break;
             }
 
+            let data = cluster.entries[i].load(Ordering::Relaxed);
+            let gen_bound = ((data >> 16) & 0xFF) as u8;
+
+            // Prefer empty slots instantly
+            if bound_of(gen_bound) == TTFlag::None {
+                replace_idx = i;
+                lowest_score = i32::MIN;
+                continue;
+            }
+
             let entry_age = (64 + curr_gen - age_of(data)) & 0x3F;
-            let depth = ((data >> 24) & 0xFF) as i32;
-            let priority = depth - (entry_age as i32 * 8);
+            let entry_depth = ((data >> 24) & 0xFF) as i32;
+            let priority = entry_depth - (entry_age as i32 * 8);
 
             if priority < lowest_score {
                 lowest_score = priority;
@@ -150,39 +169,47 @@ impl TranspositionTable {
             }
         }
 
-        let target = &cluster.entries[replace_idx];
+        let target_entry = &cluster.entries[replace_idx];
+        let old_data = target_entry.load(Ordering::Relaxed);
 
-        let keep_move = best_move == Move::NULL
-            && target[0].load(Ordering::Relaxed) == key;
-        let entry_score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        let gen_bound = (curr_gen << 2) | (flag as u8);
-
+        let keep_move = best_move == Move::NULL && found_match;
         let mv = if keep_move {
-            (target[1].load(Ordering::Relaxed) & 0xFFFF) as u16
+            (old_data & 0xFFFF) as u16
         } else {
             best_move.0
         };
 
-        let mut word = target[0].load(Ordering::Relaxed);
-        loop {
-            match target[0].compare_exchange_weak(
-                word,
-                key,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => word = actual,
+        let entry_score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let gen_bound = (curr_gen << 2) | (flag as u8);
+        let new_data = pack_data(entry_score, raw_eval, depth, gen_bound, mv);
+
+        // Store data first to avoid a reader grabbing our new signature with old data
+        target_entry.store(new_data, Ordering::Relaxed);
+
+        if !found_match {
+            loop {
+                let mut new_sigs = sigs;
+                new_sigs &= !(0xFFFF << (16 * replace_idx));
+                new_sigs |= key_sig << (16 * replace_idx);
+
+                match cluster.signatures.compare_exchange_weak(
+                    sigs,
+                    new_sigs,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => sigs = actual,
+                }
             }
         }
-        target[1].store(pack_data(entry_score, raw_eval, depth, gen_bound, mv), Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
         for cluster in &self.clusters {
+            cluster.signatures.store(0, Ordering::Relaxed);
             for entry in &cluster.entries {
-                entry[0].store(0, Ordering::Relaxed);
-                entry[1].store(0, Ordering::Relaxed);
+                entry.store(0, Ordering::Relaxed);
             }
         }
         self.generation.store(0, Ordering::Relaxed);

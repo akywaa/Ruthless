@@ -9,6 +9,7 @@ mod numa;
 mod search;
 mod see;
 mod setwise;
+mod syzygy;
 mod threadpool;
 mod time;
 mod tt;

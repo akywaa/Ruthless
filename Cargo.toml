@@ -11,3 +11,6 @@ panic = "abort"
 
 [dependencies]
 core_affinity = "0.8"
+
+[build-dependencies]
+cc = "1.0"

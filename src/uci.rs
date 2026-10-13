@@ -32,6 +32,7 @@ pub fn uci_loop() {
                 println!("option name FutilityMargin type spin default 75 min 10 max 200");
                 println!("option name NmpBase type spin default 3 min 1 max 6");
                 println!("option name NmpEvalDiv type spin default 200 min 50 max 500");
+                println!("option name SyzygyPath type string default <empty>");
                 println!("uciok");
             }
             "setoption" => {
@@ -81,6 +82,10 @@ fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
             }
             name.push_str(t);
         } else if is_value {
+            // Keep internal spaces (e.g. tablesbase paths like "C:\\My Tables").
+            if !value.is_empty() {
+                value.push(' ');
+            }
             value.push_str(t);
         }
     }
@@ -113,6 +118,9 @@ fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
         }
         "nmpevaldiv" => {
             if let Ok(v) = value.parse::<i32>() { crate::search::NMP_EVAL_DIV.store(v, Ordering::Relaxed); }
+        }
+        "syzygypath" => {
+            crate::syzygy::init(&value);
         }
         _ => {}
     }

@@ -675,6 +675,45 @@ unsafe {
             }
         }
 
+        // Syzygy tablebase WDL probe. Only meaningful without castling rights,
+        // out of check and outside a singular-extension verification search.
+        if !in_check && excluded_move == Move::NULL && board.castling_rights == 0 {
+            if let Some(wdl) = crate::syzygy::probe_wdl(board) {
+                let tb_value = if wdl > 0 {
+                    wdl - ply as i32
+                } else if wdl < 0 {
+                    wdl + ply as i32
+                } else {
+                    0
+                };
+
+                let bound = if wdl > 0 {
+                    TTFlag::LowerBound
+                } else if wdl < 0 {
+                    TTFlag::UpperBound
+                } else {
+                    TTFlag::Exact
+                };
+
+                // A draw is exact, so return immediately; a win/loss only cuts
+                // off when it beats the current window.
+                if bound == TTFlag::Exact
+                    || (bound == TTFlag::LowerBound && tb_value >= beta)
+                    || (bound == TTFlag::UpperBound && tb_value <= alpha)
+                {
+                    self.tt.store(
+                        board.tt_hash,
+                        score_to_tt(tb_value, ply),
+                        depth,
+                        bound,
+                        Move::NULL,
+                        crate::tt::RAW_EVAL_NONE,
+                    );
+                    return tb_value;
+                }
+            }
+        }
+
         if excluded_move == Move::NULL && depth >= 2 && tt_move == Move::NULL && (is_pv || cut_node) {
             depth -= 1;
         }

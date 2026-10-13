@@ -106,8 +106,7 @@ fn update_history(val: &mut i32, bonus: i32) {
 
 #[inline(always)]
 fn update_corr(val: &mut i16, bonus: i32) {
-    let clamped = bonus.clamp(-1200, 1200);
-    *val += (clamped - (*val as i32 * clamped.abs()) / 16384) as i16;
+    *val += (bonus - (*val as i32 * bonus.abs()) / 16384) as i16;
 }
 
 fn alloc_box_zeroed<T>() -> Box<T> {
@@ -209,10 +208,9 @@ unsafe {
         let w_np_idx = (board.non_pawn_hash[0] as usize) & (CORR_ENTRIES - 1);
         let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
 
-        let pawn_term = self.pawn_corr[bucket][side][p_idx] as i32 * 16;
-        let np_term = (self.non_pawn_corr[bucket][0][side][w_np_idx] as i32
-            + self.non_pawn_corr[bucket][1][side][b_np_idx] as i32)
-            * 12;
+        let pawn_term = self.pawn_corr[bucket][side][p_idx] as i32;
+        let np_term = self.non_pawn_corr[bucket][0][side][w_np_idx] as i32
+            + self.non_pawn_corr[bucket][1][side][b_np_idx] as i32;
 
         let mut cont_term = 0i32;
         let ply_idx = ply as usize;
@@ -239,12 +237,8 @@ unsafe {
                 }
             }
         }
-        cont_term *= 8;
-
-        let total_bonus = (pawn_term + np_term + cont_term) / 512;
-        let clamped_bonus = (total_bonus / 3).clamp(-60, 60);
-
-        let mut eval = raw + clamped_bonus;
+        let total_bonus = pawn_term + np_term + cont_term;
+        let mut eval = raw + total_bonus / 64;
 
         // Scale evaluation towards draw near 50-move rule
         eval = eval * (200 - board.halfmove_clock as i32) / 200;
@@ -1196,7 +1190,9 @@ unsafe {
                 && !(flag == TTFlag::LowerBound && best_score <= static_eval)
                 && !(flag == TTFlag::UpperBound && best_score >= static_eval)
             {
-                let bonus = ((best_score - static_eval) * (depth as i32)).clamp(-1200, 1200);
+                let diff = best_score - static_eval;
+                // Reckless formula for precise eval correction scaling
+                let bonus = (148 * (depth as i32) * diff / 128).clamp(-4678, 2496);
                 let side = board.side_to_move as usize;
                 let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
 

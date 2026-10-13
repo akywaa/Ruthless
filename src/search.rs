@@ -685,14 +685,21 @@ unsafe {
             depth -= 1;
         }
 
-        let improving = if in_check || ply < 2 {
-            false
+        let improvement = if in_check || ply < 2 {
+            0
         } else {
-            static_eval > self.eval_stack[(ply - 2) as usize]
+            static_eval - self.eval_stack[(ply - 2) as usize]
         };
 
+        let improving = improvement > 0;
+
         if !is_pv && !in_check {
-            let rfp_margin = (RFP_BASE.load(Ordering::Relaxed) - RFP_IMPROVING.load(Ordering::Relaxed) * improving as i32) * (depth as i32);
+            let base = RFP_BASE.load(Ordering::Relaxed);
+            let imp = RFP_IMPROVING.load(Ordering::Relaxed) * (improving as i32);
+
+            // scale the margin down if our position is improving rapidly
+            let rfp_margin = (base - imp) * (depth as i32) - improvement / 16;
+
             if depth <= 6 && static_eval - rfp_margin >= beta {
                 return (static_eval + beta) / 2;
             }
@@ -712,7 +719,18 @@ unsafe {
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
-                let r = NMP_BASE.load(Ordering::Relaxed) as u8 + depth / 3 + ((static_eval - beta) / NMP_EVAL_DIV.load(Ordering::Relaxed)).clamp(0, 3) as u8;
+                let eval_div = NMP_EVAL_DIV.load(Ordering::Relaxed);
+
+                let mut r = NMP_BASE.load(Ordering::Relaxed)
+                    + (depth as i32) / 3
+                    + ((static_eval - beta) / eval_div).clamp(0, 3)
+                    + (improvement / 128).clamp(-1, 1);
+
+                if r < 1 {
+                    r = 1;
+                }
+                let r = r as u8;
+
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = Move::NULL;
                     self.played_pieces[ply as usize] = Piece::None;
@@ -970,6 +988,8 @@ unsafe {
                     if !improving {
                         r += 1;
                     }
+
+                    r -= (improvement / 64).clamp(-2, 2);
 
                     if cut_node {
                         r += 2;

@@ -235,7 +235,7 @@ unsafe {
             }
         }
         let total_bonus = pawn_term + np_term + cont_term;
-        let mut eval = raw + total_bonus / 64;
+        let mut eval = raw + (total_bonus / 256).clamp(-80, 80);
 
         // Scale evaluation towards draw near 50-move rule
         eval = eval * (200 - board.halfmove_clock as i32) / 200;
@@ -452,7 +452,7 @@ unsafe {
                     .min(soft_limit as f32 * 1.4) as u128;
 
                 let past_hard = elapsed >= self.hard_time_ms.unwrap_or(u128::MAX);
-                let past_soft = depth >= 6 && elapsed >= dynamic_soft;
+                let past_soft = depth >= 3 && elapsed >= dynamic_soft;
 
                 if past_soft || past_hard {
                     self.stop.store(true, Ordering::Relaxed);
@@ -842,12 +842,6 @@ unsafe {
                 extension = 1;
             } else if singular_beta >= beta {
                 return singular_beta;
-            } else if score >= beta && score.abs() < MATE_SCORE - 100 {
-                // Multi-Cut: безопасно сглаживаем счет до беты
-                return beta + (score - beta) * 3 / 5;
-            } else if tt_score >= beta || cut_node {
-                // Negative Extensions
-                extension = -2;
             }
         } else if depth <= 6 && !in_check && cut_node && static_eval <= alpha - 30 {
             extension = 1;
@@ -1203,7 +1197,7 @@ unsafe {
             {
                 let diff = best_score - static_eval;
                 // Reckless formula for precise eval correction scaling
-                let bonus = (148 * (depth as i32) * diff / 128).clamp(-4678, 2496);
+                let bonus = (148 * (depth as i32) * diff / 128).clamp(-1200, 1200);
                 let side = board.side_to_move as usize;
                 let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
 

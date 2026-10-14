@@ -36,6 +36,7 @@ pub struct ThreadPool {
     shared_state: Arc<(Mutex<PoolState>, Condvar)>,
     handles: Vec<thread::JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
+    active_helpers: Arc<AtomicU64>,
     num_threads: usize,
 }
 
@@ -44,6 +45,7 @@ impl ThreadPool {
         let tt = Arc::new(TranspositionTable::new(mb));
         let stop_signal = Arc::new(AtomicBool::new(false));
         let shared_nodes = Arc::new(AtomicU64::new(0));
+        let active_helpers = Arc::new(AtomicU64::new(0));
 
         let main_searcher = Searcher::new(
             Arc::clone(&tt),
@@ -68,6 +70,7 @@ impl ThreadPool {
             )),
             handles: Vec::new(),
             stop_signal,
+            active_helpers,
             num_threads: 1, // Resized correctly below
         };
 
@@ -120,6 +123,7 @@ impl ThreadPool {
             let tt_clone = Arc::clone(&self.tt);
             let stop_clone = Arc::clone(&self.stop_signal);
             let nodes_clone = Arc::clone(&self.shared_nodes);
+            let active_clone = Arc::clone(&self.active_helpers);
             let total_threads = target_num;
 
             let handle = thread::spawn(move || {
@@ -150,7 +154,9 @@ impl ThreadPool {
                     match command {
                         Command::Search(params) => {
                             let mut board_clone = params.board;
+                            active_clone.fetch_add(1, Ordering::Relaxed);
                             helper.search_helper(&mut board_clone, params.depth, params.soft_time);
+                            active_clone.fetch_sub(1, Ordering::Relaxed);
                         }
                         Command::Clear => helper.clear(),
                         Command::Exit => return,
@@ -175,6 +181,13 @@ impl ThreadPool {
     }
 
     pub fn start_search(&mut self, board: &mut Board, depth: u8, limits: TimeLimits) -> Move {
+        // Wait for helpers from the previous search to fully stop before clearing
+        // the stop flag. Otherwise they would keep searching the stale position
+        // and pollute the TT with moves from the previous ply.
+        while self.active_helpers.load(Ordering::Relaxed) != 0 {
+            std::thread::yield_now();
+        }
+
         self.stop_signal.store(false, Ordering::Relaxed);
         self.shared_nodes.store(0, Ordering::Relaxed);
 

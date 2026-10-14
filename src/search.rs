@@ -819,7 +819,7 @@ unsafe {
             && (tt_flag == TTFlag::Exact || tt_flag == TTFlag::LowerBound)
             && tt_score.abs() < MATE_SCORE - 100
         {
-            let singular_margin = if tt_flag == TTFlag::Exact { (depth as i32 + 3) / 4 } else { depth as i32 };
+            let singular_margin = (depth as i32) * 2;
             let singular_beta = tt_score - singular_margin;
             let singular_depth = (depth - 1) / 2;
 
@@ -839,26 +839,15 @@ unsafe {
             }
 
             if score < singular_beta {
-                let tt_move_quiet = board.piece_on[tt_move.to()] == Piece::None
-                    && tt_move.move_type() != MoveType::Promotion
-                    && tt_move.move_type() != MoveType::EnPassant;
-
-                let double_margin = 195 * (is_pv as i32) - 16 * (tt_move_quiet as i32);
-                let triple_margin = 230 * (is_pv as i32) - 19 * (tt_move_quiet as i32) + 36;
-
                 extension = 1;
-                if score < singular_beta - double_margin {
-                    extension += 1;
-                }
-                if score < singular_beta - triple_margin {
-                    extension += 1;
-                }
+            } else if singular_beta >= beta {
+                return singular_beta;
             } else if score >= beta && score.abs() < MATE_SCORE - 100 {
-                // Multi-Cut: safely lerp the score down to beta
+                // Multi-Cut: безопасно сглаживаем счет до беты
                 return beta + (score - beta) * 3 / 5;
             } else if tt_score >= beta || cut_node {
                 // Negative Extensions
-                extension = -3;
+                extension = -2;
             }
         } else if depth <= 6 && !in_check && cut_node && static_eval <= alpha - 30 {
             extension = 1;
@@ -1281,7 +1270,7 @@ unsafe {
         // Hard cap on qsearch depth so long check sequences cannot explode
         // the tree beyond the main search line.
         if qply >= 16 {
-            return if board.in_check() { 0 } else { evaluate(board) };
+            return self.corrected_eval(board, ply, self.raw_eval(board));
         }
 
         let in_check = board.in_check();

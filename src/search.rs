@@ -235,7 +235,7 @@ unsafe {
             }
         }
         let total_bonus = pawn_term + np_term + cont_term;
-        let mut eval = raw + (total_bonus / 256).clamp(-80, 80);
+        let mut eval = raw + (total_bonus / 256).clamp(-15, 15);
 
         // Scale evaluation towards draw near 50-move rule
         eval = eval * (200 - board.halfmove_clock as i32) / 200;
@@ -329,7 +329,6 @@ unsafe {
         }
 
         self.nodes = 0;
-        self.stop.store(false, Ordering::Relaxed);
         self.start_time = Instant::now();
         self.tt.new_search();
         self.soft_time_ms = soft_time;
@@ -925,7 +924,7 @@ unsafe {
                     }
 
                     if is_quiet && depth <= 6 {
-                        let threshold = -700 * (depth as i32) - if improving { 400 } else { 0 };
+                        let threshold = -4000 * (depth as i32) - if improving { 2000 } else { 0 };
                         if hist < threshold {
                             continue;
                         }
@@ -1328,7 +1327,7 @@ unsafe {
                     let attacker = board.piece_on[m.from()].piece_type();
                     scores[i] = 100_000 + crate::eval::PIECE_VALUES[victim as usize] * 10 - crate::eval::PIECE_VALUES[attacker as usize];
                 } else {
-                    scores[i] = 0;
+                    scores[i] = self.quiet_history_score(board, ply, m);
                 }
             }
 

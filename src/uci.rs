@@ -2,12 +2,16 @@ use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::threadpool::ThreadPool;
 use crate::time::{TimeControl, TimeLimits, TimeManager};
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 pub fn uci_loop() {
     let mut board = Board::default();
-    let mut pool = ThreadPool::new(32, 1);
+    let pool = Arc::new(Mutex::new(ThreadPool::new(32, 1)));
+    let mut stop = pool.lock().unwrap().new_search_stop();
+    let mut search: Option<JoinHandle<()>> = None;
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
@@ -37,7 +41,9 @@ pub fn uci_loop() {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             "setoption" => {
-                handle_setoption(&tokens[1..], &mut pool);
+                stop.store(true, Ordering::Relaxed);
+                join_search(&mut search);
+                handle_setoption(&tokens[1..], &mut pool.lock().unwrap());
             }
             "eval" => {
                 println!("nnue eval: {} cp", crate::eval::evaluate(&board));
@@ -47,21 +53,61 @@ pub fn uci_loop() {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             "ucinewgame" => {
-                pool.clear();
+                stop.store(true, Ordering::Relaxed);
+                join_search(&mut search);
+                pool.lock().unwrap().clear();
                 board = Board::default();
             }
             "position" => {
                 handle_position(&mut board, &tokens[1..]);
             }
             "go" => {
-                handle_go(&mut board, &mut pool, &tokens[1..]);
+                stop.store(true, Ordering::Relaxed);
+                join_search(&mut search);
+                stop = pool.lock().unwrap().new_search_stop();
+
+                let (depth, tc) = parse_go(&tokens[1..]);
+                let mut search_board = board.clone();
+                let search_pool = Arc::clone(&pool);
+
+                search = Some(
+                    thread::Builder::new()
+                        .stack_size(64 * 1024 * 1024)
+                        .spawn(move || {
+                            let limits = TimeManager::allocate(&search_board, &tc);
+                            let best_move = search_pool
+                                .lock()
+                                .unwrap()
+                                .start_search(&mut search_board, depth, limits);
+                            println!("bestmove {}", best_move);
+                            let _ = io::stdout().flush();
+                        })
+                        .unwrap(),
+                );
+            }
+            "stop" => {
+                stop.store(true, Ordering::Relaxed);
             }
             "bench" => {
-                run_bench(&mut pool);
+                stop.store(true, Ordering::Relaxed);
+                join_search(&mut search);
+                run_bench(&mut pool.lock().unwrap());
             }
-            "quit" => break,
+            "quit" => {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
             _ => {}
         }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    join_search(&mut search);
+}
+
+fn join_search(search: &mut Option<JoinHandle<()>>) {
+    if let Some(handle) = search.take() {
+        let _ = handle.join();
     }
 }
 
@@ -167,7 +213,7 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
     }
 }
 
-fn handle_go(board: &mut Board, pool: &mut ThreadPool, tokens: &[&str]) {
+fn parse_go(tokens: &[&str]) -> (u8, TimeControl) {
     let mut depth: u8 = 64;
     let mut tc = TimeControl::default();
 
@@ -211,10 +257,7 @@ fn handle_go(board: &mut Board, pool: &mut ThreadPool, tokens: &[&str]) {
         i += 1;
     }
 
-    let limits = TimeManager::allocate(board, &tc);
-    let best_move = pool.start_search(board, depth, limits);
-    println!("bestmove {}", best_move);
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    (depth, tc)
 }
 
 pub fn run_bench_cli() {
@@ -244,6 +287,7 @@ fn run_bench(pool: &mut ThreadPool) {
 
     for fen in fens {
         if let Ok(mut board) = Board::from_fen(fen) {
+            pool.new_search_stop();
             pool.start_search(
                 &mut board,
                 12,

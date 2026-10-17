@@ -14,6 +14,7 @@ pub struct SearchParams {
     pub depth: u8,
     pub soft_time: Option<u128>,
     pub hard_time: Option<u128>,
+    pub stop: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -154,6 +155,7 @@ impl ThreadPool {
                     match command {
                         Command::Search(params) => {
                             let mut board_clone = params.board;
+                            helper.stop = Arc::clone(&params.stop);
                             active_clone.fetch_add(1, Ordering::Relaxed);
                             helper.search_helper(&mut board_clone, params.depth, params.soft_time);
                             active_clone.fetch_sub(1, Ordering::Relaxed);
@@ -180,15 +182,21 @@ impl ThreadPool {
         cvar.notify_all();
     }
 
+    pub fn new_search_stop(&mut self) -> Arc<AtomicBool> {
+        let stop = Arc::new(AtomicBool::new(false));
+        self.stop_signal = Arc::clone(&stop);
+        self.main_searcher.stop = Arc::clone(&stop);
+        stop
+    }
+
     pub fn start_search(&mut self, board: &mut Board, depth: u8, limits: TimeLimits) -> Move {
-        // Wait for helpers from the previous search to fully stop before clearing
-        // the stop flag. Otherwise they would keep searching the stale position
-        // and pollute the TT with moves from the previous ply.
+        // Wait for helpers from the previous search to fully stop. Otherwise they
+        // would keep searching the stale position and pollute the TT with moves
+        // from the previous ply.
         while self.active_helpers.load(Ordering::Relaxed) != 0 {
             std::thread::yield_now();
         }
 
-        self.stop_signal.store(false, Ordering::Relaxed);
         self.shared_nodes.store(0, Ordering::Relaxed);
 
         let params = SearchParams {
@@ -196,6 +204,7 @@ impl ThreadPool {
             depth,
             soft_time: limits.soft_limit,
             hard_time: limits.hard_limit,
+            stop: Arc::clone(&self.stop_signal),
         };
 
         // Wake up sleeping helpers instantly

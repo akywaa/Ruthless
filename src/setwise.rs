@@ -6,8 +6,7 @@ use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType, Square};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Expand every destination bit into a move. On x86_64 this walks the bitboard
-/// with BMI1 `tzcnt` / `blsr`; elsewhere it falls back to the scalar helpers.
+/// Expand every destination bit into a move, walking the bitboard bit by bit.
 #[inline(always)]
 pub fn extract_moves(
     from: Square,
@@ -16,22 +15,9 @@ pub fn extract_moves(
     pt: PieceType,
     move_type: MoveType,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let mut bb = attacks.0;
-        while bb != 0 {
-            let to = _tzcnt_u64(bb) as u8;
-            bb = _blsr_u64(bb);
-            list.push(Move::new(from, Square::new(to), pt, move_type));
-        }
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let mut attacks = attacks;
-        while !attacks.is_empty() {
-            list.push(Move::new(from, attacks.pop_lsb(), pt, move_type));
-        }
+    let mut attacks = attacks;
+    while !attacks.is_empty() {
+        list.push(Move::new(from, attacks.pop_lsb(), pt, move_type));
     }
 }
 
@@ -75,8 +61,8 @@ pub fn generate_knight_moves(board: &Board, us: Color, target: Bitboard, list: &
             let mut from_sqs = [0i32; 8];
             let mut k = 0;
             while knights != 0 && k < 8 {
-                from_sqs[k] = _tzcnt_u64(knights) as i32;
-                knights = _blsr_u64(knights);
+                from_sqs[k] = knights.trailing_zeros() as i32;
+                knights &= knights - 1;
                 k += 1;
             }
 
@@ -101,32 +87,11 @@ pub fn generate_knight_moves(board: &Board, us: Color, target: Bitboard, list: &
         return;
     }
 
-    // Scalar BMI1 extraction fallback.
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512dq"
-    )))]
-    {
-        while knights != 0 {
-            #[cfg(target_arch = "x86_64")]
-            let from_idx = unsafe { _tzcnt_u64(knights) as u8 };
-            #[cfg(not(target_arch = "x86_64"))]
-            let from_idx = knights.trailing_zeros() as u8;
-
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                knights = _blsr_u64(knights);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                knights &= knights - 1;
-            }
-
-            let from = Square::new(from_idx);
-            let att = crate::attacks::knight_attacks(from) & target;
-            extract_moves(from, att, list, PieceType::None, MoveType::Normal);
-        }
+    while knights != 0 {
+        let from = Square::new(knights.trailing_zeros() as u8);
+        knights &= knights - 1;
+        let att = crate::attacks::knight_attacks(from) & target;
+        extract_moves(from, att, list, PieceType::None, MoveType::Normal);
     }
 }
 
@@ -140,21 +105,8 @@ pub fn generate_bishop_moves(
 ) {
     let mut bishops = board.pieces[Piece::new(us, PieceType::Bishop)].0;
     while bishops != 0 {
-        #[cfg(target_arch = "x86_64")]
-        let from_idx = unsafe { _tzcnt_u64(bishops) as u8 };
-        #[cfg(not(target_arch = "x86_64"))]
-        let from_idx = bishops.trailing_zeros() as u8;
-
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            bishops = _blsr_u64(bishops);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            bishops &= bishops - 1;
-        }
-
-        let from = Square::new(from_idx);
+        let from = Square::new(bishops.trailing_zeros() as u8);
+        bishops &= bishops - 1;
         let att = bishop_attacks(from, occ) & target;
         extract_moves(from, att, list, PieceType::None, MoveType::Normal);
     }
@@ -170,21 +122,8 @@ pub fn generate_rook_moves(
 ) {
     let mut rooks = board.pieces[Piece::new(us, PieceType::Rook)].0;
     while rooks != 0 {
-        #[cfg(target_arch = "x86_64")]
-        let from_idx = unsafe { _tzcnt_u64(rooks) as u8 };
-        #[cfg(not(target_arch = "x86_64"))]
-        let from_idx = rooks.trailing_zeros() as u8;
-
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            rooks = _blsr_u64(rooks);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            rooks &= rooks - 1;
-        }
-
-        let from = Square::new(from_idx);
+        let from = Square::new(rooks.trailing_zeros() as u8);
+        rooks &= rooks - 1;
         let att = rook_attacks(from, occ) & target;
         extract_moves(from, att, list, PieceType::None, MoveType::Normal);
     }
@@ -200,21 +139,8 @@ pub fn generate_queen_moves(
 ) {
     let mut queens = board.pieces[Piece::new(us, PieceType::Queen)].0;
     while queens != 0 {
-        #[cfg(target_arch = "x86_64")]
-        let from_idx = unsafe { _tzcnt_u64(queens) as u8 };
-        #[cfg(not(target_arch = "x86_64"))]
-        let from_idx = queens.trailing_zeros() as u8;
-
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            queens = _blsr_u64(queens);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            queens &= queens - 1;
-        }
-
-        let from = Square::new(from_idx);
+        let from = Square::new(queens.trailing_zeros() as u8);
+        queens &= queens - 1;
         let att = (bishop_attacks(from, occ) | rook_attacks(from, occ)) & target;
         extract_moves(from, att, list, PieceType::None, MoveType::Normal);
     }

@@ -41,7 +41,7 @@ impl TimeManager {
 
             // Cyclic time control (e.g. 40 moves in X minutes)
             if let Some(moves) = tc.movestogo {
-                let moves = (moves.clamp(1, 50) as f64).min(20.0);
+                let moves = moves.clamp(2, 50) as f64;
                 let base = (usable_time / moves) + 0.8 * inc;
 
                 let soft = (base as u128).min((usable_time * 0.4) as u128).max(5);

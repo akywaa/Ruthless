@@ -43,6 +43,9 @@ pub struct Board {
     pub pawn_hash: u64,
     pub non_pawn_hash: [u64; 2],
     pub history: Vec<u64>,
+    // Index in `history` of the search root. Repetitions at or after it are
+    // twofold draws, repetitions before it need a third occurrence.
+    pub root_ply: usize,
     pub accumulators: Box<[Accumulator; ACC_STACK_SIZE]>,
     pub acc_index: usize,
 }
@@ -69,6 +72,7 @@ impl Board {
             pawn_hash: 0,
             non_pawn_hash: [0; 2],
             history: Vec::with_capacity(256),
+            root_ply: 0,
             accumulators: vec![Accumulator::new(); ACC_STACK_SIZE]
                 .into_boxed_slice()
                 .try_into()
@@ -141,6 +145,9 @@ impl Board {
                         'k' => Piece::BlackKing,
                         _ => return Err(format!("Invalid piece character: {}", ch)),
                     };
+                    if piece.piece_type() == PieceType::Pawn && (rank == 0 || rank == 7) {
+                        return Err("Pawn on invalid rank in FEN".to_string());
+                    }
                     board.put_piece(piece, sq);
                     file += 1;
                 }
@@ -199,6 +206,12 @@ impl Board {
 
         if parts.len() > 5 {
             board.fullmove_number = parts[5].parse().unwrap_or(1);
+        }
+
+        if board.pieces[Piece::WhiteKing].count() != 1
+            || board.pieces[Piece::BlackKing].count() != 1
+        {
+            return Err("FEN must contain exactly one king per side".to_string());
         }
 
         board.hash = board.compute_hash();
@@ -390,10 +403,16 @@ impl Board {
                 let pt = piece.piece_type();
                 match pt {
                     PieceType::Pawn => {
-                        let (forward, start_rank) = match us {
-                            Color::White => (8i8, 1u8),
-                            Color::Black => (-8i8, 6u8),
+                        let (forward, start_rank, promo_rank) = match us {
+                            Color::White => (8i8, 1u8, 7u8),
+                            Color::Black => (-8i8, 6u8, 0u8),
                         };
+
+                        // A pawn reaching the last rank must be encoded as a
+                        // promotion, never as a normal push.
+                        if to.rank() == promo_rank {
+                            return false;
+                        }
 
                         if dest_piece == Piece::None {
                             if to as i8 == from as i8 + forward {
@@ -442,30 +461,33 @@ impl Board {
                 self.piece_on[cap_sq] == Piece::new(them, PieceType::Pawn) && pawn_attacks(us, from).contains(to)
             }
             MoveType::Castling => {
+                if piece.piece_type() != PieceType::King {
+                    return false;
+                }
                 let occ = self.occupied;
-                match (us, to) {
-                    (Color::White, Square::G1) => {
+                match (us, from, to) {
+                    (Color::White, Square::E1, Square::G1) => {
                         (self.castling_rights & Self::CASTLE_WK) != 0
                             && (occ.0 & ((1u64 << Square::F1 as u8) | (1u64 << Square::G1 as u8))) == 0
                             && !self.is_square_attacked(Square::E1, Color::Black)
                             && !self.is_square_attacked(Square::F1, Color::Black)
                             && !self.is_square_attacked(Square::G1, Color::Black)
                     }
-                    (Color::White, Square::C1) => {
+                    (Color::White, Square::E1, Square::C1) => {
                         (self.castling_rights & Self::CASTLE_WQ) != 0
                             && (occ.0 & ((1u64 << Square::B1 as u8) | (1u64 << Square::C1 as u8) | (1u64 << Square::D1 as u8))) == 0
                             && !self.is_square_attacked(Square::E1, Color::Black)
                             && !self.is_square_attacked(Square::D1, Color::Black)
                             && !self.is_square_attacked(Square::C1, Color::Black)
                     }
-                    (Color::Black, Square::G8) => {
+                    (Color::Black, Square::E8, Square::G8) => {
                         (self.castling_rights & Self::CASTLE_BK) != 0
                             && (occ.0 & ((1u64 << Square::F8 as u8) | (1u64 << Square::G8 as u8))) == 0
                             && !self.is_square_attacked(Square::E8, Color::White)
                             && !self.is_square_attacked(Square::F8, Color::White)
                             && !self.is_square_attacked(Square::G8, Color::White)
                     }
-                    (Color::Black, Square::C8) => {
+                    (Color::Black, Square::E8, Square::C8) => {
                         (self.castling_rights & Self::CASTLE_BQ) != 0
                             && (occ.0 & ((1u64 << Square::B8 as u8) | (1u64 << Square::C8 as u8) | (1u64 << Square::D8 as u8))) == 0
                             && !self.is_square_attacked(Square::E8, Color::White)
@@ -517,6 +539,15 @@ impl Board {
 
     pub fn is_legal(&self, m: Move) -> bool {
         let us = self.side_to_move;
+        self.is_legal_with(m, self.checkers(), self.pinned_pieces(us))
+    }
+
+    /// Legality check with king-attack information computed by the caller for
+    /// the current side to move. Callers that test many moves in the same
+    /// position should compute both masks once instead of per move.
+    #[inline(always)]
+    pub fn is_legal_with(&self, m: Move, checkers: Bitboard, pinned: Bitboard) -> bool {
+        let us = self.side_to_move;
         let them = !us;
         let from = m.from();
         let to = m.to();
@@ -527,7 +558,6 @@ impl Board {
             return true;
         }
 
-        let checkers = self.checkers();
         let num_checkers = checkers.count();
 
         if num_checkers > 1 {
@@ -581,7 +611,7 @@ impl Board {
                 && (rook_attacks(ksq, occ) & opp_rooks_queens).is_empty();
         }
 
-        if self.pinned_pieces(us).contains(from) {
+        if pinned.contains(from) {
             let from_rank = (from.rank() as i32) - (ksq.rank() as i32);
             let from_file = (from.file() as i32) - (ksq.file() as i32);
             let to_rank = (to.rank() as i32) - (ksq.rank() as i32);
@@ -649,7 +679,10 @@ impl Board {
 
     #[inline(always)]
     pub fn is_draw(&self) -> bool {
-        self.is_repetition() || self.halfmove_clock >= 100 || self.draw_by_material()
+        self.is_repetition()
+            || (self.halfmove_clock >= 100
+                && (!self.in_check() || crate::movegen::generate_legal_moves(self).count > 0))
+            || self.draw_by_material()
     }
 
     #[inline(always)]
@@ -704,10 +737,18 @@ impl Board {
         }
 
         let max_steps = (self.halfmove_clock as usize).min(count);
+        let mut earlier_reps = 0;
         let mut i = 2;
         while i <= max_steps {
-            if self.history[count - i] == self.hash {
-                return true;
+            let idx = count - i;
+            if self.history[idx] == self.hash {
+                // A repetition strictly inside the search tree is a draw at
+                // once; one that also existed before the root needs a third
+                // occurrence before the fifty-move rule is satisfied.
+                if idx >= self.root_ply || earlier_reps > 0 {
+                    return true;
+                }
+                earlier_reps += 1;
             }
             i += 2;
         }
@@ -868,9 +909,15 @@ impl Board {
                     self.accumulators[self.acc_index].add_feature_side(moving_piece, to, self.king_square(them), them);
                 }
 
-                if moving_piece.piece_type() == PieceType::Pawn && ((from as i8) - (to as i8)).abs() == 16 {
-                    self.ep_square = Square::new(((from as u8) + (to as u8)) / 2);
-                    self.hash ^= ep_key(self.ep_square.file());
+                if moving_piece.piece_type() == PieceType::Pawn
+                    && ((from as i8) - (to as i8)).abs() == 16
+                {
+                    let ep = Square::new(((from as u8) + (to as u8)) / 2);
+                    let enemy_pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
+                    if !(pawn_attacks(us, ep) & enemy_pawns).is_empty() {
+                        self.ep_square = ep;
+                        self.hash ^= ep_key(ep.file());
+                    }
                 }
             }
             MoveType::Castling => {
@@ -1018,6 +1065,71 @@ mod tests {
     }
 
     #[test]
+    fn ep_square_and_king_validation() {
+        assert!(Board::from_fen("8/8/8/8/8/8/8/8 w - - 0 1").is_err());
+
+        let mut board = Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
+        play(&mut board, "e2e4");
+        assert!(!board.ep_square.is_valid());
+        assert_eq!(
+            board.hash,
+            Board::from_fen("4k3/8/8/8/4P3/8/8/4K3 b - - 0 1").unwrap().hash
+        );
+
+        let mut board = Board::from_fen("4k3/8/8/8/3p4/8/4P3/4K3 w - - 0 1").unwrap();
+        play(&mut board, "e2e4");
+        assert_eq!(board.ep_square, Square::E3);
+    }
+
+    #[test]
+    fn pseudo_legal_rejects_unencoded_promotions() {
+        let board = Board::from_fen("4k3/P7/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let quiet_push = Move::new(Square::A7, Square::A8, PieceType::None, MoveType::Normal);
+        assert!(!board.is_pseudo_legal(quiet_push));
+
+        let promo = Move::new(Square::A7, Square::A8, PieceType::Queen, MoveType::Promotion);
+        assert!(board.is_pseudo_legal(promo));
+
+        let board = Board::from_fen("4k3/8/8/8/8/8/p7/4K3 b - - 0 1").unwrap();
+        let quiet_push = Move::new(Square::A2, Square::A1, PieceType::None, MoveType::Normal);
+        assert!(!board.is_pseudo_legal(quiet_push));
+
+        // A castling-typed move must actually start from the king square.
+        let board = Board::from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1").unwrap();
+        let fake = Move::new(Square::H1, Square::G1, PieceType::None, MoveType::Castling);
+        assert!(!board.is_pseudo_legal(fake));
+    }
+
+    #[test]
+    fn fen_rejects_pawns_on_back_ranks() {
+        assert!(Board::from_fen("P3k3/8/8/8/8/8/8/4K3 w - - 0 1").is_err());
+        assert!(Board::from_fen("4k3/8/8/8/8/8/8/P3K3 w - - 0 1").is_err());
+        assert!(Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").is_ok());
+    }
+
+    #[test]
+    fn fifty_move_rule_does_not_mask_checkmate() {
+        let board = Board::from_fen("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1").unwrap();
+        assert!(board.in_check());
+        assert!(generate_legal_moves(&board).count == 0);
+        assert!(!board.is_draw());
+    }
+
+    #[test]
+    fn repetition_needs_threefold_before_root() {
+        let mut board = Board::default();
+        for s in ["g1f3", "g8f6", "f3g1", "f6g8"] {
+            play(&mut board, s);
+        }
+
+        board.root_ply = board.history.len();
+        assert!(!board.is_repetition());
+
+        board.root_ply = 0;
+        assert!(board.is_repetition());
+    }
+
+    #[test]
     fn gives_direct_check_promotion_and_castling() {
         let board = Board::from_fen("8/4k1P1/8/8/8/8/8/K7 w - - 0 1").unwrap();
         let knight_promo = generate_legal_moves(&board)
@@ -1085,6 +1197,51 @@ mod tests {
             let pick = (rng as usize) % moves.count;
             board.make_move(moves.moves[pick]);
             board.reset_accumulator_stack();
+        }
+    }
+
+    #[test]
+    fn accumulator_roundtrip_bench_positions() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            "8/8/1k1NK3/r7/2R2P1P/3n2P1/8/8 b - - 0 59",
+            "8/3k4/3b3p/R1p1p2P/p1Pr4/P2P1r2/2K1R3/4B3 b - - 4 75",
+        ];
+
+        for fen in fens {
+            let mut board = Board::from_fen(fen).unwrap();
+            let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+            for _ in 0..24 {
+                let moves = generate_legal_moves(&board);
+                if moves.count == 0 {
+                    break;
+                }
+                for &m in moves.as_slice() {
+                    let before = board.accumulators[board.acc_index].vals;
+                    let undo = board.make_move(m);
+                    let mut check = board.clone();
+                    check.refresh_accumulator();
+                    assert_eq!(
+                        board.accumulators[board.acc_index].vals,
+                        check.accumulators[check.acc_index].vals,
+                        "make mismatch on {} in {}",
+                        m,
+                        fen
+                    );
+                    board.undo_move(m, undo);
+                    assert_eq!(board.accumulators[board.acc_index].vals, before, "undo mismatch on {}", m);
+                }
+
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                board.make_move(moves.moves[(rng as usize) % moves.count]);
+                board.reset_accumulator_stack();
+            }
         }
     }
 

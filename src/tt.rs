@@ -176,6 +176,23 @@ impl TranspositionTable {
             }
         }
 
+        if found_match {
+            let old_depth = ((old_data >> 24) & 0xFF) as i32;
+            let old_age_diff = (64 + curr_gen - age_of(old_data)) & 0x3F;
+            if flag != TTFlag::Exact && old_age_diff == 0 && (depth as i32) + 4 <= old_depth {
+                if best_move != Move::NULL {
+                    let new_mv = best_move.0 as u64;
+                    if new_mv != (old_data & 0xFFFF) {
+                        let updated = (old_data & !0xFFFF) | new_mv;
+                        let entry = &cluster.entries[replace_idx];
+                        entry.data.store(updated, Ordering::Relaxed);
+                        entry.key.store(key ^ updated, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+        }
+
         let target_entry = &cluster.entries[replace_idx];
 
         let mv = if best_move == Move::NULL && found_match {
@@ -202,5 +219,22 @@ impl TranspositionTable {
             }
         }
         self.generation.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_keeps_deeper_entry() {
+        let tt = TranspositionTable::new(1);
+        tt.new_search();
+        tt.store(42, 100, 8, TTFlag::Exact, Move(1), 0);
+        tt.store(42, 50, 0, TTFlag::LowerBound, Move::NULL, 0);
+
+        let entry = tt.probe(42).unwrap();
+        assert_eq!(entry.depth, 8);
+        assert!(entry.best_move == Move(1));
     }
 }

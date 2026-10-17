@@ -1,3 +1,4 @@
+use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::evaluate;
 use crate::movegen::generate_legal_moves;
@@ -49,6 +50,7 @@ pub struct Searcher {
     pub thread_id: usize,
     pub num_threads: usize,
     pub shared_nodes: Arc<AtomicU64>,
+    nodes_at_last_check: u64,
     start_time: Instant,
     soft_time_ms: Option<u128>,
     hard_time_ms: Option<u128>,
@@ -77,10 +79,14 @@ pub struct Searcher {
     pub completed_depth: u8,
 }
 
+// Mate scores carry the distance to the root in their low bits, so the
+// threshold has to cover every ply the search can reach.
+const MATE_WINDOW: i32 = MATE_SCORE - MAX_PLY as i32;
+
 fn score_to_tt(score: i32, ply: u8) -> i32 {
-    if score >= MATE_SCORE - 100 {
+    if score >= MATE_WINDOW {
         score + ply as i32
-    } else if score <= -MATE_SCORE + 100 {
+    } else if score <= -MATE_WINDOW {
         score - ply as i32
     } else {
         score
@@ -88,9 +94,9 @@ fn score_to_tt(score: i32, ply: u8) -> i32 {
 }
 
 fn score_from_tt(score: i32, ply: u8) -> i32 {
-    if score >= MATE_SCORE - 100 {
+    if score >= MATE_WINDOW {
         score - ply as i32
-    } else if score <= -MATE_SCORE + 100 {
+    } else if score <= -MATE_WINDOW {
         score + ply as i32
     } else {
         score
@@ -134,6 +140,7 @@ impl Searcher {
             thread_id,
             num_threads,
             shared_nodes,
+            nodes_at_last_check: 0,
             start_time: Instant::now(),
             soft_time_ms: None,
             hard_time_ms: None,
@@ -162,6 +169,10 @@ cont_corr: alloc_box_zeroed(),
 
     pub fn clear(&mut self) {
         self.tt.clear();
+        self.clear_histories();
+    }
+
+    pub fn clear_histories(&mut self) {
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
         self.counter_moves = [[Move::NULL; 64]; 64];
@@ -281,15 +292,14 @@ unsafe {
     }
 
     #[inline(always)]
-    fn noisy_history_score(&self, board: &Board, m: Move) -> i32 {
+    fn noisy_history_score(&self, board: &Board, m: Move, threats: Bitboard) -> i32 {
         let moving_pc = board.piece_on[m.from()];
         let victim_pt = match m.move_type() {
             MoveType::EnPassant => PieceType::Pawn,
             MoveType::Promotion => m.promo_type(),
             _ => board.piece_on[m.to()].piece_type(),
         };
-        let pawn_threats = board.opponent_pawn_threats();
-        let to_threatened = pawn_threats.contains(m.to()) as usize;
+        let to_threatened = threats.contains(m.to()) as usize;
 
         self.noisy_history[moving_pc as usize][m.to() as usize][victim_pt as usize][to_threatened]
     }
@@ -329,11 +339,13 @@ unsafe {
         }
 
         self.nodes = 0;
+        self.nodes_at_last_check = 0;
         self.start_time = Instant::now();
         self.tt.new_search();
         self.soft_time_ms = soft_time;
         self.hard_time_ms = hard_time;
         self.root_best_move_pending = Move::NULL;
+        board.root_ply = board.history.len();
 
         let mut best_move = legal_moves.moves[0];
         let mut prev_best_move = Move::NULL;
@@ -398,6 +410,10 @@ unsafe {
             let pv = self.extract_pv(board, depth);
             let pv_str = pv.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" ");
 
+            self.root_best_move = best_move;
+            self.root_score = score;
+            self.completed_depth = depth;
+
             if score.abs() > MATE_SCORE - 100 {
                 let mate_dist = (MATE_SCORE - score.abs() + 1) / 2;
                 let sign = if score > 0 { 1 } else { -1 };
@@ -461,17 +477,15 @@ unsafe {
 
             prev_best_move = best_move;
             prev_score = score;
-
-            self.root_best_move = best_move;
-            self.root_score = score;
-            self.completed_depth = depth;
         }
 
         best_move
     }
 
     pub fn search_helper(&mut self, board: &mut Board, max_depth: u8, soft_time: Option<u128>) {
+        board.root_ply = board.history.len();
         self.nodes = 0;
+        self.nodes_at_last_check = 0;
         self.start_time = Instant::now();
         self.soft_time_ms = soft_time;
         let mut score = 0;
@@ -491,7 +505,7 @@ unsafe {
                 let mut beta = (score + delta).min(INFINITY);
 
                 loop {
-                    score = self.negamax(board, depth, 0, alpha, beta, false, Move::NULL, false);
+                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false);
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -520,7 +534,7 @@ unsafe {
                     }
                 }
             } else {
-                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, false, Move::NULL, false);
+                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false);
             }
 
             self.root_score = score;
@@ -562,7 +576,8 @@ unsafe {
     }
 
     fn check_time(&mut self) {
-    if self.nodes > 0 && (self.nodes & 1023) == 0 {
+    if self.nodes >= self.nodes_at_last_check + 1024 {
+        self.nodes_at_last_check += 1024;
         self.shared_nodes.fetch_add(1024, Ordering::Relaxed);
         let elapsed = self.start_time.elapsed().as_millis();
 
@@ -597,8 +612,31 @@ unsafe {
             }
         }
 
+        // If the side to move can force a repetition, the position is worth at
+        // least a draw. Raise alpha before TT or pruning code can undervalue it.
+        if ply > 0 && board.halfmove_clock >= 3 && alpha < draw_score && board.upcoming_repetition() {
+            alpha = draw_score;
+            if alpha >= beta {
+                return alpha;
+            }
+        }
+
         if (ply as usize) >= MAX_PLY {
             return evaluate(board);
+        }
+
+        // Mate-distance pruning. A mate found closer to the root already
+        // dominates anything this subtree can return.
+        alpha = alpha.max(-MATE_SCORE + ply as i32);
+        let beta = beta.min(MATE_SCORE - ply as i32 - 1);
+        if alpha >= beta {
+            return alpha;
+        }
+
+        // Killers two plies below belong to grandchildren of this node and
+        // may be stale leftovers from a previously searched branch.
+        if (ply as usize) + 2 < MAX_PLY {
+            self.killers[(ply + 2) as usize] = [Move::NULL; 2];
         }
 
         let in_check = board.in_check();
@@ -640,6 +678,21 @@ unsafe {
             self.eval_stack[ply as usize] = static_eval;
         }
 
+        // A TT score backed by the right bound is usually a sharper position
+        // estimate than the raw eval, so use it for pruning decisions.
+        let mut eval = static_eval;
+        if has_tt {
+            let refines_eval = match tt_flag {
+                TTFlag::Exact => true,
+                TTFlag::LowerBound => tt_score > eval,
+                TTFlag::UpperBound => tt_score < eval,
+                TTFlag::None => false,
+            };
+            if refines_eval {
+                eval = tt_score.clamp(-MATE_SCORE + 100, MATE_SCORE - 100);
+            }
+        }
+
         if has_tt && excluded_move == Move::NULL && tt_depth >= depth && ply > 0 && !is_pv {
             match tt_flag {
                 TTFlag::Exact => return tt_score,
@@ -651,7 +704,7 @@ unsafe {
 
         // Syzygy tablebase WDL probe. Only meaningful without castling rights,
         // out of check and outside a singular-extension verification search.
-        if !in_check && excluded_move == Move::NULL && board.castling_rights == 0 {
+        if ply > 0 && !in_check && excluded_move == Move::NULL && board.castling_rights == 0 {
             if let Some(wdl) = crate::syzygy::probe_wdl(board) {
                 let tb_value = if wdl > 0 {
                     wdl - ply as i32
@@ -705,14 +758,14 @@ unsafe {
             let imp = RFP_IMPROVING.load(Ordering::Relaxed) * (improving as i32);
 
             // scale the margin down if our position is improving rapidly
-            let rfp_margin = (base - imp) * (depth as i32) - improvement / 16;
+            let rfp_margin = ((base - imp) * (depth as i32) - improvement / 16).max(0);
 
-            if depth <= 6 && static_eval - rfp_margin >= beta {
-                return (static_eval + beta) / 2;
+            if depth <= 6 && eval - rfp_margin >= beta {
+                return (eval + beta) / 2;
             }
 
             // Razoring
-            if depth <= 2 && static_eval + 400 + 150 * (depth as i32) <= alpha {
+            if depth <= 2 && eval + 200 + 100 * (depth as i32) <= alpha {
                 let qscore = self.quiescence(board, alpha, beta, ply, 0);
                 if qscore <= alpha {
                     return qscore;
@@ -722,7 +775,7 @@ unsafe {
             // Null move pruning
             if excluded_move == Move::NULL
                 && depth >= 3
-                && static_eval >= beta
+                && eval >= beta
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
@@ -730,7 +783,7 @@ unsafe {
 
                 let mut r = NMP_BASE.load(Ordering::Relaxed)
                     + (depth as i32) / 3
-                    + ((static_eval - beta) / eval_div).clamp(0, 3)
+                    + ((eval - beta) / eval_div).clamp(0, 3)
                     + (improvement / 128).clamp(-1, 1);
 
                 if r < 1 {
@@ -782,6 +835,14 @@ unsafe {
                     continue;
                 }
 
+                if (ply as usize) < MAX_PLY {
+                    self.played_moves[ply as usize] = m;
+                    self.played_pieces[ply as usize] = board.piece_on[m.from()];
+                    self.prev_in_check[ply as usize] = false;
+                    self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
+                        || m.move_type() == MoveType::EnPassant;
+                }
+
                 let undo = board.make_move(m);
                 let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0);
 
@@ -808,7 +869,8 @@ unsafe {
 
         let mut extension = 0;
 
-        if depth >= 7
+        if ply > 0
+            && depth >= 7
             && has_tt
             && tt_move != Move::NULL
             && excluded_move == Move::NULL
@@ -842,7 +904,7 @@ unsafe {
             } else if singular_beta >= beta {
                 return singular_beta;
             }
-        } else if depth <= 6 && !in_check && cut_node && static_eval <= alpha - 30 {
+        } else if depth <= 6 && !in_check && cut_node && eval <= alpha - 30 {
             extension = 1;
         }
 
@@ -856,7 +918,7 @@ unsafe {
             && !in_check
             && depth <= 6
             && alpha.abs() < MATE_SCORE - 100
-            && (static_eval + futility_margin <= alpha);
+            && (eval + futility_margin <= alpha);
 
         let mut quiet_moves = [Move::NULL; 64];
         let mut quiet_count = 0;
@@ -881,6 +943,7 @@ unsafe {
         };
 
         let mut picker = MovePicker::new(tt_move, killers, counter_move);
+        let mut threats_cache: Option<Bitboard> = None;
 
         while let Some(m) = picker.next(
             board,
@@ -903,19 +966,20 @@ unsafe {
             let hist = if is_quiet {
                 self.quiet_history_score(board, ply, m)
             } else {
-                self.noisy_history_score(board, m)
+                let threats = *threats_cache.get_or_insert_with(|| board.opponent_threats());
+                self.noisy_history_score(board, m, threats)
             };
 
-            if !is_pv && !in_check && moves_searched > 0 {
-                let is_direct_check = board.gives_direct_check(m);
-
-                if !is_direct_check {
-                    if is_quiet && depth <= 8 && moves_searched >= lmp_threshold {
+            // Do not prune while the best score so far is a loss: the remaining
+            // moves may still hold the only defence.
+            if !is_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
+                // Quiet-move pruning is the only user of the direct-check test.
+                if is_quiet && depth <= 8 && !board.gives_direct_check(m) {
+                    if moves_searched >= lmp_threshold {
                         continue;
                     }
 
-                    if is_quiet
-                        && futility_pruning
+                    if futility_pruning
                         && m != killers[0]
                         && m != killers[1]
                         && m != counter_move
@@ -923,7 +987,7 @@ unsafe {
                         continue;
                     }
 
-                    if is_quiet && depth <= 6 {
+                    if depth <= 6 {
                         let threshold = -4000 * (depth as i32) - if improving { 2000 } else { 0 };
                         if hist < threshold {
                             continue;
@@ -956,7 +1020,8 @@ unsafe {
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
-            let is_see_ge_zero = !is_quiet && see(board, m, 0);
+            let lmr_applies = depth >= 4 && moves_searched >= 2 && (!is_pv || is_quiet);
+            let is_see_ge_zero = lmr_applies && !is_quiet && see(board, m, 0);
 
             let undo = board.make_move(m);
             let gives_check = board.in_check();
@@ -965,14 +1030,12 @@ unsafe {
 
             let score = if moves_searched == 0 {
                 let next_depth = (depth as i32 - 1 + ext).max(0) as u8;
-                -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, false)
+                let child_cut = !is_pv && !cut_node;
+                -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, child_cut)
             } else {
                 let mut r = 0;
 
-                if depth >= 4
-                    && moves_searched >= 2
-                    && (!is_pv || is_quiet)
-                {
+                if lmr_applies {
                     r = lmr(depth as usize, moves_searched);
 
                     if !is_quiet {
@@ -1072,7 +1135,7 @@ unsafe {
                     _ => board.piece_on[m.to()].piece_type(),
                 } as usize;
 
-                let threats = board.opponent_threats();
+                let threats = *threats_cache.get_or_insert_with(|| board.opponent_threats());
                 let to_threatened = threats.contains(m.to()) as usize;
 
                 if is_quiet {
@@ -1251,10 +1314,8 @@ unsafe {
         }
 
         let draw_score = self.draw_score();
-        if ply > 0 {
-            if board.is_repetition() || board.halfmove_clock >= 100 {
-                return draw_score;
-            }
+        if ply > 0 && board.is_draw() {
+            return draw_score;
         }
 
         if (ply as usize) >= MAX_PLY {
@@ -1271,11 +1332,13 @@ unsafe {
         let mut tt_move = Move::NULL;
         let mut tt_score: Option<i32> = None;
         let mut tt_flag = TTFlag::None;
+        let mut tt_raw_eval = crate::tt::RAW_EVAL_NONE;
 
         if let Some(entry) = self.tt.probe(board.tt_hash) {
             tt_move = entry.best_move;
             tt_score = Some(score_from_tt(entry.score, ply));
             tt_flag = entry.flag;
+            tt_raw_eval = entry.raw_eval;
 
             let s = tt_score.unwrap();
             match tt_flag {
@@ -1292,7 +1355,12 @@ unsafe {
         let mut stand_pat = -INFINITY;
         let mut raw_eval = 0;
         if !in_check {
-            raw_eval = self.raw_eval(board);
+            // The static eval was already fetched with the TT probe above.
+            raw_eval = if tt_raw_eval != crate::tt::RAW_EVAL_NONE {
+                tt_raw_eval as i32
+            } else {
+                evaluate(board)
+            };
             stand_pat = self.corrected_eval(board, ply, raw_eval);
 
             if stand_pat >= beta {
@@ -1343,6 +1411,13 @@ unsafe {
                 moves.moves.swap(i, best_idx);
 
                 let m = moves.moves[i];
+                if (ply as usize) < MAX_PLY {
+                    self.played_moves[ply as usize] = m;
+                    self.played_pieces[ply as usize] = board.piece_on[m.from()];
+                    self.prev_in_check[ply as usize] = true;
+                    self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
+                        || m.move_type() == MoveType::EnPassant;
+                }
                 let undo = board.make_move(m);
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1);
                 board.undo_move(m, undo);
@@ -1405,6 +1480,13 @@ unsafe {
                 }
             }
 
+            if (ply as usize) < MAX_PLY {
+                self.played_moves[ply as usize] = m;
+                self.played_pieces[ply as usize] = board.piece_on[m.from()];
+                self.prev_in_check[ply as usize] = false;
+                self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
+                    || m.move_type() == MoveType::EnPassant;
+            }
             let undo = board.make_move(m);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1);
             board.undo_move(m, undo);

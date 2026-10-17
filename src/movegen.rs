@@ -13,8 +13,10 @@ pub fn generate_legal_moves(board: &Board) -> MoveList {
     generate_noisy_pseudo(board, &mut pseudo);
     generate_quiet_pseudo(board, &mut pseudo);
 
+    let checkers = board.checkers();
+    let pinned = board.pinned_pieces(board.side_to_move);
     for &m in pseudo.as_slice() {
-        if board.is_legal(m) {
+        if board.is_legal_with(m, checkers, pinned) {
             list.push(m);
         }
     }

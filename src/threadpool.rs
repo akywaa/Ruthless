@@ -15,13 +15,13 @@ pub struct SearchParams {
     pub soft_time: Option<u128>,
     pub hard_time: Option<u128>,
     pub stop: Arc<AtomicBool>,
+    pub clear_histories: bool,
 }
 
 #[derive(Clone)]
 pub enum Command {
     Idle,
     Search(SearchParams),
-    Clear,
     Exit,
 }
 
@@ -39,6 +39,7 @@ pub struct ThreadPool {
     stop_signal: Arc<AtomicBool>,
     active_helpers: Arc<AtomicU64>,
     num_threads: usize,
+    clear_pending: bool,
 }
 
 impl ThreadPool {
@@ -56,8 +57,6 @@ impl ThreadPool {
             Arc::clone(&shared_nodes),
         );
 
-        bind_thread(0);
-
         let mut pool = Self {
             tt,
             main_searcher,
@@ -73,6 +72,7 @@ impl ThreadPool {
             stop_signal,
             active_helpers,
             num_threads: 1, // Resized correctly below
+            clear_pending: false,
         };
 
         pool.set_threads(num_threads);
@@ -154,13 +154,15 @@ impl ThreadPool {
 
                     match command {
                         Command::Search(params) => {
+                            if params.clear_histories {
+                                helper.clear_histories();
+                            }
                             let mut board_clone = params.board;
                             helper.stop = Arc::clone(&params.stop);
                             active_clone.fetch_add(1, Ordering::Relaxed);
                             helper.search_helper(&mut board_clone, params.depth, params.soft_time);
                             active_clone.fetch_sub(1, Ordering::Relaxed);
                         }
-                        Command::Clear => helper.clear(),
                         Command::Exit => return,
                         Command::Idle => unreachable!(),
                     }
@@ -172,14 +174,8 @@ impl ThreadPool {
     }
 
     pub fn clear(&mut self) {
-        self.tt.clear();
         self.main_searcher.clear();
-
-        let (lock, cvar) = &*self.shared_state;
-        let mut state = lock.lock().unwrap();
-        state.command = Command::Clear;
-        state.generation += 1;
-        cvar.notify_all();
+        self.clear_pending = true;
     }
 
     pub fn new_search_stop(&mut self) -> Arc<AtomicBool> {
@@ -197,7 +193,11 @@ impl ThreadPool {
             std::thread::yield_now();
         }
 
+        bind_thread(0);
         self.shared_nodes.store(0, Ordering::Relaxed);
+
+        let clear_histories = self.clear_pending;
+        self.clear_pending = false;
 
         let params = SearchParams {
             board: board.clone(),
@@ -205,6 +205,7 @@ impl ThreadPool {
             soft_time: limits.soft_limit,
             hard_time: limits.hard_limit,
             stop: Arc::clone(&self.stop_signal),
+            clear_histories,
         };
 
         // Wake up sleeping helpers instantly

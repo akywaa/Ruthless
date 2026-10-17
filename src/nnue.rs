@@ -90,7 +90,7 @@ impl Accumulator {
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx2",
-            not(target_feature = "avx512f")
+            not(all(target_feature = "avx512f", target_feature = "avx512bw"))
         ))]
         {
             unsafe {
@@ -145,7 +145,7 @@ impl Accumulator {
         #[cfg(all(
             target_arch = "x86_64",
             target_feature = "avx2",
-            not(target_feature = "avx512f")
+            not(all(target_feature = "avx512f", target_feature = "avx512bw"))
         ))]
         {
             unsafe {
@@ -272,7 +272,7 @@ pub fn evaluate(board: &Board) -> i32 {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx2",
-        not(target_feature = "avx512f")
+        not(all(target_feature = "avx512f", target_feature = "avx512bw"))
     ))]
     {
         unsafe {

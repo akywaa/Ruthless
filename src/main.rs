@@ -27,7 +27,12 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "bench" {
-        uci::run_bench_cli();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(uci::run_bench_cli)
+            .unwrap()
+            .join()
+            .unwrap();
         return;
     }
 

@@ -1,3 +1,4 @@
+use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
 use crate::movegen::{generate_noisy_pseudo, generate_quiet_pseudo};
@@ -29,6 +30,9 @@ pub struct MovePicker {
     cur_idx: usize,
     bad_noisy: MoveList,
     qsearch: bool,
+    checkers: Bitboard,
+    pinned: Bitboard,
+    king_info_ready: bool,
 }
 
 impl MovePicker {
@@ -44,6 +48,9 @@ impl MovePicker {
             cur_idx: 0,
             bad_noisy: MoveList::new(),
             qsearch: false,
+            checkers: Bitboard::EMPTY,
+            pinned: Bitboard::EMPTY,
+            king_info_ready: false,
         }
     }
 
@@ -59,7 +66,25 @@ impl MovePicker {
             cur_idx: 0,
             bad_noisy: MoveList::new(),
             qsearch: true,
+            checkers: Bitboard::EMPTY,
+            pinned: Bitboard::EMPTY,
+            king_info_ready: false,
         }
+    }
+
+    #[inline(always)]
+    fn ensure_king_info(&mut self, board: &Board) {
+        if !self.king_info_ready {
+            self.checkers = board.checkers();
+            self.pinned = board.pinned_pieces(board.side_to_move);
+            self.king_info_ready = true;
+        }
+    }
+
+    #[inline(always)]
+    fn is_legal(&mut self, board: &Board, m: Move) -> bool {
+        self.ensure_king_info(board);
+        board.is_legal_with(m, self.checkers, self.pinned)
     }
 
     pub fn next(
@@ -86,7 +111,7 @@ impl MovePicker {
 
                     if (!self.qsearch || is_noisy)
                         && self.is_pseudo_legal_any(board, m)
-                        && board.is_legal(m)
+                        && self.is_legal(board, m)
                     {
                         return Some(m);
                     }
@@ -105,8 +130,17 @@ impl MovePicker {
                             continue;
                         }
 
+                        // Underpromotions are a full-depth concern; searching all
+                        // four in the quiescence tree only costs nodes.
+                        if self.qsearch
+                            && m.move_type() == MoveType::Promotion
+                            && m.promo_type() != PieceType::Queen
+                        {
+                            continue;
+                        }
+
                         if see(board, m, 0) {
-                            if board.is_legal(m) {
+                            if self.is_legal(board, m) {
                                 return Some(m);
                             }
                         } else {
@@ -128,7 +162,7 @@ impl MovePicker {
                             && k != self.tt_move
                             && !(self.killer_idx == 2 && k == self.killers[0])
                             && self.is_pseudo_legal(board, k)
-                            && board.is_legal(k)
+                            && self.is_legal(board, k)
                         {
                             return Some(k);
                         }
@@ -143,7 +177,7 @@ impl MovePicker {
                         && cm != self.killers[0]
                         && cm != self.killers[1]
                         && self.is_pseudo_legal(board, cm)
-                        && board.is_legal(cm)
+                        && self.is_legal(board, cm)
                     {
                         return Some(cm);
                     }
@@ -171,7 +205,7 @@ impl MovePicker {
                         if m == self.tt_move || m == self.killers[0] || m == self.killers[1] || m == self.counter_move {
                             continue;
                         }
-                        if board.is_legal(m) {
+                        if self.is_legal(board, m) {
                             return Some(m);
                         }
                     }
@@ -182,7 +216,7 @@ impl MovePicker {
                     while self.cur_idx < self.bad_noisy.count {
                         let m = self.bad_noisy.moves[self.cur_idx];
                         self.cur_idx += 1;
-                        if m != self.tt_move && board.is_legal(m) {
+                        if m != self.tt_move && self.is_legal(board, m) {
                             return Some(m);
                         }
                     }

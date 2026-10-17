@@ -3,16 +3,41 @@ use crate::movegen::generate_legal_moves;
 use crate::threadpool::ThreadPool;
 use crate::time::{TimeControl, TimeLimits, TimeManager};
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 pub fn uci_loop() {
     let mut board = Board::default();
     let pool = Arc::new(Mutex::new(ThreadPool::new(32, 1)));
     let mut stop = pool.lock().unwrap().new_search_stop();
-    let mut search: Option<JoinHandle<()>> = None;
+    let mut pending_stop: Option<Arc<AtomicBool>> = None;
     let stdin = io::stdin();
+
+    let (go_tx, go_rx) = mpsc::channel::<(Board, u8, TimeControl, bool, Arc<AtomicBool>)>();
+    let search_pool = Arc::clone(&pool);
+
+    let _search_thread = thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            while let Ok((mut search_board, depth, tc, wait_for_stop, thread_release)) = go_rx.recv()
+            {
+                let limits = TimeManager::allocate(&search_board, &tc);
+                let best_move = search_pool
+                    .lock()
+                    .unwrap()
+                    .start_search(&mut search_board, depth, limits);
+
+                while wait_for_stop && !thread_release.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+
+                println!("bestmove {}", best_move);
+                let _ = io::stdout().flush();
+            }
+        })
+        .unwrap();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -37,12 +62,12 @@ pub fn uci_loop() {
                 println!("option name NmpBase type spin default 3 min 1 max 6");
                 println!("option name NmpEvalDiv type spin default 200 min 50 max 500");
                 println!("option name SyzygyPath type string default <empty>");
+                println!("option name NumaBind type check default false");
                 println!("uciok");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             "setoption" => {
-                stop.store(true, Ordering::Relaxed);
-                join_search(&mut search);
+                halt(&stop, &mut pending_stop);
                 handle_setoption(&tokens[1..], &mut pool.lock().unwrap());
             }
             "eval" => {
@@ -53,8 +78,7 @@ pub fn uci_loop() {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             "ucinewgame" => {
-                stop.store(true, Ordering::Relaxed);
-                join_search(&mut search);
+                halt(&stop, &mut pending_stop);
                 pool.lock().unwrap().clear();
                 board = Board::default();
             }
@@ -62,53 +86,40 @@ pub fn uci_loop() {
                 handle_position(&mut board, &tokens[1..]);
             }
             "go" => {
-                stop.store(true, Ordering::Relaxed);
-                join_search(&mut search);
+                halt(&stop, &mut pending_stop);
                 stop = pool.lock().unwrap().new_search_stop();
 
-                let (depth, tc) = parse_go(&tokens[1..]);
-                let mut search_board = board.clone();
-                let search_pool = Arc::clone(&pool);
+                let (depth, tc, wait_for_stop) = parse_go(&tokens[1..]);
+                let release = Arc::new(AtomicBool::new(false));
+                if wait_for_stop {
+                    pending_stop = Some(Arc::clone(&release));
+                }
 
-                search = Some(
-                    thread::Builder::new()
-                        .stack_size(64 * 1024 * 1024)
-                        .spawn(move || {
-                            let limits = TimeManager::allocate(&search_board, &tc);
-                            let best_move = search_pool
-                                .lock()
-                                .unwrap()
-                                .start_search(&mut search_board, depth, limits);
-                            println!("bestmove {}", best_move);
-                            let _ = io::stdout().flush();
-                        })
-                        .unwrap(),
-                );
+                let _ = go_tx.send((board.clone(), depth, tc, wait_for_stop, release));
             }
             "stop" => {
-                stop.store(true, Ordering::Relaxed);
+                halt(&stop, &mut pending_stop);
             }
             "bench" => {
-                stop.store(true, Ordering::Relaxed);
-                join_search(&mut search);
+                halt(&stop, &mut pending_stop);
                 run_bench(&mut pool.lock().unwrap());
             }
             "quit" => {
-                stop.store(true, Ordering::Relaxed);
+                halt(&stop, &mut pending_stop);
                 break;
             }
             _ => {}
         }
     }
 
-    stop.store(true, Ordering::Relaxed);
-    join_search(&mut search);
+    halt(&stop, &mut pending_stop);
 }
 
-fn join_search(search: &mut Option<JoinHandle<()>>) {
-    if let Some(handle) = search.take() {
-        let _ = handle.join();
+fn halt(stop: &Arc<AtomicBool>, pending_stop: &mut Option<Arc<AtomicBool>>) {
+    if let Some(flag) = pending_stop.take() {
+        flag.store(true, Ordering::Relaxed);
     }
+    stop.store(true, Ordering::Relaxed);
 }
 
 fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
@@ -130,7 +141,6 @@ fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
             }
             name.push_str(t);
         } else if is_value {
-            // Keep internal spaces (e.g. tablesbase paths like "C:\\My Tables").
             if !value.is_empty() {
                 value.push(' ');
             }
@@ -169,6 +179,9 @@ fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
         }
         "syzygypath" => {
             crate::syzygy::init(&value);
+        }
+        "numabind" => {
+            crate::numa::set_bind_enabled(value.eq_ignore_ascii_case("true"));
         }
         _ => {}
     }
@@ -213,13 +226,17 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
     }
 }
 
-fn parse_go(tokens: &[&str]) -> (u8, TimeControl) {
+fn parse_go(tokens: &[&str]) -> (u8, TimeControl, bool) {
     let mut depth: u8 = 64;
     let mut tc = TimeControl::default();
+    let mut wait_for_stop = false;
 
     let mut i = 0;
     while i < tokens.len() {
         match tokens[i] {
+            "infinite" | "ponder" => {
+                wait_for_stop = true;
+            }
             "depth" => {
                 if let Some(val) = tokens.get(i + 1).and_then(|s| s.parse().ok()) {
                     depth = val;
@@ -257,7 +274,7 @@ fn parse_go(tokens: &[&str]) -> (u8, TimeControl) {
         i += 1;
     }
 
-    (depth, tc)
+    (depth, tc, wait_for_stop)
 }
 
 pub fn run_bench_cli() {

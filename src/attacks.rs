@@ -45,16 +45,18 @@ pub fn king_attacks(sq: Square) -> Bitboard {
 
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
-    let m = &attacks().bishop_magics[sq as usize];
+    let tables = attacks();
+    let m = &tables.bishop_magics[sq as usize];
     let idx = crate::setwise::pext_slider_idx(occ.0, m.mask, m.offset, m.shift, m.magic);
-    attacks().slider_table[idx]
+    tables.slider_table[idx]
 }
 
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
-    let m = &attacks().rook_magics[sq as usize];
+    let tables = attacks();
+    let m = &tables.rook_magics[sq as usize];
     let idx = crate::setwise::pext_slider_idx(occ.0, m.mask, m.offset, m.shift, m.magic);
-    attacks().slider_table[idx]
+    tables.slider_table[idx]
 }
 
 #[allow(dead_code)]

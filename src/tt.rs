@@ -78,7 +78,8 @@ unsafe impl Send for TranspositionTable {}
 impl TranspositionTable {
     pub fn new(mb: usize) -> Self {
         let size_bytes = mb * 1024 * 1024;
-        let cluster_count = (size_bytes / std::mem::size_of::<Cluster>()).next_power_of_two();
+        let wanted = (size_bytes / std::mem::size_of::<Cluster>()).max(1);
+        let cluster_count = 1usize << (usize::BITS - 1 - wanted.leading_zeros());
         let mask = cluster_count - 1;
 
         let clusters = (0..cluster_count).map(|_| Cluster::empty()).collect();

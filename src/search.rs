@@ -1182,7 +1182,7 @@ unsafe {
         }
 
         if excluded_move == Move::NULL && !self.stop.load(Ordering::Relaxed) {
-            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), depth, flag, best_move, raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), depth, flag, best_move, raw_eval.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16);
 
             let tt_move_quiet = best_move == Move::NULL
                 || (board.piece_on[best_move.to()] == Piece::None
@@ -1191,6 +1191,7 @@ unsafe {
 
             if !in_check
                 && tt_move_quiet
+                && best_score.abs() < MATE_SCORE - MAX_PLY as i32
                 && !(flag == TTFlag::LowerBound && best_score <= static_eval)
                 && !(flag == TTFlag::UpperBound && best_score >= static_eval)
             {
@@ -1303,7 +1304,7 @@ unsafe {
         let raw_eval_to_store = if in_check {
             crate::tt::RAW_EVAL_NONE
         } else {
-            raw_eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+            raw_eval.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16
         };
 
         if in_check {

@@ -484,8 +484,26 @@ impl Board {
         let ksq = self.king_square(!us);
         let from = m.from();
         let to = m.to();
-        let pt = self.piece_on[from].piece_type();
         let occ = (self.occupied ^ Bitboard::from_square(from)) | Bitboard::from_square(to);
+
+        if m.move_type() == MoveType::Castling {
+            let (rook_from, rook_to) = match to {
+                Square::G1 => (Square::H1, Square::F1),
+                Square::C1 => (Square::A1, Square::D1),
+                Square::G8 => (Square::H8, Square::F8),
+                Square::C8 => (Square::A8, Square::D8),
+                _ => return false,
+            };
+            let rook_occ =
+                (occ ^ Bitboard::from_square(rook_from)) | Bitboard::from_square(rook_to);
+            return rook_attacks(rook_to, rook_occ).contains(ksq);
+        }
+
+        let pt = if m.move_type() == MoveType::Promotion {
+            m.promo_type()
+        } else {
+            self.piece_on[from].piece_type()
+        };
 
         match pt {
             PieceType::Knight => knight_attacks(to).contains(ksq),
@@ -997,6 +1015,27 @@ mod tests {
             }
         }
         panic!("move not found: {}", s);
+    }
+
+    #[test]
+    fn gives_direct_check_promotion_and_castling() {
+        let board = Board::from_fen("8/4k1P1/8/8/8/8/8/K7 w - - 0 1").unwrap();
+        let knight_promo = generate_legal_moves(&board)
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|m| m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Knight)
+            .unwrap();
+        assert!(board.gives_direct_check(knight_promo));
+
+        let castle = Board::from_fen("5k2/8/8/8/8/8/8/4K2R w K - 0 1").unwrap();
+        let castle_move = generate_legal_moves(&castle)
+            .as_slice()
+            .iter()
+            .copied()
+            .find(|m| m.move_type() == MoveType::Castling)
+            .unwrap();
+        assert!(castle.gives_direct_check(castle_move));
     }
 
     #[test]

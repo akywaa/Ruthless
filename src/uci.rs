@@ -61,6 +61,8 @@ pub fn uci_loop() {
                 println!("option name FutilityMargin type spin default 75 min 10 max 200");
                 println!("option name NmpBase type spin default 3 min 1 max 6");
                 println!("option name NmpEvalDiv type spin default 200 min 50 max 500");
+                println!("option name CorrWeight type spin default 148 min 20 max 400");
+                println!("option name CorrLimit type spin default 15 min 2 max 60");
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name NumaBind type check default false");
                 println!("uciok");
@@ -176,6 +178,12 @@ fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
         }
         "nmpevaldiv" => {
             if let Ok(v) = value.parse::<i32>() { crate::search::NMP_EVAL_DIV.store(v, Ordering::Relaxed); }
+        }
+        "corrweight" => {
+            if let Ok(v) = value.parse::<i32>() { crate::search::CORR_WEIGHT.store(v, Ordering::Relaxed); }
+        }
+        "corrlimit" => {
+            if let Ok(v) = value.parse::<i32>() { crate::search::CORR_LIMIT.store(v, Ordering::Relaxed); }
         }
         "syzygypath" => {
             crate::syzygy::init(&value);

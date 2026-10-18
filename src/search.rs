@@ -23,6 +23,8 @@ pub static FUTILITY_BASE: AtomicI32 = AtomicI32::new(70);
 pub static FUTILITY_MARGIN: AtomicI32 = AtomicI32::new(75);
 pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
 pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(200);
+pub static CORR_WEIGHT: AtomicI32 = AtomicI32::new(148);
+pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(15);
 
 static LMR: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
 
@@ -246,7 +248,8 @@ unsafe {
             }
         }
         let total_bonus = pawn_term + np_term + cont_term;
-        let mut eval = raw + (total_bonus / 256).clamp(-15, 15);
+        let limit = CORR_LIMIT.load(Ordering::Relaxed);
+        let mut eval = raw + (total_bonus / 256).clamp(-limit, limit);
 
         // Scale evaluation towards draw near 50-move rule
         eval = eval * (200 - board.halfmove_clock as i32) / 200;
@@ -1260,7 +1263,8 @@ unsafe {
             {
                 let diff = best_score - static_eval;
                 // Reckless formula for precise eval correction scaling
-                let bonus = (148 * (depth as i32) * diff / 128).clamp(-1200, 1200);
+                let weight = CORR_WEIGHT.load(Ordering::Relaxed);
+                let bonus = (weight * (depth as i32) * diff / 128).clamp(-1200, 1200);
                 let side = board.side_to_move as usize;
                 let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
 

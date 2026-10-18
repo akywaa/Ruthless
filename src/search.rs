@@ -17,23 +17,27 @@ pub const MAX_PLY: usize = 128;
 pub const CORR_ENTRIES: usize = 16384;
 pub const CORR_BUCKETS: usize = 8;
 
+/// SPSA tuning: parameters identified through hyperbullet game analysis
+/// - 20000 games: RFP_BASE, RFP_IMPROVING, FUTILITY_BASE, FUTILITY_MARGIN, NMP_BASE, NMP_EVAL_DIV
+/// - 4000 games: CORR_WEIGHT, CORR_LIMIT
 pub static RFP_BASE: AtomicI32 = AtomicI32::new(80);
 pub static RFP_IMPROVING: AtomicI32 = AtomicI32::new(20);
 pub static FUTILITY_BASE: AtomicI32 = AtomicI32::new(70);
 pub static FUTILITY_MARGIN: AtomicI32 = AtomicI32::new(75);
 pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
 pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(200);
-pub static CORR_WEIGHT: AtomicI32 = AtomicI32::new(148);
-pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(15);
+pub static CORR_WEIGHT: AtomicI32 = AtomicI32::new(153);
+pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(13);
+pub static LMR_BASE: AtomicI32 = AtomicI32::new(0);
+pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(240);
 
-static LMR: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
+static LN_TABLE: OnceLock<[[f32; 64]; 64]> = OnceLock::new();
 
-fn init_lmr() -> [[i32; 64]; 64] {
-    let mut table = [[0; 64]; 64];
+fn init_ln_table() -> [[f32; 64]; 64] {
+    let mut table = [[0.0; 64]; 64];
     for d in 1..64 {
         for m in 1..64 {
-            let base = ((d as f64).ln() * (m as f64).ln()) / 2.4;
-            table[d][m] = (base as i32).max(1);
+            table[d][m] = (d as f32).ln() * (m as f32).ln();
         }
     }
     table
@@ -41,8 +45,10 @@ fn init_lmr() -> [[i32; 64]; 64] {
 
 #[inline(always)]
 fn lmr(depth: usize, move_count: usize) -> i32 {
-    let table = LMR.get_or_init(init_lmr);
-    table[depth.min(63)][move_count.min(63)]
+    let ln_prod = LN_TABLE.get_or_init(init_ln_table)[depth.min(63)][move_count.min(63)];
+    let base = LMR_BASE.load(Ordering::Relaxed) as f32 / 100.0;
+    let div = (LMR_DIVISOR.load(Ordering::Relaxed) as f32 / 100.0).max(0.1);
+    ((base + ln_prod / div) as i32).max(1)
 }
 
 pub struct Searcher {

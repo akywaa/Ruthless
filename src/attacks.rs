@@ -4,11 +4,13 @@ use std::sync::OnceLock;
 
 pub struct Magic {
     pub mask: u64,
-    // Only consulted on non-BMI2 builds, where the index is a magic
-    // multiply-shift; with BMI2 the index is a PEXT of `mask`.
     pub magic: u64,
     pub shift: u8,
-    pub offset: usize,
+    // The same attack set is stored twice: once in magic multiply-shift order
+    // and once in compressed (PEXT) order. Which one is used is decided once at
+    // startup, see `setwise::detect_slider_style`.
+    pub magic_offset: usize,
+    pub pext_offset: usize,
 }
 
 pub struct AttackTables {
@@ -17,7 +19,8 @@ pub struct AttackTables {
     pub king_attacks: [Bitboard; SQUARE_NB],
     pub bishop_magics: [Magic; SQUARE_NB],
     pub rook_magics: [Magic; SQUARE_NB],
-    pub slider_table: Vec<Bitboard>,
+    pub slider_magic: Vec<Bitboard>,
+    pub slider_pext: Vec<Bitboard>,
     pub between: [[Bitboard; SQUARE_NB]; SQUARE_NB],
 }
 
@@ -47,16 +50,26 @@ pub fn king_attacks(sq: Square) -> Bitboard {
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let tables = attacks();
     let m = &tables.bishop_magics[sq as usize];
-    let idx = crate::setwise::pext_slider_idx(occ.0, m.mask, m.offset, m.shift, m.magic);
-    tables.slider_table[idx]
+    if crate::setwise::use_pext() {
+        tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)]
+    } else {
+        tables.slider_magic[
+            m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)
+        ]
+    }
 }
 
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let tables = attacks();
     let m = &tables.rook_magics[sq as usize];
-    let idx = crate::setwise::pext_slider_idx(occ.0, m.mask, m.offset, m.shift, m.magic);
-    tables.slider_table[idx]
+    if crate::setwise::use_pext() {
+        tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)]
+    } else {
+        tables.slider_magic[
+            m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)
+        ]
+    }
 }
 
 #[allow(dead_code)]
@@ -89,6 +102,8 @@ impl Prng {
 
 impl AttackTables {
     fn init() -> Self {
+        crate::setwise::detect_slider_style();
+
         let mut pawn_attacks = [[Bitboard::EMPTY; SQUARE_NB]; 2];
         let mut knight_attacks = [Bitboard::EMPTY; SQUARE_NB];
         let mut king_attacks = [Bitboard::EMPTY; SQUARE_NB];
@@ -126,11 +141,22 @@ impl AttackTables {
             king_attacks[sq] = Bitboard(kg);
         }
 
-        let mut slider_table = Vec::with_capacity(107648);
+        let mut slider_magic = Vec::with_capacity(107648);
+        let mut slider_pext = Vec::with_capacity(107648);
         let mut prng = Prng(1070372);
 
-        let (bishop_magics, _) = Self::init_slider(true, &mut slider_table, &mut prng);
-        let (rook_magics, _) = Self::init_slider(false, &mut slider_table, &mut prng);
+        let bishop_magics = Self::init_slider(
+            true,
+            &mut slider_magic,
+            &mut slider_pext,
+            &mut prng,
+        );
+        let rook_magics = Self::init_slider(
+            false,
+            &mut slider_magic,
+            &mut slider_pext,
+            &mut prng,
+        );
 
         let mut between = [[Bitboard::EMPTY; SQUARE_NB]; SQUARE_NB];
         for sq1 in 0..64 {
@@ -165,17 +191,27 @@ impl AttackTables {
             king_attacks,
             bishop_magics,
             rook_magics,
-            slider_table,
+            slider_magic,
+            slider_pext,
             between,
         }
     }
 
     fn init_slider(
         is_bishop: bool,
-        table: &mut Vec<Bitboard>,
+        magic_table: &mut Vec<Bitboard>,
+        pext_table: &mut Vec<Bitboard>,
         prng: &mut Prng,
-    ) -> ([Magic; SQUARE_NB], usize) {
-        let mut magics = [const { Magic { mask: 0, magic: 0, shift: 0, offset: 0 } }; SQUARE_NB];
+    ) -> [Magic; SQUARE_NB] {
+        let mut magics = [const {
+            Magic {
+                mask: 0,
+                magic: 0,
+                shift: 0,
+                magic_offset: 0,
+                pext_offset: 0,
+            }
+        }; SQUARE_NB];
 
         for sq in 0..64 {
             let mask = if is_bishop {
@@ -186,7 +222,8 @@ impl AttackTables {
             let bits = mask.count_ones() as u8;
             let size = 1usize << bits;
             let shift = 64 - bits;
-            let offset = table.len();
+            let magic_offset = magic_table.len();
+            let pext_offset = pext_table.len();
 
             let mut occupancies = vec![0u64; size];
             let mut attacks = vec![Bitboard::EMPTY; size];
@@ -200,7 +237,12 @@ impl AttackTables {
                 };
             }
 
-            table.resize(offset + size, Bitboard::EMPTY);
+            // The compressed layout is direct: `index_to_occupancy` guarantees
+            // that pext(occupancies[i], mask) == i, so slot i belongs to attacks[i].
+            pext_table.resize(pext_offset + size, Bitboard::EMPTY);
+            pext_table[pext_offset..pext_offset + size].copy_from_slice(&attacks);
+
+            magic_table.resize(magic_offset + size, Bitboard::EMPTY);
 
             loop {
                 let magic = prng.sparse();
@@ -208,34 +250,34 @@ impl AttackTables {
                     continue;
                 }
 
-                table[offset..offset + size].fill(Bitboard::EMPTY);
+                magic_table[magic_offset..magic_offset + size].fill(Bitboard::EMPTY);
                 let mut fail = false;
 
                 for i in 0..size {
-                    // On BMI2 the lookup is a PEXT of the relevant-mask bits, so
-                    // the table must be stored in compressed-index order.
-                    // `index_to_occupancy` guarantees pext(occupancies[i], mask) == i,
-                    // so the two layouts below are each self-consistent.
-                    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-                    let idx = offset + crate::setwise::compressed_index(occupancies[i], mask);
-                    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-                    let idx = offset + (((occupancies[i].wrapping_mul(magic)) >> shift) as usize);
-                    if table[idx] == Bitboard::EMPTY {
-                        table[idx] = attacks[i];
-                    } else if table[idx] != attacks[i] {
+                    let idx = magic_offset
+                        + (((occupancies[i].wrapping_mul(magic)) >> shift) as usize);
+                    if magic_table[idx] == Bitboard::EMPTY {
+                        magic_table[idx] = attacks[i];
+                    } else if magic_table[idx] != attacks[i] {
                         fail = true;
                         break;
                     }
                 }
 
                 if !fail {
-                    magics[sq] = Magic { mask, magic, shift, offset };
+                    magics[sq] = Magic {
+                        mask,
+                        magic,
+                        shift,
+                        magic_offset,
+                        pext_offset,
+                    };
                     break;
                 }
             }
         }
 
-        (magics, table.len())
+        magics
     }
 
     fn index_to_occupancy(index: usize, bits: u8, mut mask: u64) -> u64 {

@@ -124,7 +124,10 @@ impl Board {
 
             for ch in rank_str.chars() {
                 if let Some(digit) = ch.to_digit(10) {
-                    file += digit as u8;
+                    file = file.saturating_add(digit as u8);
+                    if file > 8 {
+                        return Err("Too many squares in a FEN rank".to_string());
+                    }
                 } else {
                     if file >= 8 {
                         return Err("Invalid file index in FEN".to_string());
@@ -176,6 +179,30 @@ impl Board {
             }
         }
 
+        // A FEN may claim castling rights whose king or rook is not on its
+        // home square. Keeping such a right would later place a Piece::None on
+        // the board during castling, which indexes out of bounds.
+        let mut rights = board.castling_rights;
+        if board.piece_on[Square::E1] != Piece::WhiteKing {
+            rights &= !(Self::CASTLE_WK | Self::CASTLE_WQ);
+        }
+        if board.piece_on[Square::H1] != Piece::WhiteRook {
+            rights &= !Self::CASTLE_WK;
+        }
+        if board.piece_on[Square::A1] != Piece::WhiteRook {
+            rights &= !Self::CASTLE_WQ;
+        }
+        if board.piece_on[Square::E8] != Piece::BlackKing {
+            rights &= !(Self::CASTLE_BK | Self::CASTLE_BQ);
+        }
+        if board.piece_on[Square::H8] != Piece::BlackRook {
+            rights &= !Self::CASTLE_BK;
+        }
+        if board.piece_on[Square::A8] != Piece::BlackRook {
+            rights &= !Self::CASTLE_BQ;
+        }
+        board.castling_rights = rights;
+
         if parts.len() > 3 {
             board.ep_square = match parts[3] {
                 "-" => Square::None,
@@ -201,17 +228,28 @@ impl Board {
         }
 
         if parts.len() > 4 {
-            board.halfmove_clock = parts[4].parse().unwrap_or(0);
+            // The clock is stored in a u8 and is only meaningful up to the
+            // fifty-move limit, so anything larger is clamped.
+            board.halfmove_clock = parts[4].parse::<u32>().unwrap_or(0).min(255) as u8;
         }
 
         if parts.len() > 5 {
-            board.fullmove_number = parts[5].parse().unwrap_or(1);
+            board.fullmove_number = parts[5].parse::<u16>().unwrap_or(1).max(1);
         }
 
         if board.pieces[Piece::WhiteKing].count() != 1
             || board.pieces[Piece::BlackKing].count() != 1
         {
             return Err("FEN must contain exactly one king per side".to_string());
+        }
+
+        // The side that just moved may not be left in check: otherwise the
+        // search could capture a king and king_square would return Square::None.
+        if board.is_square_attacked(
+            board.king_square(!board.side_to_move),
+            board.side_to_move,
+        ) {
+            return Err("FEN has the side not to move in check".to_string());
         }
 
         board.hash = board.compute_hash();
@@ -796,7 +834,20 @@ impl Board {
                 // Build a pseudo-legal move and strictly verify it (king safety).
                 let m = crate::types::Move::new(from, to, crate::types::PieceType::None, crate::types::MoveType::Normal);
                 if self.is_pseudo_legal(m) && self.is_legal(m) {
-                    return true;
+                    // A repeat inside the search tree is a draw immediately;
+                    // one that predates the root is only a draw once the older
+                    // position has itself occurred before.
+                    if index >= self.root_ply {
+                        return true;
+                    }
+                    let repeated_key = self.history[index];
+                    let mut j = index;
+                    while j >= 2 {
+                        j -= 2;
+                        if self.history[j] == repeated_key {
+                            return true;
+                        }
+                    }
                 }
             }
 
@@ -878,7 +929,7 @@ impl Board {
             self.ep_square = Square::None;
         }
 
-        self.halfmove_clock += 1;
+        self.halfmove_clock = self.halfmove_clock.saturating_add(1);
         if moving_piece.piece_type() == PieceType::Pawn || undo.captured != Piece::None {
             self.halfmove_clock = 0;
         }
@@ -968,7 +1019,7 @@ impl Board {
         }
 
         if us == Color::Black {
-            self.fullmove_number += 1;
+            self.fullmove_number = self.fullmove_number.saturating_add(1);
         }
         self.side_to_move = them;
         self.hash ^= side_key();
@@ -983,7 +1034,7 @@ impl Board {
         let us = self.side_to_move;
 
         if us == Color::Black {
-            self.fullmove_number -= 1;
+            self.fullmove_number = self.fullmove_number.saturating_sub(1);
         }
 
         let from = m.from();
@@ -1098,6 +1149,29 @@ mod tests {
         let board = Board::from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1").unwrap();
         let fake = Move::new(Square::H1, Square::G1, PieceType::None, MoveType::Castling);
         assert!(!board.is_pseudo_legal(fake));
+    }
+
+    #[test]
+    fn fen_drops_castling_rights_without_pieces() {
+        // No rook on a1 and no rook on h1: neither white right may survive.
+        let board = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w KQkq - 0 1").unwrap();
+        assert_eq!(board.castling_rights, 0);
+
+        // Kingside right is real (rook on h1), queenside is not (no rook on a1).
+        let board = Board::from_fen("4k3/8/8/8/8/8/8/4K2R w KQ - 0 1").unwrap();
+        assert_eq!(board.castling_rights, Board::CASTLE_WK);
+
+        // King off its home square invalidates both rights for that side.
+        let board = Board::from_fen("4k3/8/8/8/8/8/8/3K3R w KQ - 0 1").unwrap();
+        assert_eq!(board.castling_rights, 0);
+    }
+
+    #[test]
+    fn fen_rejects_side_not_to_move_in_check() {
+        // Black is not to move but is attacked by the rook on e2.
+        assert!(Board::from_fen("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1").is_err());
+        // The side to move is allowed to be in check.
+        assert!(Board::from_fen("4k3/8/8/8/8/8/4R3/4K3 b - - 0 1").is_ok());
     }
 
     #[test]

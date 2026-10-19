@@ -3,7 +3,7 @@ use crate::board::Board;
 use crate::eval::PIECE_VALUES;
 use crate::movegen::{generate_noisy_pseudo, generate_quiet_pseudo};
 use crate::see::see;
-use crate::search::MAX_PLY;
+use crate::search::{ContHist, MAX_PLY};
 use crate::types::{Move, MoveList, MoveType, Piece, PieceType};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -33,6 +33,10 @@ pub struct MovePicker {
     checkers: Bitboard,
     pinned: Bitboard,
     king_info_ready: bool,
+    /// Whether the move returned by the last `next()` call is a capture with
+    /// SEE >= 0. Cached here so the search does not have to run SEE a second
+    /// time on the same move.
+    pub last_see_ge_zero: bool,
 }
 
 impl MovePicker {
@@ -51,6 +55,7 @@ impl MovePicker {
             checkers: Bitboard::EMPTY,
             pinned: Bitboard::EMPTY,
             king_info_ready: false,
+            last_see_ge_zero: true,
         }
     }
 
@@ -69,6 +74,7 @@ impl MovePicker {
             checkers: Bitboard::EMPTY,
             pinned: Bitboard::EMPTY,
             king_info_ready: false,
+            last_see_ge_zero: true,
         }
     }
 
@@ -92,13 +98,11 @@ impl MovePicker {
         board: &Board,
         history: &[[[i32; 64]; 64]; 2],
         pawn_history: &[[[i32; 64]; 12]; 512],
-        conthist: &[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4],
+        conthist: &ContHist,
         noisy_history: &[[[[i32; 2]; 6]; 64]; 12],
         ply: u8,
         played_pieces: &[Piece; MAX_PLY],
         played_moves: &[Move; MAX_PLY],
-        prev_in_check: &[bool; MAX_PLY],
-        prev_is_capture: &[bool; MAX_PLY],
     ) -> Option<Move> {
         loop {
             match self.stage {
@@ -113,6 +117,9 @@ impl MovePicker {
                         && self.is_pseudo_legal_any(board, m)
                         && self.is_legal(board, m)
                     {
+                        // SEE is not evaluated for the TT move; assume a good
+                        // capture so LMR stays conservative.
+                        self.last_see_ge_zero = true;
                         return Some(m);
                     }
                 }
@@ -141,6 +148,7 @@ impl MovePicker {
 
                         if see(board, m, 0) {
                             if self.is_legal(board, m) {
+                                self.last_see_ge_zero = true;
                                 return Some(m);
                             }
                         } else {
@@ -164,6 +172,7 @@ impl MovePicker {
                             && self.is_pseudo_legal(board, k)
                             && self.is_legal(board, k)
                         {
+                            self.last_see_ge_zero = true;
                             return Some(k);
                         }
                     }
@@ -179,6 +188,7 @@ impl MovePicker {
                         && self.is_pseudo_legal(board, cm)
                         && self.is_legal(board, cm)
                     {
+                        self.last_see_ge_zero = true;
                         return Some(cm);
                     }
                 }
@@ -193,8 +203,6 @@ impl MovePicker {
                         ply,
                         played_pieces,
                         played_moves,
-                        prev_in_check,
-                        prev_is_capture,
                     );
                     self.cur_idx = 0;
                     self.stage = Stage::Quiets;
@@ -206,6 +214,7 @@ impl MovePicker {
                             continue;
                         }
                         if self.is_legal(board, m) {
+                            self.last_see_ge_zero = true;
                             return Some(m);
                         }
                     }
@@ -217,6 +226,7 @@ impl MovePicker {
                         let m = self.bad_noisy.moves[self.cur_idx];
                         self.cur_idx += 1;
                         if m != self.tt_move && self.is_legal(board, m) {
+                            self.last_see_ge_zero = false;
                             return Some(m);
                         }
                     }
@@ -290,12 +300,10 @@ impl MovePicker {
         board: &Board,
         history: &[[[i32; 64]; 64]; 2],
         pawn_history: &[[[i32; 64]; 12]; 512],
-        conthist: &[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4],
+        conthist: &ContHist,
         ply: u8,
         played_pieces: &[Piece; MAX_PLY],
         played_moves: &[Move; MAX_PLY],
-        prev_in_check: &[bool; MAX_PLY],
-        prev_is_capture: &[bool; MAX_PLY],
     ) {
         let us = board.side_to_move;
         let pawn_threats = board.opponent_pawn_threats();
@@ -318,10 +326,12 @@ impl MovePicker {
                     let prev_idx = ply_idx - offset;
                     let prev_piece = played_pieces[prev_idx];
                     let prev_move = played_moves[prev_idx];
-                    if prev_piece != Piece::None && prev_move != Move::NULL {
-                        let chk = prev_in_check[prev_idx] as usize;
-                        let cap = prev_is_capture[prev_idx] as usize;
-                        score += conthist[layer][chk][cap][prev_piece as usize][prev_move.to() as usize][to as usize];
+                    if prev_piece != Piece::None
+                        && prev_move != Move::NULL
+                        && (piece as usize) < 12
+                    {
+                        score += conthist[layer][prev_piece as usize][prev_move.to() as usize]
+                            [piece as usize][to as usize] as i32;
                     }
                 }
             }

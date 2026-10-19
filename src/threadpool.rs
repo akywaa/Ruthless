@@ -217,6 +217,7 @@ impl ThreadPool {
             cvar.notify_all();
         }
 
+        self.main_searcher.fixed_time = limits.fixed;
         let best_move =
             self.main_searcher.search(board, depth, limits.soft_limit, limits.hard_limit);
 

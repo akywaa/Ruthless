@@ -16,6 +16,9 @@ pub struct TimeControl {
 pub struct TimeLimits {
     pub soft_limit: Option<u128>,
     pub hard_limit: Option<u128>,
+    /// True for `go movetime`, where the whole budget should be used instead of
+    /// being scaled down by search-stability heuristics.
+    pub fixed: bool,
 }
 
 pub struct TimeManager;
@@ -27,6 +30,7 @@ impl TimeManager {
             return TimeLimits {
                 soft_limit: Some(t),
                 hard_limit: Some(t),
+                fixed: true,
             };
         }
 
@@ -50,6 +54,7 @@ impl TimeManager {
                 return TimeLimits {
                     soft_limit: Some(soft),
                     hard_limit: Some(hard),
+                    fixed: false,
                 };
             }
 
@@ -75,11 +80,13 @@ impl TimeManager {
             TimeLimits {
                 soft_limit: Some(soft),
                 hard_limit: Some(hard),
+                fixed: false,
             }
         } else {
             TimeLimits {
                 soft_limit: None,
                 hard_limit: None,
+                fixed: false,
             }
         }
     }

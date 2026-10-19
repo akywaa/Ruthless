@@ -31,14 +31,18 @@ struct CacheEntry {
     data: AtomicU64,
 }
 
-impl Cluster {
-    fn empty() -> Self {
-        Self {
-            entries: std::array::from_fn(|_| CacheEntry {
-                key: AtomicU64::new(0),
-                data: AtomicU64::new(0),
-            }),
+/// Allocates zeroed clusters in one go. Zero is a valid state for every field
+/// (an all-zero key/data pair simply never matches), and allocating with
+/// `alloc_zeroed` lets the OS hand back pre-zeroed pages instead of touching
+/// every byte in user space, which matters for multi-gigabyte hash sizes.
+fn alloc_zeroed_clusters(count: usize) -> Box<[Cluster]> {
+    let layout = std::alloc::Layout::array::<Cluster>(count).expect("TT size overflow");
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout) as *mut Cluster;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
         }
+        Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, count))
     }
 }
 
@@ -67,8 +71,8 @@ fn age_of(data: u64) -> u8 {
 }
 
 pub struct TranspositionTable {
-    clusters: Vec<Cluster>,
-    mask: usize,
+    clusters: Box<[Cluster]>,
+    len: usize,
     generation: AtomicU8,
 }
 
@@ -77,18 +81,22 @@ unsafe impl Send for TranspositionTable {}
 
 impl TranspositionTable {
     pub fn new(mb: usize) -> Self {
-        let size_bytes = mb * 1024 * 1024;
-        let wanted = (size_bytes / std::mem::size_of::<Cluster>()).max(1);
-        let cluster_count = 1usize << (usize::BITS - 1 - wanted.leading_zeros());
-        let mask = cluster_count - 1;
-
-        let clusters = (0..cluster_count).map(|_| Cluster::empty()).collect();
+        let size_bytes = mb.max(1).saturating_mul(1024 * 1024);
+        let cluster_count = (size_bytes / std::mem::size_of::<Cluster>()).max(1);
 
         Self {
-            clusters,
-            mask,
+            clusters: alloc_zeroed_clusters(cluster_count),
+            len: cluster_count,
             generation: AtomicU8::new(0),
         }
+    }
+
+    /// Multiply-shift indexing: maps the full 64-bit key onto `0..len` and
+    /// honours exactly the requested size instead of rounding down to a power
+    /// of two (Hash 24000 no longer silently becomes 16384).
+    #[inline(always)]
+    fn index(&self, key: u64) -> usize {
+        ((key as u128 * self.len as u128) >> 64) as usize
     }
 
     #[inline(always)]
@@ -98,7 +106,7 @@ impl TranspositionTable {
 
     #[inline(always)]
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let idx = (key as usize) & self.mask;
+        let idx = self.index(key);
         let cluster = &self.clusters[idx];
 
         for entry in &cluster.entries {
@@ -137,7 +145,7 @@ impl TranspositionTable {
         best_move: Move,
         raw_eval: i16,
     ) {
-        let idx = (key as usize) & self.mask;
+        let idx = self.index(key);
         let cluster = &self.clusters[idx];
         let curr_gen = self.generation.load(Ordering::Relaxed) & 0x3F;
 

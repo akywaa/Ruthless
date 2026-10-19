@@ -1,2 +1,10 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Portable x86-64 baseline (SSE4.2 + POPCNT). Never default to
+# `target-cpu=native`: such a binary dies with "illegal instruction" on any
+# machine that lacks one of the build host's ISA extensions.
+#
+# Release builds for a specific microarchitecture level (see README):
+#   RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
+#   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+#   RUSTFLAGS="-C target-cpu=x86-64-v4" cargo build --release
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v2"]

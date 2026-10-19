@@ -8,7 +8,6 @@ use crate::tt::{TTFlag, TranspositionTable};
 use crate::types::{Move, MoveType, Piece, PieceType};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 pub const INFINITY: i32 = 32_500;
@@ -31,24 +30,33 @@ pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(13);
 pub static LMR_BASE: AtomicI32 = AtomicI32::new(0);
 pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(240);
 
-static LN_TABLE: OnceLock<[[f32; 64]; 64]> = OnceLock::new();
+/// Continuation history indexed by
+/// `[layer][previous piece][previous to][current piece][current to]`.
+/// The current piece is part of the key: a knight and a queen landing on the
+/// same square must not share statistics. Values are i16 because i32 for the
+/// full layout would cost ~19 MB per searcher.
+pub type ContHist = [[[[[i16; 64]; 12]; 64]; 12]; 4];
 
-fn init_ln_table() -> [[f32; 64]; 64] {
-    let mut table = [[0.0; 64]; 64];
-    for d in 1..64 {
-        for m in 1..64 {
-            table[d][m] = (d as f32).ln() * (m as f32).ln();
+// LMR reduction table. Rebuilt whenever the LMR tunables change so the hot
+// path is a single relaxed load instead of two atomic loads plus a float divide.
+const LMR_TABLE_LEN: usize = 64 * 64;
+static LMR_TABLE: [AtomicI32; LMR_TABLE_LEN] = [const { AtomicI32::new(1) }; LMR_TABLE_LEN];
+
+pub fn rebuild_lmr_table() {
+    let base = LMR_BASE.load(Ordering::Relaxed) as f32 / 100.0;
+    let div = (LMR_DIVISOR.load(Ordering::Relaxed) as f32 / 100.0).max(0.1);
+    for depth in 0..64 {
+        for moves in 0..64 {
+            let ln_prod = (depth as f32).ln() * (moves as f32).ln();
+            let r = ((base + ln_prod / div) as i32).max(1);
+            LMR_TABLE[depth * 64 + moves].store(r, Ordering::Relaxed);
         }
     }
-    table
 }
 
 #[inline(always)]
 fn lmr(depth: usize, move_count: usize) -> i32 {
-    let ln_prod = LN_TABLE.get_or_init(init_ln_table)[depth.min(63)][move_count.min(63)];
-    let base = LMR_BASE.load(Ordering::Relaxed) as f32 / 100.0;
-    let div = (LMR_DIVISOR.load(Ordering::Relaxed) as f32 / 100.0).max(0.1);
-    ((base + ln_prod / div) as i32).max(1)
+    LMR_TABLE[depth.min(63) * 64 + move_count.min(63)].load(Ordering::Relaxed)
 }
 
 pub struct Searcher {
@@ -62,18 +70,20 @@ pub struct Searcher {
     start_time: Instant,
     soft_time_ms: Option<u128>,
     hard_time_ms: Option<u128>,
+    // True when the budget came from `go movetime`, where dynamic scaling of
+    // the soft limit must not be applied.
+    pub fixed_time: bool,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     pawn_history: Box<[[[i32; 64]; 12]; 512]>,
     noisy_history: Box<[[[[i32; 2]; 6]; 64]; 12]>,
     counter_moves: [[Move; 64]; 64],
-    conthist: Box<[[[[[[i32; 64]; 64]; 12]; 2]; 2]; 4]>,
+    conthist: Box<ContHist>,
     pawn_corr: Box<[[[i16; CORR_ENTRIES]; 2]; CORR_BUCKETS]>,
     non_pawn_corr: Box<[[[[i16; CORR_ENTRIES]; 2]; 2]; CORR_BUCKETS]>,
     cont_corr: Box<[[[[i16; 64]; 12]; 64]; 12]>,
     played_moves: [Move; MAX_PLY],
     played_pieces: [Piece; MAX_PLY],
-    prev_in_check: [bool; MAX_PLY],
     prev_is_capture: [bool; MAX_PLY],
     eval_stack: [i32; MAX_PLY],
     root_move_nodes: [u64; 256],
@@ -90,6 +100,10 @@ pub struct Searcher {
 // Mate scores carry the distance to the root in their low bits, so the
 // threshold has to cover every ply the search can reach.
 const MATE_WINDOW: i32 = MATE_SCORE - MAX_PLY as i32;
+
+/// Marks an `eval_stack` slot whose stored value (a position in check) cannot
+/// be compared with a normal static evaluation.
+const EVAL_SENTINEL: i32 = i32::MIN;
 
 fn score_to_tt(score: i32, ply: u8) -> i32 {
     if score >= MATE_WINDOW {
@@ -118,6 +132,12 @@ fn update_history(val: &mut i32, bonus: i32) {
 }
 
 #[inline(always)]
+fn update_history_i16(val: &mut i16, bonus: i32) {
+    let update = bonus - (*val as i32 * bonus.abs()) / 16384;
+    *val = (*val as i32 + update).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+}
+
+#[inline(always)]
 fn update_corr(val: &mut i16, bonus: i32) {
     *val += (bonus - (*val as i32 * bonus.abs()) / 16384) as i16;
 }
@@ -141,6 +161,7 @@ impl Searcher {
         num_threads: usize,
         shared_nodes: Arc<AtomicU64>,
     ) -> Self {
+        rebuild_lmr_table();
         Self {
             tt,
             nodes: 0,
@@ -152,6 +173,7 @@ impl Searcher {
             start_time: Instant::now(),
             soft_time_ms: None,
             hard_time_ms: None,
+            fixed_time: false,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             pawn_history: alloc_box_zeroed(),
@@ -163,7 +185,6 @@ non_pawn_corr: alloc_box_zeroed(),
 cont_corr: alloc_box_zeroed(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
-            prev_in_check: [false; MAX_PLY],
             prev_is_capture: [false; MAX_PLY],
             eval_stack: [0; MAX_PLY],
             root_move_nodes: [0; 256],
@@ -194,7 +215,6 @@ unsafe {
 }
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
-        self.prev_in_check = [false; MAX_PLY];
         self.prev_is_capture = [false; MAX_PLY];
         self.eval_stack = [0; MAX_PLY];
         self.root_move_nodes = [0; 256];
@@ -266,7 +286,12 @@ unsafe {
     const CONT_OFFSETS: [usize; 4] = [1, 2, 4, 6];
 
     #[inline(always)]
-    fn get_conthist(&self, ply: u8, m: Move) -> i32 {
+    fn get_conthist(&self, board: &Board, ply: u8, m: Move) -> i32 {
+        let cur_piece = board.piece_on[m.from()] as usize;
+        if cur_piece >= 12 {
+            return 0;
+        }
+        let cur_to = m.to() as usize;
         let mut score = 0;
         let ply_idx = ply as usize;
         for (layer, &offset) in Self::CONT_OFFSETS.iter().enumerate() {
@@ -275,9 +300,8 @@ unsafe {
                 let prev_piece = self.played_pieces[prev_idx];
                 let prev_move = self.played_moves[prev_idx];
                 if prev_piece != Piece::None && prev_move != Move::NULL {
-                    let chk = self.prev_in_check[prev_idx] as usize;
-                    let cap = self.prev_is_capture[prev_idx] as usize;
-                    score += self.conthist[layer][chk][cap][prev_piece as usize][prev_move.to() as usize][m.to() as usize];
+                    score += self.conthist[layer][prev_piece as usize][prev_move.to() as usize]
+                        [cur_piece][cur_to] as i32;
                 }
             }
         }
@@ -297,7 +321,7 @@ unsafe {
 
         self.history[us][m.from() as usize][m.to() as usize]
             + self.pawn_history[p_idx][piece as usize][m.to() as usize]
-            + self.get_conthist(ply, m)
+            + self.get_conthist(board, ply, m)
     }
 
     #[inline(always)]
@@ -313,7 +337,12 @@ unsafe {
         self.noisy_history[moving_pc as usize][m.to() as usize][victim_pt as usize][to_threatened]
     }
 
-    fn update_conthist(&mut self, ply: u8, m: Move, bonus: i32) {
+    fn update_conthist(&mut self, ply: u8, cur_piece: Piece, m: Move, bonus: i32) {
+        if cur_piece == Piece::None {
+            return;
+        }
+        let cur_piece = cur_piece as usize;
+        let cur_to = m.to() as usize;
         let ply_idx = ply as usize;
         for (layer, &offset) in Self::CONT_OFFSETS.iter().enumerate() {
             if ply_idx >= offset {
@@ -321,10 +350,9 @@ unsafe {
                 let prev_piece = self.played_pieces[prev_idx];
                 let prev_move = self.played_moves[prev_idx];
                 if prev_piece != Piece::None && prev_move != Move::NULL {
-                    let chk = self.prev_in_check[prev_idx] as usize;
-                    let cap = self.prev_is_capture[prev_idx] as usize;
-                    update_history(
-                        &mut self.conthist[layer][chk][cap][prev_piece as usize][prev_move.to() as usize][m.to() as usize],
+                    update_history_i16(
+                        &mut self.conthist[layer][prev_piece as usize][prev_move.to() as usize]
+                            [cur_piece][cur_to],
                         bonus,
                     );
                 }
@@ -451,6 +479,15 @@ unsafe {
             let eval_stable = (prev_score - score).abs() < 15;
 
             if let Some(soft_limit) = self.soft_time_ms {
+                if self.fixed_time {
+                    // `go movetime` is a hard budget: scaling the soft limit by
+                    // the stability factors below would regularly spend only a
+                    // fraction of it. The hard limit check stops us instead.
+                    prev_best_move = best_move;
+                    prev_score = score;
+                    continue;
+                }
+
                 let score_diff = (prev_score - score).clamp(-100, 100) as f32;
                 let score_trend = if score < -100 { 1.25 } else { (0.85 + 0.03 * score_diff).clamp(0.8, 1.3) };
                 let pv_factor = (1.25 - 0.05 * (stable_iterations as f32)).max(0.7);
@@ -650,7 +687,7 @@ unsafe {
 
         let in_check = board.in_check();
         if in_check && (ply as usize) < MAX_PLY - 1 && excluded_move == Move::NULL {
-            depth += 1;
+            depth = depth.saturating_add(1);
         }
 
         if depth == 0 {
@@ -684,7 +721,10 @@ unsafe {
 
         let static_eval = self.corrected_eval(board, ply, raw_eval);
         if (ply as usize) < MAX_PLY {
-            self.eval_stack[ply as usize] = static_eval;
+            // An in-check eval is not comparable with a quiet one, so mark it as
+            // unusable instead of letting it poison the improving comparison two
+            // plies later.
+            self.eval_stack[ply as usize] = if in_check { EVAL_SENTINEL } else { static_eval };
         }
 
         // A TT score backed by the right bound is usually a sharper position
@@ -757,13 +797,23 @@ unsafe {
         let (improving, improvement) = if in_check || ply < 2 {
             (false, 0)
         } else {
-            let diff2 = static_eval - self.eval_stack[(ply - 2) as usize];
-            if diff2 > 0 {
-                (true, diff2)
-            } else if ply >= 4 && static_eval > self.eval_stack[(ply - 4) as usize] {
-                (true, static_eval - self.eval_stack[(ply - 4) as usize])
+            let prev2 = self.eval_stack[(ply - 2) as usize];
+            if prev2 == EVAL_SENTINEL {
+                (false, 0)
             } else {
-                (false, diff2)
+                let diff2 = static_eval - prev2;
+                if diff2 > 0 {
+                    (true, diff2)
+                } else if ply >= 4 {
+                    let prev4 = self.eval_stack[(ply - 4) as usize];
+                    if prev4 != EVAL_SENTINEL && static_eval > prev4 {
+                        (true, static_eval - prev4)
+                    } else {
+                        (false, diff2)
+                    }
+                } else {
+                    (false, diff2)
+                }
             }
         };
 
@@ -850,8 +900,6 @@ unsafe {
                     ply,
                     &self.played_pieces,
                     &self.played_moves,
-                    &self.prev_in_check,
-                    &self.prev_is_capture,
                 ) {
                     if !see(board, m, probcut_beta - static_eval) {
                         continue;
@@ -860,7 +908,6 @@ unsafe {
                     if (ply as usize) < MAX_PLY {
                         self.played_moves[ply as usize] = m;
                         self.played_pieces[ply as usize] = board.piece_on[m.from()];
-                        self.prev_in_check[ply as usize] = false;
                         self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
                             || m.move_type() == MoveType::EnPassant;
                     }
@@ -933,8 +980,6 @@ unsafe {
             } else if singular_beta >= beta {
                 return singular_beta;
             }
-        } else if depth <= 6 && !in_check && cut_node && eval <= alpha - 30 {
-            extension = 1;
         }
 
         let mut best_score = -INFINITY;
@@ -983,8 +1028,6 @@ unsafe {
             ply,
             &self.played_pieces,
             &self.played_moves,
-            &self.prev_in_check,
-            &self.prev_is_capture,
         ) {
             if m == excluded_move {
                 continue;
@@ -1052,14 +1095,14 @@ unsafe {
             if (ply as usize) < MAX_PLY {
                 self.played_moves[ply as usize] = m;
                 self.played_pieces[ply as usize] = board.piece_on[m.from()];
-                self.prev_in_check[ply as usize] = in_check;
                 self.prev_is_capture[ply as usize] = is_capture;
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
             let lmr_depth_threshold = if is_pv { 2 } else { 1 };
             let lmr_applies = depth >= 3 && moves_searched >= lmr_depth_threshold && (!is_pv || is_quiet);
-            let is_see_ge_zero = lmr_applies && !is_quiet && see(board, m, 0);
+            // The picker already ran SEE on every noisy move it returned.
+            let is_see_ge_zero = lmr_applies && !is_quiet && picker.last_see_ge_zero;
 
             let undo = board.make_move(m);
             let gives_check = board.in_check();
@@ -1151,15 +1194,18 @@ unsafe {
 
             if score > best_score {
                 best_score = score;
-                best_move = m;
                 if ply == 0 && !self.stop.load(Ordering::Relaxed) {
                     self.root_best_move_pending = m;
                     self.root_best_idx = moves_searched - 1;
                 }
             }
 
+            // Only a move that actually raised alpha is worth storing as the
+            // TT best move. A fail-low move carries a score that was cut off at
+            // alpha and would wreck move ordering on later visits.
             if score > alpha {
                 alpha = score;
+                best_move = m;
             }
 
             if alpha >= beta {
@@ -1195,7 +1241,7 @@ unsafe {
                     if moving_pc < 12 {
                         update_history(&mut self.pawn_history[p_idx][moving_pc][m.to() as usize], bonus);
                     }
-                    self.update_conthist(ply, m, bonus);
+                    self.update_conthist(ply, board.piece_on[m.from()], m, bonus);
 
                     for j in 0..quiet_count {
                         let qm = quiet_moves[j];
@@ -1205,7 +1251,7 @@ unsafe {
                         if q_pc < 12 {
                             update_history(&mut self.history[us][qm.from() as usize][qm.to() as usize], -malus);
                             update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -malus);
-                            self.update_conthist(ply, qm, -malus);
+                            self.update_conthist(ply, board.piece_on[qm.from()], qm, -malus);
                         }
                     }
 
@@ -1453,7 +1499,6 @@ unsafe {
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = m;
                     self.played_pieces[ply as usize] = board.piece_on[m.from()];
-                    self.prev_in_check[ply as usize] = true;
                     self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
                         || m.move_type() == MoveType::EnPassant;
                 }
@@ -1467,14 +1512,17 @@ unsafe {
 
                 if score > best_score {
                     best_score = score;
-                    best_move = m;
                 }
 
                 if score >= beta {
                     self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store);
                     return score;
                 }
-                alpha = alpha.max(score);
+
+                if score > alpha {
+                    alpha = score;
+                    best_move = m;
+                }
             }
 
             let flag = if best_score >= beta {
@@ -1501,8 +1549,6 @@ unsafe {
             ply,
             &self.played_pieces,
             &self.played_moves,
-            &self.prev_in_check,
-            &self.prev_is_capture,
         ) {
             let is_promo = m.move_type() == MoveType::Promotion;
             if !is_promo {
@@ -1522,7 +1568,6 @@ unsafe {
             if (ply as usize) < MAX_PLY {
                 self.played_moves[ply as usize] = m;
                 self.played_pieces[ply as usize] = board.piece_on[m.from()];
-                self.prev_in_check[ply as usize] = false;
                 self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
                     || m.move_type() == MoveType::EnPassant;
             }

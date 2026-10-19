@@ -2,9 +2,49 @@ use crate::attacks::{bishop_attacks, rook_attacks};
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType, Square};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Slider indexing style, picked once at startup. PEXT needs BMI2, but on AMD
+// Zen 1/2 (family 0x17) BMI2 is emulated in microcode and is much slower than
+// a magic multiply-shift, so those CPUs keep using the magic tables.
+static USE_PEXT: AtomicBool = AtomicBool::new(false);
+
+#[inline(always)]
+pub fn use_pext() -> bool {
+    USE_PEXT.load(Ordering::Relaxed)
+}
+
+/// Chooses between the PEXT and the magic slider tables for this machine.
+pub fn detect_slider_style() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fast = std::arch::is_x86_feature_detected!("bmi2") && !is_slow_pext_amd();
+        USE_PEXT.store(fast, Ordering::Relaxed);
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+fn is_slow_pext_amd() -> bool {
+    // CPUID leaves are available on every x86_64 CPU.
+    let leaf1 = std::arch::x86_64::__cpuid(1);
+    let is_amd = leaf1.ebx == 0x6874_7541
+        && leaf1.edx == 0x6972_6D65
+        && leaf1.ecx == 0x444D_4163;
+    if !is_amd {
+        return false;
+    }
+
+    let base_family = (leaf1.eax >> 8) & 0xF;
+    let ext_family = (leaf1.eax >> 20) & 0xFF;
+    let family = if base_family == 0xF {
+        base_family + ext_family
+    } else {
+        base_family
+    };
+
+    // 0x17 covers Zen 1, Zen+ and Zen 2.
+    family == 0x17
+}
 
 /// Expand every destination bit into a move, walking the bitboard bit by bit.
 #[inline(always)]
@@ -21,75 +61,39 @@ pub fn extract_moves(
     }
 }
 
-/// Slider lookup index. Prefers BMI2 `pext` (compressed-occupancy index) and
-/// falls back to the classic magic multiply-shift when BMI2 is unavailable.
-/// The attacker table is built with the matching layout, see `attacks.rs`.
+/// Compressed-occupancy index for the PEXT slider table. The table is built in
+/// this exact order, so the result is the offset-relative slot.
 #[inline(always)]
-pub fn pext_slider_idx(occ: u64, mask: u64, offset: usize, shift: u8, magic: u64) -> usize {
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    unsafe {
-        let _ = (shift, magic);
-        offset + _pext_u64(occ, mask) as usize
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+pub fn pext_index(occ: u64, mask: u64) -> usize {
+    #[cfg(target_arch = "x86_64")]
     {
-        offset + (((occ & mask).wrapping_mul(magic)) >> shift) as usize
+        // Safety: only called when runtime detection found BMI2 and a CPU where
+        // PEXT is not microcoded.
+        unsafe { pext_u64(occ, mask) as usize }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        unreachable!("PEXT slider tables are x86_64 only")
     }
 }
 
-/// Compressed occupancy index used to build the PEXT slider table.
-#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn pext_u64(occ: u64, mask: u64) -> u64 {
+    std::arch::x86_64::_pext_u64(occ, mask)
+}
+
+/// Classic magic multiply-shift index for the magic slider table.
 #[inline(always)]
-pub fn compressed_index(occ: u64, mask: u64) -> usize {
-    unsafe { _pext_u64(occ, mask) as usize }
+pub fn magic_index(occ: u64, mask: u64, shift: u8, magic: u64) -> usize {
+    (((occ & mask).wrapping_mul(magic)) >> shift) as usize
 }
 
 #[inline(always)]
 pub fn generate_knight_moves(board: &Board, us: Color, target: Bitboard, list: &mut MoveList) {
-    let mut knights = board.pieces[Piece::new(us, PieceType::Knight)].0;
-
-    // Setwise AVX-512 parallel move generation for knights: gather up to eight
-    // attack bitboards at once with one vpgatherqq.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512dq"
-    ))]
-    unsafe {
-        let table_ptr = crate::attacks::attacks().knight_attacks.as_ptr() as *const i64;
-        while knights != 0 {
-            let mut from_sqs = [0i32; 8];
-            let mut k = 0;
-            while knights != 0 && k < 8 {
-                from_sqs[k] = knights.trailing_zeros() as i32;
-                knights &= knights - 1;
-                k += 1;
-            }
-
-            let v_from = _mm256_loadu_si256(from_sqs.as_ptr() as *const __m256i);
-            let v_attacks = _mm512_i32gather_epi64::<8>(v_from, table_ptr);
-            let v_target = _mm512_set1_epi64(target.0 as i64);
-            let v_valid = _mm512_and_si512(v_attacks, v_target);
-
-            let mut valid_arr = [0u64; 8];
-            _mm512_storeu_si512(valid_arr.as_mut_ptr() as *mut _, v_valid);
-
-            for i in 0..k {
-                extract_moves(
-                    Square::new(from_sqs[i] as u8),
-                    Bitboard(valid_arr[i]),
-                    list,
-                    PieceType::None,
-                    MoveType::Normal,
-                );
-            }
-        }
-        return;
-    }
-
-    while knights != 0 {
-        let from = Square::new(knights.trailing_zeros() as u8);
-        knights &= knights - 1;
+    let mut knights = board.pieces[Piece::new(us, PieceType::Knight)];
+    while !knights.is_empty() {
+        let from = knights.pop_lsb();
         let att = crate::attacks::knight_attacks(from) & target;
         extract_moves(from, att, list, PieceType::None, MoveType::Normal);
     }

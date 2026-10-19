@@ -188,10 +188,16 @@ fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
             if let Ok(v) = value.parse::<i32>() { crate::search::CORR_LIMIT.store(v, Ordering::Relaxed); }
         }
         "lmrbase" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::LMR_BASE.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::LMR_BASE.store(v, Ordering::Relaxed);
+                crate::search::rebuild_lmr_table();
+            }
         }
         "lmrdivisor" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::LMR_DIVISOR.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::LMR_DIVISOR.store(v, Ordering::Relaxed);
+                crate::search::rebuild_lmr_table();
+            }
         }
         "syzygypath" => {
             crate::syzygy::init(&value);
@@ -254,8 +260,10 @@ fn parse_go(tokens: &[&str]) -> (u8, TimeControl, bool) {
                 wait_for_stop = true;
             }
             "depth" => {
-                if let Some(val) = tokens.get(i + 1).and_then(|s| s.parse().ok()) {
-                    depth = val;
+                if let Some(val) = tokens.get(i + 1).and_then(|s| s.parse::<u8>().ok()) {
+                    // Beyond MAX_PLY there is nothing to search and depth + 1 in
+                    // the in-check extension would overflow.
+                    depth = val.min(crate::search::MAX_PLY as u8);
                 }
                 i += 1;
             }
@@ -327,6 +335,7 @@ fn run_bench(pool: &mut ThreadPool) {
                 TimeLimits {
                     soft_limit: None,
                     hard_limit: None,
+                    fixed: false,
                 },
             );
             total_nodes += pool.shared_nodes.load(Ordering::Relaxed)

@@ -971,7 +971,7 @@ unsafe {
 
             if score < singular_beta {
                 // Double extension if all alternative moves failed by a wide margin
-                let double_margin = singular_margin;
+                let double_margin = singular_margin * 2;
                 if !is_pv && score < singular_beta - double_margin {
                     extension = 2;
                 } else {
@@ -1078,7 +1078,7 @@ unsafe {
 
                     // Prune captures with terrible history at low depths
                     let is_queen_promo = m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Queen;
-                    if depth <= 5 && !is_queen_promo && hist < -3000 * (depth as i32) {
+                    if depth <= 5 && !is_queen_promo && !picker.last_see_ge_zero && hist < -3000 * (depth as i32) {
                         continue;
                     }
                 }
@@ -1099,7 +1099,7 @@ unsafe {
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
-            let lmr_depth_threshold = if is_pv { 2 } else { 1 };
+            let lmr_depth_threshold = if is_pv { 2 } else { 2 + is_pv as usize };
             let lmr_applies = depth >= 3 && moves_searched >= lmr_depth_threshold && (!is_pv || is_quiet);
             // The picker already ran SEE on every noisy move it returned.
             let is_see_ge_zero = lmr_applies && !is_quiet && picker.last_see_ge_zero;
@@ -1131,7 +1131,9 @@ unsafe {
                         r += 1;
                     }
 
-                    r -= (improvement / 64).clamp(-2, 2);
+                    if improving {
+                        r -= (improvement / 64).clamp(0, 2);
+                    }
 
                     if cut_node {
                         r += 2;

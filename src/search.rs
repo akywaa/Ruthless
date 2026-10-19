@@ -310,7 +310,9 @@ unsafe {
 
     #[inline(always)]
     fn draw_score(&self) -> i32 {
-        (self.nodes as i32 & 3) - 2
+        // Small penalty for drawing as white stimulates searching for victory
+        let base = (self.nodes as i32 & 3) - 2;
+        base - 10
     }
 
     #[inline(always)]
@@ -509,8 +511,9 @@ unsafe {
 
                 // Cap the soft-limit extension: the factors above can compound to
                 // more than 2x, which would let a single iteration burn the bank.
+                let max_multiplier = if score < prev_score - 30 { 2.5 } else { 1.5 };
                 let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor)
-                    .min(soft_limit as f32 * 1.4) as u128;
+                    .min(soft_limit as f32 * max_multiplier) as u128;
 
                 let past_hard = elapsed >= self.hard_time_ms.unwrap_or(u128::MAX);
                 let past_soft = depth >= 3 && elapsed >= dynamic_soft;
@@ -1047,10 +1050,6 @@ unsafe {
             if !is_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
                 // Quiet-move pruning is the only user of the direct-check test.
                 if is_quiet && depth <= 8 && !board.gives_direct_check(m) {
-                    if moves_searched >= lmp_threshold && hist < 2000 {
-                        continue;
-                    }
-
                     if futility_pruning
                         && m != killers[0]
                         && m != killers[1]

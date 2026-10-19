@@ -1037,7 +1037,8 @@ unsafe {
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
-            let lmr_applies = depth >= 4 && moves_searched >= 2 && (!is_pv || is_quiet);
+            let lmr_depth_threshold = if is_pv { 2 } else { 1 };
+            let lmr_applies = depth >= 3 && moves_searched >= lmr_depth_threshold && (!is_pv || is_quiet);
             let is_see_ge_zero = lmr_applies && !is_quiet && see(board, m, 0);
 
             let undo = board.make_move(m);
@@ -1060,7 +1061,7 @@ unsafe {
                         if !is_see_ge_zero {
                             r += 2;
                         }
-                        r -= (hist / 4096).clamp(-3, 3);
+                        r -= (hist / 1024).clamp(-2, 2);
                     }
 
                     if !improving {

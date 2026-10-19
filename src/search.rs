@@ -909,7 +909,13 @@ unsafe {
             }
 
             if score < singular_beta {
-                extension = 1;
+                // Double extension if all alternative moves failed by a wide margin
+                let double_margin = singular_margin;
+                if !is_pv && score < singular_beta - double_margin {
+                    extension = 2;
+                } else {
+                    extension = 1;
+                }
             } else if singular_beta >= beta {
                 return singular_beta;
             }

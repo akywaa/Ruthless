@@ -754,13 +754,18 @@ unsafe {
             depth -= 1;
         }
 
-        let improvement = if in_check || ply < 2 {
-            0
+        let (improving, improvement) = if in_check || ply < 2 {
+            (false, 0)
         } else {
-            static_eval - self.eval_stack[(ply - 2) as usize]
+            let diff2 = static_eval - self.eval_stack[(ply - 2) as usize];
+            if diff2 > 0 {
+                (true, diff2)
+            } else if ply >= 4 && static_eval > self.eval_stack[(ply - 4) as usize] {
+                (true, static_eval - self.eval_stack[(ply - 4) as usize])
+            } else {
+                (false, diff2)
+            }
         };
-
-        let improving = improvement > 0;
 
         if !is_pv && !in_check {
             let base = RFP_BASE.load(Ordering::Relaxed);

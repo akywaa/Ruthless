@@ -984,7 +984,7 @@ unsafe {
             if !is_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
                 // Quiet-move pruning is the only user of the direct-check test.
                 if is_quiet && depth <= 8 && !board.gives_direct_check(m) {
-                    if moves_searched >= lmp_threshold {
+                    if moves_searched >= lmp_threshold && hist < 2000 {
                         continue;
                     }
 
@@ -1008,8 +1008,16 @@ unsafe {
                     continue;
                 }
 
-                if !is_quiet && depth <= 6 && !see(board, m, -120 * (depth as i32)) {
-                    continue;
+                if !is_quiet && depth <= 6 {
+                    if !see(board, m, -120 * (depth as i32)) {
+                        continue;
+                    }
+
+                    // Prune captures with terrible history at low depths
+                    let is_queen_promo = m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Queen;
+                    if depth <= 5 && !is_queen_promo && hist < -3000 * (depth as i32) {
+                        continue;
+                    }
                 }
             }
 

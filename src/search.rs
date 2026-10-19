@@ -831,52 +831,61 @@ unsafe {
         // ProbCut
         if !is_pv && !in_check && excluded_move == Move::NULL && depth >= 5 && beta.abs() < MATE_SCORE - 100 {
             let probcut_beta = beta + 200;
-            let mut probcut_picker = MovePicker::new_qsearch(Move::NULL);
 
-            while let Some(m) = probcut_picker.next(
-                board,
-                &self.history,
-                &self.pawn_history,
-                &self.conthist,
-                &self.noisy_history,
-                ply,
-                &self.played_pieces,
-                &self.played_moves,
-                &self.prev_in_check,
-                &self.prev_is_capture,
-            ) {
-                if !see(board, m, probcut_beta - static_eval) {
-                    continue;
-                }
+            // Skip ProbCut if a deeper TT entry proves we cannot beat probcut_beta
+            let can_probcut = !has_tt
+                || tt_depth < depth - 3
+                || tt_score >= probcut_beta
+                || tt_flag == TTFlag::LowerBound;
 
-                if (ply as usize) < MAX_PLY {
-                    self.played_moves[ply as usize] = m;
-                    self.played_pieces[ply as usize] = board.piece_on[m.from()];
-                    self.prev_in_check[ply as usize] = false;
-                    self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
-                        || m.move_type() == MoveType::EnPassant;
-                }
+            if can_probcut {
+                let mut probcut_picker = MovePicker::new_qsearch(tt_move);
 
-                let undo = board.make_move(m);
-                let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0);
+                while let Some(m) = probcut_picker.next(
+                    board,
+                    &self.history,
+                    &self.pawn_history,
+                    &self.conthist,
+                    &self.noisy_history,
+                    ply,
+                    &self.played_pieces,
+                    &self.played_moves,
+                    &self.prev_in_check,
+                    &self.prev_is_capture,
+                ) {
+                    if !see(board, m, probcut_beta - static_eval) {
+                        continue;
+                    }
 
-                if score >= probcut_beta {
-                    score = -self.negamax(
-                        board,
-                        depth - 4,
-                        ply + 1,
-                        -probcut_beta,
-                        -probcut_beta + 1,
-                        false,
-                        Move::NULL,
-                        !cut_node,
-                    );
-                }
+                    if (ply as usize) < MAX_PLY {
+                        self.played_moves[ply as usize] = m;
+                        self.played_pieces[ply as usize] = board.piece_on[m.from()];
+                        self.prev_in_check[ply as usize] = false;
+                        self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
+                            || m.move_type() == MoveType::EnPassant;
+                    }
 
-                board.undo_move(m, undo);
+                    let undo = board.make_move(m);
+                    let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0);
 
-                if score >= probcut_beta {
-                    return score;
+                    if score >= probcut_beta {
+                        score = -self.negamax(
+                            board,
+                            depth - 4,
+                            ply + 1,
+                            -probcut_beta,
+                            -probcut_beta + 1,
+                            false,
+                            Move::NULL,
+                            !cut_node,
+                        );
+                    }
+
+                    board.undo_move(m, undo);
+
+                    if score >= probcut_beta {
+                        return score;
+                    }
                 }
             }
         }

@@ -1,7 +1,21 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::board::Board;
 use crate::types::Color;
 
-pub const OVERHEAD_MS: u128 = 25;
+/// Reserve subtracted from the clock before allocating time, so GUI/network
+/// latency cannot make the engine flag. Settable through the UCI
+/// `Move Overhead` option.
+pub static MOVE_OVERHEAD_MS: AtomicU64 = AtomicU64::new(25);
+
+#[inline(always)]
+pub fn move_overhead() -> u128 {
+    MOVE_OVERHEAD_MS.load(Ordering::Relaxed) as u128
+}
+
+pub fn set_move_overhead(ms: u64) {
+    MOVE_OVERHEAD_MS.store(ms, Ordering::Relaxed);
+}
 
 #[derive(Clone, Default, Debug)]
 pub struct TimeControl {
@@ -25,8 +39,10 @@ pub struct TimeManager;
 
 impl TimeManager {
     pub fn allocate(board: &Board, tc: &TimeControl) -> TimeLimits {
+        let overhead = move_overhead();
+
         if let Some(mt) = tc.movetime {
-            let t = mt.saturating_sub(OVERHEAD_MS).max(5);
+            let t = mt.saturating_sub(overhead).max(5);
             return TimeLimits {
                 soft_limit: Some(t),
                 hard_limit: Some(t),
@@ -40,7 +56,7 @@ impl TimeManager {
         };
 
         if let Some(time) = my_time {
-            let usable_time = time.saturating_sub(OVERHEAD_MS) as f64;
+            let usable_time = time.saturating_sub(overhead) as f64;
             let inc = my_inc as f64;
 
             // Cyclic time control (e.g. 40 moves in X minutes)

@@ -67,6 +67,7 @@ pub fn uci_loop() {
                 println!("option name LmrDivisor type spin default 240 min 100 max 400");
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name NumaBind type check default false");
+                println!("option name Move Overhead type spin default 25 min 0 max 5000");
                 println!("uciok");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
@@ -204,6 +205,11 @@ fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
         }
         "numabind" => {
             crate::numa::set_bind_enabled(value.eq_ignore_ascii_case("true"));
+        }
+        "move overhead" | "moveoverhead" => {
+            if let Ok(v) = value.parse::<u64>() {
+                crate::time::set_move_overhead(v.clamp(0, 5000));
+            }
         }
         _ => {}
     }

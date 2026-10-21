@@ -1474,27 +1474,31 @@ unsafe {
             let mut best_score = -INFINITY;
             let mut best_move = Move::NULL;
 
-            let mut scores = [0i32; 256];
+            // Scores are written only for the moves actually generated, so the
+            // array does not need to be zeroed up front.
+            let mut scores: [std::mem::MaybeUninit<i32>; 256] =
+                [const { std::mem::MaybeUninit::uninit() }; 256];
             for i in 0..moves.count {
                 let m = moves.moves[i];
-                if m == tt_move {
-                    scores[i] = 1_000_000;
+                let score = if m == tt_move {
+                    1_000_000
                 } else if board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant {
                     let victim = match m.move_type() {
                         MoveType::EnPassant => PieceType::Pawn,
                         _ => board.piece_on[m.to()].piece_type(),
                     };
                     let attacker = board.piece_on[m.from()].piece_type();
-                    scores[i] = 100_000 + crate::eval::PIECE_VALUES[victim as usize] * 10 - crate::eval::PIECE_VALUES[attacker as usize];
+                    100_000 + crate::eval::PIECE_VALUES[victim as usize] * 10 - crate::eval::PIECE_VALUES[attacker as usize]
                 } else {
-                    scores[i] = self.quiet_history_score(board, ply, m);
-                }
+                    self.quiet_history_score(board, ply, m)
+                };
+                scores[i].write(score);
             }
 
             for i in 0..moves.count {
                 let mut best_idx = i;
                 for j in (i + 1)..moves.count {
-                    if scores[j] > scores[best_idx] {
+                    if unsafe { scores[j].assume_init() > scores[best_idx].assume_init() } {
                         best_idx = j;
                     }
                 }

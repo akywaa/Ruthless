@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
@@ -26,9 +28,14 @@ pub struct MovePicker {
     killer_idx: usize,
     counter_move: Move,
     moves: MoveList,
-    scores: [i32; 256],
+    /// Written lazily for `cur_idx..moves.count` by the scoring pass, so the
+    /// constructor does not have to zero a kilobyte on every node.
+    scores: [MaybeUninit<i32>; 256],
     cur_idx: usize,
-    bad_noisy: MoveList,
+    /// At most 64 pieces can deliver a losing capture, so this buffer is much
+    /// smaller than a full MoveList and is never touched in qsearch.
+    bad_noisy: [Move; 64],
+    bad_noisy_count: usize,
     qsearch: bool,
     checkers: Bitboard,
     pinned: Bitboard,
@@ -48,9 +55,10 @@ impl MovePicker {
             killer_idx: 0,
             counter_move,
             moves: MoveList::new(),
-            scores: [0; 256],
+            scores: [MaybeUninit::uninit(); 256],
             cur_idx: 0,
-            bad_noisy: MoveList::new(),
+            bad_noisy: [Move::NULL; 64],
+            bad_noisy_count: 0,
             qsearch: false,
             checkers: Bitboard::EMPTY,
             pinned: Bitboard::EMPTY,
@@ -67,9 +75,10 @@ impl MovePicker {
             killer_idx: 0,
             counter_move: Move::NULL,
             moves: MoveList::new(),
-            scores: [0; 256],
+            scores: [MaybeUninit::uninit(); 256],
             cur_idx: 0,
-            bad_noisy: MoveList::new(),
+            bad_noisy: [Move::NULL; 64],
+            bad_noisy_count: 0,
             qsearch: true,
             checkers: Bitboard::EMPTY,
             pinned: Bitboard::EMPTY,
@@ -151,8 +160,9 @@ impl MovePicker {
                                 self.last_see_ge_zero = true;
                                 return Some(m);
                             }
-                        } else {
-                            self.bad_noisy.push(m);
+                        } else if !self.qsearch && self.bad_noisy_count < self.bad_noisy.len() {
+                            self.bad_noisy[self.bad_noisy_count] = m;
+                            self.bad_noisy_count += 1;
                         }
                     }
 
@@ -222,8 +232,8 @@ impl MovePicker {
                     self.stage = Stage::BadNoisy;
                 }
                 Stage::BadNoisy => {
-                    while self.cur_idx < self.bad_noisy.count {
-                        let m = self.bad_noisy.moves[self.cur_idx];
+                    while self.cur_idx < self.bad_noisy_count {
+                        let m = self.bad_noisy[self.cur_idx];
                         self.cur_idx += 1;
                         if m != self.tt_move && self.is_legal(board, m) {
                             self.last_see_ge_zero = false;
@@ -238,12 +248,13 @@ impl MovePicker {
     }
 
     fn pick_best(&mut self) -> Move {
-        let mut best_score = self.scores[self.cur_idx];
+        let mut best_score = unsafe { self.scores[self.cur_idx].assume_init() };
         let mut best_idx = self.cur_idx;
 
         for i in (self.cur_idx + 1)..self.moves.count {
-            if self.scores[i] > best_score {
-                best_score = self.scores[i];
+            let s = unsafe { self.scores[i].assume_init() };
+            if s > best_score {
+                best_score = s;
                 best_idx = i;
             }
         }
@@ -288,9 +299,9 @@ impl MovePicker {
                     score += 2000;
                 }
 
-                self.scores[i] = score;
+                self.scores[i].write(score);
             } else {
-                self.scores[i] = 0;
+                self.scores[i].write(0);
             }
         }
     }
@@ -350,7 +361,7 @@ impl MovePicker {
                 score -= if pt != PieceType::Pawn { 3000 } else { 1200 };
             }
 
-            self.scores[i] = score;
+            self.scores[i].write(score);
         }
     }
 

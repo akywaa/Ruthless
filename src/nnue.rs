@@ -213,6 +213,17 @@ pub fn king_bucket(sq: Square) -> usize {
 }
 
 #[inline(always)]
+pub fn needs_accumulator_refresh(from: Square, to: Square, color: Color) -> bool {
+    let (o_from, o_to) = if color == Color::White {
+        (from, to)
+    } else {
+        (Square::new((from as u8) ^ 56), Square::new((to as u8) ^ 56))
+    };
+
+    king_bucket(o_from) != king_bucket(o_to) || (o_from.file() > 3) != (o_to.file() > 3)
+}
+
+#[inline(always)]
 pub fn oriented_piece(piece: Piece, view: Color) -> usize {
     let pc_color = piece.color();
     let pt = piece.piece_type() as usize;

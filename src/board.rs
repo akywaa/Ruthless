@@ -936,10 +936,26 @@ impl Board {
 
         self.remove_piece(from);
 
-        if !is_king_move {
-            self.accumulators[self.acc_index].remove_feature(moving_piece, from, w_ksq, b_ksq);
+        // A king move only changes the input indices when the king crosses a
+        // bucket boundary or the center mirror. Otherwise both sides update
+        // incrementally; castling always needs a full refresh of our side.
+        let refresh_us = is_king_move
+            && (move_type == MoveType::Castling
+                || crate::nnue::needs_accumulator_refresh(from, to, us));
+
+        let (acc_w_ksq, acc_b_ksq) = if is_king_move {
+            match us {
+                Color::White => (to, b_ksq),
+                Color::Black => (w_ksq, to),
+            }
         } else {
-            // For the opponent, king bucket never changes; update incrementally
+            (w_ksq, b_ksq)
+        };
+
+        if !refresh_us {
+            self.accumulators[self.acc_index].remove_feature(moving_piece, from, acc_w_ksq, acc_b_ksq);
+        } else {
+            // The opponent's king stays put, so its view is still current.
             self.accumulators[self.acc_index].remove_feature_side(moving_piece, from, self.king_square(them), them);
         }
 
@@ -947,15 +963,15 @@ impl Board {
             MoveType::Normal => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
-                    if !is_king_move {
-                        self.accumulators[self.acc_index].remove_feature(undo.captured, to, w_ksq, b_ksq);
+                    if !refresh_us {
+                        self.accumulators[self.acc_index].remove_feature(undo.captured, to, acc_w_ksq, acc_b_ksq);
                     } else {
                         self.accumulators[self.acc_index].remove_feature_side(undo.captured, to, self.king_square(them), them);
                     }
                 }
                 self.put_piece(moving_piece, to);
-                if !is_king_move {
-                    self.accumulators[self.acc_index].add_feature(moving_piece, to, w_ksq, b_ksq);
+                if !refresh_us {
+                    self.accumulators[self.acc_index].add_feature(moving_piece, to, acc_w_ksq, acc_b_ksq);
                 } else {
                     self.accumulators[self.acc_index].add_feature_side(moving_piece, to, self.king_square(them), them);
                 }
@@ -1007,7 +1023,7 @@ impl Board {
             }
         }
 
-        if is_king_move {
+        if refresh_us {
             self.refresh_accumulator_side(us);
         }
 

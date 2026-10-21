@@ -99,6 +99,25 @@ impl TranspositionTable {
         ((key as u128 * self.len as u128) >> 64) as usize
     }
 
+    /// Pulls the cluster that `probe(key)` will touch into L1. Call it right
+    /// after a move is made, so the load overlaps with the check, LMR and
+    /// repetition work done before the child node probes the table.
+    #[inline(always)]
+    pub fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let idx = self.index(key);
+            let ptr = self.clusters.as_ptr().add(idx) as *const i8;
+            _mm_prefetch(ptr, _MM_HINT_T0);
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = key;
+        }
+    }
+
     #[inline(always)]
     pub fn new_search(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);

@@ -861,6 +861,7 @@ unsafe {
                     self.played_pieces[ply as usize] = Piece::None;
                 }
                 let undo = board.make_null_move();
+                self.tt.prefetch(board.tt_hash);
                 let score = -self.negamax(
                     board,
                     depth.saturating_sub(r),
@@ -914,6 +915,7 @@ unsafe {
                     }
 
                     let undo = board.make_move(m);
+                    self.tt.prefetch(board.tt_hash);
                     let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0);
 
                     if score >= probcut_beta {
@@ -1106,6 +1108,7 @@ unsafe {
             let is_see_ge_zero = lmr_applies && !is_quiet && picker.last_see_ge_zero;
 
             let undo = board.make_move(m);
+            self.tt.prefetch(board.tt_hash);
             let gives_check = board.in_check();
 
             let ext = if m == tt_move { extension } else { 0 };
@@ -1506,6 +1509,7 @@ unsafe {
                         || m.move_type() == MoveType::EnPassant;
                 }
                 let undo = board.make_move(m);
+                self.tt.prefetch(board.tt_hash);
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1);
                 board.undo_move(m, undo);
 
@@ -1575,6 +1579,7 @@ unsafe {
                     || m.move_type() == MoveType::EnPassant;
             }
             let undo = board.make_move(m);
+            self.tt.prefetch(board.tt_hash);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1);
             board.undo_move(m, undo);
 

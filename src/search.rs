@@ -37,6 +37,10 @@ pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(240);
 /// full layout would cost ~19 MB per searcher.
 pub type ContHist = [[[[[i16; 64]; 12]; 64]; 12]; 4];
 
+/// Butterfly history split by whether the source and destination squares are
+/// attacked by enemy pawns: `[side][from_threat][to_threat][from][to]`.
+pub type MainHistory = [[[[[i32; 64]; 64]; 2]; 2]; 2];
+
 // LMR reduction table. Rebuilt whenever the LMR tunables change so the hot
 // path is a single relaxed load instead of two atomic loads plus a float divide.
 const LMR_TABLE_LEN: usize = 64 * 64;
@@ -74,7 +78,7 @@ pub struct Searcher {
     // the soft limit must not be applied.
     pub fixed_time: bool,
     killers: [[Move; 2]; MAX_PLY],
-    history: [[[i32; 64]; 64]; 2],
+    history: Box<MainHistory>,
     pawn_history: Box<[[[i32; 64]; 12]; 512]>,
     noisy_history: Box<[[[[i32; 2]; 6]; 64]; 12]>,
     counter_moves: [[Move; 64]; 64],
@@ -85,6 +89,7 @@ pub struct Searcher {
     played_moves: [Move; MAX_PLY],
     played_pieces: [Piece; MAX_PLY],
     prev_is_capture: [bool; MAX_PLY],
+    played_threat_state: [u8; MAX_PLY],
     eval_stack: [i32; MAX_PLY],
     root_move_nodes: [u64; 256],
     root_best_idx: usize,
@@ -175,7 +180,7 @@ impl Searcher {
             hard_time_ms: None,
             fixed_time: false,
             killers: [[Move::NULL; 2]; MAX_PLY],
-            history: [[[0; 64]; 64]; 2],
+            history: alloc_box_zeroed(),
             pawn_history: alloc_box_zeroed(),
 noisy_history: alloc_box_zeroed(),
 counter_moves: [[Move::NULL; 64]; 64],
@@ -186,6 +191,7 @@ cont_corr: alloc_box_zeroed(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
             prev_is_capture: [false; MAX_PLY],
+            played_threat_state: [0; MAX_PLY],
             eval_stack: [0; MAX_PLY],
             root_move_nodes: [0; 256],
             root_best_idx: 0,
@@ -203,9 +209,9 @@ cont_corr: alloc_box_zeroed(),
 
     pub fn clear_histories(&mut self) {
         self.killers = [[Move::NULL; 2]; MAX_PLY];
-        self.history = [[[0; 64]; 64]; 2];
         self.counter_moves = [[Move::NULL; 64]; 64];
 unsafe {
+    std::ptr::write_bytes(self.history.as_mut(), 0, 1);
     std::ptr::write_bytes(self.pawn_history.as_mut(), 0, 1);
     std::ptr::write_bytes(self.noisy_history.as_mut(), 0, 1);
     std::ptr::write_bytes(self.conthist.as_mut(), 0, 1);
@@ -216,6 +222,7 @@ unsafe {
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
         self.prev_is_capture = [false; MAX_PLY];
+        self.played_threat_state = [0; MAX_PLY];
         self.eval_stack = [0; MAX_PLY];
         self.root_move_nodes = [0; 256];
         self.root_best_idx = 0;
@@ -318,8 +325,11 @@ unsafe {
         let us = board.side_to_move as usize;
         let piece = board.piece_on[m.from()];
         let p_idx = (board.pawn_hash as usize) & 511;
+        let threats = board.opponent_pawn_threats();
+        let from_th = threats.contains(m.from()) as usize;
+        let to_th = threats.contains(m.to()) as usize;
 
-        self.history[us][m.from() as usize][m.to() as usize]
+        self.history[us][from_th][to_th][m.from() as usize][m.to() as usize]
             + self.pawn_history[p_idx][piece as usize][m.to() as usize]
             + self.get_conthist(board, ply, m)
     }
@@ -1124,6 +1134,9 @@ unsafe {
                 self.played_moves[ply as usize] = m;
                 self.played_pieces[ply as usize] = board.piece_on[m.from()];
                 self.prev_is_capture[ply as usize] = is_capture;
+                let pawn_threats = board.opponent_pawn_threats();
+                self.played_threat_state[ply as usize] = ((pawn_threats.contains(m.from()) as u8) << 1)
+                    | (pawn_threats.contains(m.to()) as u8);
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
@@ -1267,8 +1280,14 @@ unsafe {
 
                     let us = board.side_to_move as usize;
                     let p_idx = (board.pawn_hash as usize) & 511;
+                    let pawn_threats = board.opponent_pawn_threats();
+                    let m_from_th = pawn_threats.contains(m.from()) as usize;
+                    let m_to_th = pawn_threats.contains(m.to()) as usize;
 
-                    update_history(&mut self.history[us][m.from() as usize][m.to() as usize], bonus);
+                    update_history(
+                        &mut self.history[us][m_from_th][m_to_th][m.from() as usize][m.to() as usize],
+                        bonus,
+                    );
                     if moving_pc < 12 {
                         update_history(&mut self.pawn_history[p_idx][moving_pc][m.to() as usize], bonus);
                     }
@@ -1280,7 +1299,12 @@ unsafe {
 
                         let q_pc = board.piece_on[qm.from()] as usize;
                         if q_pc < 12 {
-                            update_history(&mut self.history[us][qm.from() as usize][qm.to() as usize], -malus);
+                            let q_from_th = pawn_threats.contains(qm.from()) as usize;
+                            let q_to_th = pawn_threats.contains(qm.to()) as usize;
+                            update_history(
+                                &mut self.history[us][q_from_th][q_to_th][qm.from() as usize][qm.to() as usize],
+                                -malus,
+                            );
                             update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -malus);
                             self.update_conthist(ply, board.piece_on[qm.from()], qm, -malus);
                         }
@@ -1355,7 +1379,14 @@ unsafe {
             if p_move != Move::NULL && !self.prev_is_capture[prev_idx] && p_piece != Piece::None {
                 let prev_bonus = (120 * depth as i32 - 40).clamp(0, 1200);
                 let opp_color = !board.side_to_move as usize;
-                update_history(&mut self.history[opp_color][p_move.from() as usize][p_move.to() as usize], prev_bonus);
+                let th = self.played_threat_state[prev_idx];
+                let prev_from_th = (th >> 1) as usize;
+                let prev_to_th = (th & 1) as usize;
+                update_history(
+                    &mut self.history[opp_color][prev_from_th][prev_to_th][p_move.from() as usize]
+                        [p_move.to() as usize],
+                    prev_bonus,
+                );
             }
         }
 

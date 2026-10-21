@@ -105,7 +105,7 @@ impl MovePicker {
     pub fn next(
         &mut self,
         board: &Board,
-        history: &[[[i32; 64]; 64]; 2],
+        history: &crate::search::MainHistory,
         pawn_history: &[[[i32; 64]; 12]; 512],
         conthist: &ContHist,
         noisy_history: &[[[[i32; 2]; 6]; 64]; 12],
@@ -309,7 +309,7 @@ impl MovePicker {
     fn score_quiets(
         &mut self,
         board: &Board,
-        history: &[[[i32; 64]; 64]; 2],
+        history: &crate::search::MainHistory,
         pawn_history: &[[[i32; 64]; 12]; 512],
         conthist: &ContHist,
         ply: u8,
@@ -328,8 +328,10 @@ impl MovePicker {
             let to = m.to();
             let piece = board.piece_on[from];
             let pt = piece.piece_type();
+            let from_threat = pawn_threats.contains(from) as usize;
+            let to_threat = pawn_threats.contains(to) as usize;
 
-            let mut score = history[us as usize][from as usize][to as usize]
+            let mut score = history[us as usize][from_threat][to_threat][from as usize][to as usize]
                 + pawn_history[p_idx][piece as usize][to as usize];
 
             for (layer, &offset) in offsets.iter().enumerate() {
@@ -347,18 +349,18 @@ impl MovePicker {
                 }
             }
 
-            let is_threatened_to = pawn_threats.contains(to);
+            let is_threatened_to = to_threat == 1;
 
             if board.gives_direct_check(m) && !is_threatened_to {
                 score += 2000;
             }
 
-            if pawn_threats.contains(from) && !is_threatened_to {
-                score += 2500;
+            if from_threat == 1 && !is_threatened_to {
+                score += 2000;
             }
 
             if is_threatened_to {
-                score -= if pt != PieceType::Pawn { 3000 } else { 1200 };
+                score -= if pt != PieceType::Pawn { 2500 } else { 1000 };
             }
 
             self.scores[i].write(score);

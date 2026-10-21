@@ -997,12 +997,6 @@ unsafe {
         let mut moves_searched = 0;
 
         let lmp_threshold = 2 + (depth as usize) * (depth as usize) / (2 + (!improving as usize));
-        let futility_margin = FUTILITY_BASE.load(Ordering::Relaxed) + FUTILITY_MARGIN.load(Ordering::Relaxed) * (depth as i32);
-        let futility_pruning = !is_pv
-            && !in_check
-            && depth <= 6
-            && alpha.abs() < MATE_SCORE - 100
-            && (eval + futility_margin <= alpha);
 
         let mut quiet_moves = [Move::NULL; 64];
         let mut quiet_count = 0;
@@ -1052,16 +1046,30 @@ unsafe {
                 self.noisy_history_score(board, m, threats)
             };
 
+            // LMR will search later moves shallower than `depth`, so shallow
+            // pruning decisions are made against that effective depth instead
+            // of the nominal one.
+            let lmr_depth = if depth >= 3 && moves_searched >= (if tt_pv { 2 } else { 3 }) {
+                let r = lmr(depth as usize, moves_searched);
+                (depth as i32 - 1 - r).max(0)
+            } else {
+                depth as i32 - 1
+            };
+
             // Do not prune while the best score so far is a loss: the remaining
             // moves may still hold the only defence.
-            if !is_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
+            if !tt_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
                 // Quiet-move pruning is the only user of the direct-check test.
-                if is_quiet && depth <= 8 && !board.gives_direct_check(m) {
+                if is_quiet && !board.gives_direct_check(m) {
                     if moves_searched >= lmp_threshold && hist < 2000 {
                         continue;
                     }
 
-                    if futility_pruning
+                    let futility_margin = FUTILITY_BASE.load(Ordering::Relaxed)
+                        + FUTILITY_MARGIN.load(Ordering::Relaxed) * (lmr_depth + 1);
+                    if lmr_depth <= 5
+                        && alpha.abs() < MATE_SCORE - 100
+                        && eval + futility_margin <= alpha
                         && m != killers[0]
                         && m != killers[1]
                         && m != counter_move
@@ -1069,26 +1077,26 @@ unsafe {
                         continue;
                     }
 
-                    if depth <= 6 {
-                        let threshold = -4000 * (depth as i32) - if improving { 2000 } else { 0 };
+                    if lmr_depth <= 5 {
+                        let threshold = -3500 * (lmr_depth + 1) - if improving { 2000 } else { 0 };
                         if hist < threshold {
                             continue;
                         }
                     }
                 }
 
-                if is_quiet && depth <= 6 && !see(board, m, -35 * (depth as i32) * (depth as i32)) {
+                if is_quiet && lmr_depth <= 6 && !see(board, m, -30 * (lmr_depth + 1) * (lmr_depth + 1)) {
                     continue;
                 }
 
-                if !is_quiet && depth <= 6 {
-                    if !see(board, m, -120 * (depth as i32)) {
+                if !is_quiet && lmr_depth <= 5 {
+                    if !see(board, m, -100 * (lmr_depth + 1)) {
                         continue;
                     }
 
                     // Prune captures with terrible history at low depths
                     let is_queen_promo = m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Queen;
-                    if depth <= 5 && !is_queen_promo && !picker.last_see_ge_zero && hist < -3000 * (depth as i32) {
+                    if lmr_depth <= 4 && !is_queen_promo && !picker.last_see_ge_zero && hist < -2500 * (lmr_depth + 1) {
                         continue;
                     }
                 }

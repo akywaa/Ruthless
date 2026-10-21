@@ -704,6 +704,7 @@ unsafe {
         let mut tt_flag = TTFlag::Exact;
         let mut has_tt = false;
         let mut tt_raw_eval = crate::tt::RAW_EVAL_NONE;
+        let mut tt_is_pv = false;
 
         if let Some(entry) = self.tt.probe(board.tt_hash) {
             has_tt = true;
@@ -712,7 +713,12 @@ unsafe {
             tt_flag = entry.flag;
             tt_move = entry.best_move;
             tt_raw_eval = entry.raw_eval;
+            tt_is_pv = entry.is_pv;
         }
+
+        // Nodes that were on a PV before are still treated as critical when
+        // they are re-visited with a null window.
+        let tt_pv = is_pv || (has_tt && tt_is_pv);
 
         let raw_eval = if has_tt && tt_raw_eval != crate::tt::RAW_EVAL_NONE {
             tt_raw_eval as i32
@@ -785,6 +791,7 @@ unsafe {
                         bound,
                         Move::NULL,
                         crate::tt::RAW_EVAL_NONE,
+                        is_pv,
                     );
                     return tb_value;
                 }
@@ -1102,8 +1109,8 @@ unsafe {
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
-            let lmr_depth_threshold = if is_pv { 2 } else { 2 + is_pv as usize };
-            let lmr_applies = depth >= 3 && moves_searched >= lmr_depth_threshold && (!is_pv || is_quiet);
+            let lmr_depth_threshold = if tt_pv { 2 } else { 3 };
+            let lmr_applies = depth >= 3 && moves_searched >= lmr_depth_threshold && (!tt_pv || is_quiet);
             // The picker already ran SEE on every noisy move it returned.
             let is_see_ge_zero = lmr_applies && !is_quiet && picker.last_see_ge_zero;
 
@@ -1150,7 +1157,7 @@ unsafe {
                         r -= (hist / 4096).clamp(-3, 3);
                     }
 
-                    if is_pv {
+                    if tt_pv {
                         r -= 1;
                     }
 
@@ -1335,7 +1342,15 @@ unsafe {
         }
 
         if excluded_move == Move::NULL && !self.stop.load(Ordering::Relaxed) {
-            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), depth, flag, best_move, raw_eval.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16);
+            self.tt.store(
+                board.tt_hash,
+                score_to_tt(best_score, ply),
+                depth,
+                flag,
+                best_move,
+                raw_eval.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16,
+                is_pv || flag == TTFlag::Exact,
+            );
 
             let tt_move_quiet = best_move == Move::NULL
                 || (board.piece_on[best_move.to()] == Piece::None
@@ -1526,7 +1541,15 @@ unsafe {
                 }
 
                 if score >= beta {
-                    self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store);
+                    self.tt.store(
+                    board.tt_hash,
+                    score_to_tt(score, ply),
+                    0,
+                    TTFlag::LowerBound,
+                    m,
+                    raw_eval_to_store,
+                    false,
+                );
                     return score;
                 }
 
@@ -1543,7 +1566,15 @@ unsafe {
             } else {
                 TTFlag::UpperBound
             };
-            self.tt.store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval_to_store);
+            self.tt.store(
+                board.tt_hash,
+                score_to_tt(best_score, ply),
+                0,
+                flag,
+                best_move,
+                raw_eval_to_store,
+                false,
+            );
             return best_score;
         }
 
@@ -1609,7 +1640,15 @@ unsafe {
                     update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt][to_threatened], 100);
                 }
 
-                self.tt.store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store);
+                self.tt.store(
+                    board.tt_hash,
+                    score_to_tt(score, ply),
+                    0,
+                    TTFlag::LowerBound,
+                    m,
+                    raw_eval_to_store,
+                    false,
+                );
                 return score;
             }
             alpha = alpha.max(score);
@@ -1624,6 +1663,7 @@ unsafe {
                 TTFlag::LowerBound,
                 best_move,
                 raw_eval_to_store,
+                false,
             );
         }
 

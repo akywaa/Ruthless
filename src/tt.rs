@@ -17,6 +17,7 @@ pub struct TTEntry {
     pub depth: u8,
     pub flag: TTFlag,
     pub best_move: Move,
+    pub is_pv: bool,
 }
 
 pub const RAW_EVAL_NONE: i16 = i16::MIN;
@@ -66,8 +67,13 @@ fn bound_of(gen_bound: u8) -> TTFlag {
 }
 
 #[inline(always)]
+fn is_pv_of(gen_bound: u8) -> bool {
+    (gen_bound & 4) != 0
+}
+
+#[inline(always)]
 fn age_of(data: u64) -> u8 {
-    (((data >> 16) & 0xFF) >> 2) as u8
+    (((data >> 16) & 0xFF) >> 3) as u8
 }
 
 pub struct TranspositionTable {
@@ -146,6 +152,7 @@ impl TranspositionTable {
                         score: (((data >> 32) & 0xFFFF) as u16 as i16) as i32,
                         raw_eval: ((data >> 48) & 0xFFFF) as u16 as i16,
                         flag,
+                        is_pv: is_pv_of(gen_bound),
                     });
                 }
             }
@@ -163,10 +170,11 @@ impl TranspositionTable {
         flag: TTFlag,
         best_move: Move,
         raw_eval: i16,
+        is_pv: bool,
     ) {
         let idx = self.index(key);
         let cluster = &self.clusters[idx];
-        let curr_gen = self.generation.load(Ordering::Relaxed) & 0x3F;
+        let curr_gen = self.generation.load(Ordering::Relaxed) & 0x1F;
 
         let mut replace_idx = 0;
         let mut lowest_score = i32::MAX;
@@ -193,9 +201,10 @@ impl TranspositionTable {
                 continue;
             }
 
-            let entry_age = (64 + curr_gen - age_of(data)) & 0x3F;
+            let entry_age = (32 + curr_gen - age_of(data)) & 0x1F;
             let entry_depth = ((data >> 24) & 0xFF) as i32;
-            let priority = entry_depth - (entry_age as i32 * 8);
+            let is_pv_entry = is_pv_of(gen_bound);
+            let priority = entry_depth - (entry_age as i32 * 8) + (is_pv_entry as i32 * 4);
 
             if priority < lowest_score {
                 lowest_score = priority;
@@ -205,7 +214,7 @@ impl TranspositionTable {
 
         if found_match {
             let old_depth = ((old_data >> 24) & 0xFF) as i32;
-            let old_age_diff = (64 + curr_gen - age_of(old_data)) & 0x3F;
+            let old_age_diff = (32 + curr_gen - age_of(old_data)) & 0x1F;
             if flag != TTFlag::Exact && old_age_diff == 0 && (depth as i32) + 4 <= old_depth {
                 if best_move != Move::NULL {
                     let new_mv = best_move.0 as u64;
@@ -228,8 +237,13 @@ impl TranspositionTable {
             best_move.0
         };
 
+        // A node that has ever been part of the PV keeps that flag, so later
+        // non-PV probes can still treat it as critical.
+        let old_is_pv = found_match && is_pv_of(((old_data >> 16) & 0xFF) as u8);
+        let store_is_pv = is_pv || old_is_pv;
+
         let entry_score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        let gen_bound = (curr_gen << 2) | (flag as u8);
+        let gen_bound = ((curr_gen & 0x1F) << 3) | ((store_is_pv as u8) << 2) | (flag as u8);
         let new_data = pack_data(entry_score, raw_eval, depth, gen_bound, mv);
 
         // Write plain data first, then the xored key so a racing reader
@@ -257,11 +271,13 @@ mod tests {
     fn store_keeps_deeper_entry() {
         let tt = TranspositionTable::new(1);
         tt.new_search();
-        tt.store(42, 100, 8, TTFlag::Exact, Move(1), 0);
-        tt.store(42, 50, 0, TTFlag::LowerBound, Move::NULL, 0);
+        tt.store(42, 100, 8, TTFlag::Exact, Move(1), 0, true);
+        tt.store(42, 50, 0, TTFlag::LowerBound, Move::NULL, 0, false);
 
         let entry = tt.probe(42).unwrap();
         assert_eq!(entry.depth, 8);
         assert!(entry.best_move == Move(1));
+        // The shallow non-PV store must not clear the existing PV flag.
+        assert!(entry.is_pv);
     }
 }

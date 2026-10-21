@@ -980,15 +980,25 @@ unsafe {
             }
 
             if score < singular_beta {
-                // Double extension if all alternative moves failed by a wide margin
+                // The wider the gap to every alternative, the more this move
+                // deserves extra depth.
                 let double_margin = singular_margin * 2;
-                if !is_pv && score < singular_beta - double_margin {
+                let triple_margin = singular_margin * 3;
+                if !is_pv && score < singular_beta - triple_margin {
+                    extension = 3;
+                } else if !is_pv && score < singular_beta - double_margin {
                     extension = 2;
                 } else {
                     extension = 1;
                 }
             } else if singular_beta >= beta {
                 return singular_beta;
+            } else if tt_score >= beta {
+                // Alternatives are just as good, so give the TT move less depth
+                // instead of spending a full search on it.
+                extension = if !is_pv { -2 } else { -1 };
+            } else if cut_node {
+                extension = -1;
             }
         }
 
@@ -1129,7 +1139,7 @@ unsafe {
             let ext = if m == tt_move { extension } else { 0 };
 
             let score = if moves_searched == 0 {
-                let next_depth = (depth as i32 - 1 + ext).max(0) as u8;
+                let next_depth = (depth as i32 - 1 + ext).clamp(0, MAX_PLY as i32 - 1) as u8;
                 let child_cut = !is_pv && !cut_node;
                 -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, child_cut)
             } else {

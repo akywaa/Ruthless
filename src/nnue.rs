@@ -48,7 +48,27 @@ pub fn network() -> &'static Network {
         assert!(!ptr.is_null(), "out of memory allocating network");
         unsafe {
             std::ptr::copy_nonoverlapping(NETWORK_BYTES.as_ptr(), ptr, NETWORK_BYTES.len());
-            &*(ptr as *const Network)
+            let net = &*(ptr as *const Network);
+
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                // The AVX2 output layer multiplies clipped activations (0..=QA)
+                // by output weights in 16-bit lanes, which is only exact while
+                // |weight| * QA fits into an i16. Reject a net that would
+                // silently produce wrong evaluations instead.
+                let mut max_abs = 0i32;
+                for bucket in &net.output_weights {
+                    for &w in bucket.iter() {
+                        max_abs = max_abs.max((w as i32).abs());
+                    }
+                }
+                assert!(
+                    max_abs * i32::from(QA) <= i32::from(i16::MAX),
+                    "network output weights exceed the 16-bit SIMD range"
+                );
+            }
+
+            net
         }
     })
 }
@@ -512,55 +532,36 @@ unsafe fn evaluate_avx2(
     unsafe {
         let zero = _mm256_setzero_si256();
         let qa = _mm256_set1_epi16(QA);
-        let mut acc64 = _mm256_setzero_si256();
+        // Eight i32 lanes. Each lane only ever sums a few dozen products of at
+        // most QA * QA * 128, so i32 cannot overflow here.
+        let mut sum = _mm256_setzero_si256();
 
         let mut evaluate_side = |vals: &[i16; HIDDEN_SIZE], offset: usize| {
             let v_ptr = vals.as_ptr() as *const __m256i;
             let w_ptr = net.output_weights[bucket][offset..].as_ptr() as *const __m256i;
-            let mut acc = _mm256_setzero_si256();
 
             for chunk in 0..(HIDDEN_SIZE / 16) {
                 let v = _mm256_load_si256(v_ptr.add(chunk));
-                let clamped = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa);
-
-                // Split both clamped and weights into 128-bit halves with the
-                // same sign-extension so lane i pairs with weight i.
-                let low_16 = _mm256_castsi256_si128(clamped);
-                let high_16 = _mm256_extracti128_si256(clamped, 1);
-                let y_low = _mm256_cvtepi16_epi32(low_16);
-                let y_high = _mm256_cvtepi16_epi32(high_16);
-
+                let x = _mm256_min_epi16(_mm256_max_epi16(v, zero), qa);
                 let w = _mm256_loadu_si256(w_ptr.add(chunk));
-                let w_low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(w));
-                let w_high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(w, 1));
 
-                // Single screlu*w product per lane fits in i32 (screlu <= QA^2,
-                // |w| bounded). Sign-extend to i64 and accumulate there so the
-                // running total cannot overflow i32.
-                let p_low = _mm256_mullo_epi32(_mm256_mullo_epi32(y_low, y_low), w_low);
-                let p_high = _mm256_mullo_epi32(_mm256_mullo_epi32(y_high, y_high), w_high);
-                acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(p_low)));
-                acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(p_high)));
-
-                // Low 128 bits already consumed; do the high halves.
-                let p_low_hi = _mm256_extracti128_si256(p_low, 1);
-                acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(p_low_hi));
-                let p_high_hi = _mm256_extracti128_si256(p_high, 1);
-                acc = _mm256_add_epi64(acc, _mm256_cvtepi32_epi64(p_high_hi));
+                // x is in 0..=QA and |w| * QA fits in an i16 (checked when the
+                // network is loaded), so this 16-bit product is exact.
+                let xw = _mm256_mullo_epi16(x, w);
+                // madd sums adjacent pairs into i32 lanes: x * (x * w) = x^2 * w.
+                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(x, xw));
             }
-
-            acc64 = _mm256_add_epi64(acc64, acc);
         };
 
         evaluate_side(&acc.vals[us], 0);
         evaluate_side(&acc.vals[them], HIDDEN_SIZE);
 
-        let mut arr = [0i64; 4];
-        _mm256_storeu_si256(arr.as_mut_ptr() as *mut _, acc64);
+        let mut arr = [0i32; 8];
+        _mm256_storeu_si256(arr.as_mut_ptr() as *mut _, sum);
 
         let mut output = 0i64;
-        for i in 0..4 {
-            output += arr[i];
+        for &lane in arr.iter() {
+            output += i64::from(lane);
         }
 
         output /= i64::from(QA);

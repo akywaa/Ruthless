@@ -216,14 +216,15 @@ impl TranspositionTable {
             let old_depth = ((old_data >> 24) & 0xFF) as i32;
             let old_age_diff = (32 + curr_gen - age_of(old_data)) & 0x1F;
             if flag != TTFlag::Exact && old_age_diff == 0 && (depth as i32) + 4 <= old_depth {
-                if best_move != Move::NULL {
-                    let new_mv = best_move.0 as u64;
-                    if new_mv != (old_data & 0xFFFF) {
-                        let updated = (old_data & !0xFFFF) | new_mv;
-                        let entry = &cluster.entries[replace_idx];
-                        entry.data.store(updated, Ordering::Relaxed);
-                        entry.key.store(key ^ updated, Ordering::Relaxed);
-                    }
+                // The entry comes from a much deeper search, so keep its score
+                // and depth. Only fill in a move when it has none: a move from
+                // this shallow node would otherwise replace a better one and
+                // corrupt move ordering on later visits.
+                if best_move != Move::NULL && (old_data & 0xFFFF) == 0 {
+                    let updated = (old_data & !0xFFFF) | best_move.0 as u64;
+                    let entry = &cluster.entries[replace_idx];
+                    entry.data.store(updated, Ordering::Relaxed);
+                    entry.key.store(key ^ updated, Ordering::Relaxed);
                 }
                 return;
             }
@@ -279,5 +280,30 @@ mod tests {
         assert!(entry.best_move == Move(1));
         // The shallow non-PV store must not clear the existing PV flag.
         assert!(entry.is_pv);
+    }
+
+    #[test]
+    fn shallow_store_does_not_replace_deeper_move() {
+        let tt = TranspositionTable::new(1);
+        tt.new_search();
+        tt.store(42, 100, 8, TTFlag::Exact, Move(1), 0, true);
+        tt.store(42, -50, 1, TTFlag::UpperBound, Move(2), 0, false);
+
+        let entry = tt.probe(42).unwrap();
+        assert_eq!(entry.depth, 8);
+        assert_eq!(entry.score, 100);
+        assert!(entry.best_move == Move(1));
+    }
+
+    #[test]
+    fn shallow_store_fills_missing_deeper_move() {
+        let tt = TranspositionTable::new(1);
+        tt.new_search();
+        tt.store(42, 100, 8, TTFlag::UpperBound, Move::NULL, 0, false);
+        tt.store(42, -50, 1, TTFlag::UpperBound, Move(7), 0, false);
+
+        let entry = tt.probe(42).unwrap();
+        assert_eq!(entry.depth, 8);
+        assert!(entry.best_move == Move(7));
     }
 }

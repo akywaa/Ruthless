@@ -1,7 +1,7 @@
 use crate::board::Board;
 use crate::types::{Color, Piece, Square};
 
-pub const HIDDEN_SIZE: usize = 512;
+pub const HIDDEN_SIZE: usize = 1024;
 pub const NUM_INPUT_BUCKETS: usize = 10;
 pub const NUM_OUTPUT_BUCKETS: usize = 8;
 pub const SCALE: i32 = 880;

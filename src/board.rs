@@ -575,6 +575,42 @@ impl Board {
         }
     }
 
+    /// Squares from which one of our pieces of a given type would check the
+    /// enemy king, indexed by `PieceType`. Preparing it once per node turns the
+    /// per-move test into a single bitboard lookup instead of two slider lookups.
+    #[inline(always)]
+    pub fn check_squares(&self) -> [Bitboard; 6] {
+        let us = self.side_to_move;
+        let ksq = self.king_square(!us);
+        let bishop = bishop_attacks(ksq, self.occupied);
+        let rook = rook_attacks(ksq, self.occupied);
+
+        let mut squares = [Bitboard::EMPTY; 6];
+        squares[PieceType::Pawn as usize] = pawn_attacks(!us, ksq);
+        squares[PieceType::Knight as usize] = knight_attacks(ksq);
+        squares[PieceType::Bishop as usize] = bishop;
+        squares[PieceType::Rook as usize] = rook;
+        squares[PieceType::Queen as usize] = bishop | rook;
+        squares
+    }
+
+    /// `gives_direct_check` evaluated against a table from `check_squares`.
+    /// Castling is the exception: the rook gives the check there, not the king.
+    #[inline(always)]
+    pub fn gives_check_with(&self, m: Move, check_squares: &[Bitboard; 6]) -> bool {
+        if m.move_type() == MoveType::Castling {
+            return self.gives_direct_check(m);
+        }
+
+        let pt = if m.move_type() == MoveType::Promotion {
+            m.promo_type()
+        } else {
+            self.piece_on[m.from()].piece_type()
+        };
+
+        pt != PieceType::None && check_squares[pt as usize].contains(m.to())
+    }
+
     pub fn is_legal(&self, m: Move) -> bool {
         let us = self.side_to_move;
         self.is_legal_with(m, self.checkers(), self.pinned_pieces(us))
@@ -1241,6 +1277,45 @@ mod tests {
     }
 
     #[test]
+    fn check_squares_match_direct_check() {
+        let check = |board: &Board, fen: &str| {
+            let squares = board.check_squares();
+            for &m in pseudo_legal(board).as_slice() {
+                // Castling checks are given by the rook, not the king, so the
+                // per-piece-type table does not cover them.
+                if m.move_type() == MoveType::Castling {
+                    continue;
+                }
+                assert_eq!(
+                    board.gives_check_with(m, &squares),
+                    board.gives_direct_check(m),
+                    "check detection mismatch on {} in {}",
+                    m,
+                    fen
+                );
+            }
+        };
+
+        let promos = Board::from_fen("4k3/6P1/8/8/8/8/1p6/K7 w - - 0 1").unwrap();
+        check(&promos, "promotions");
+
+        let mut board = Board::default();
+        let mut rng: u64 = 0x0BAD_F00D_1234_5678;
+        for _ in 0..200 {
+            check(&board, "random walk");
+            let moves = generate_legal_moves(&board);
+            if moves.count == 0 {
+                break;
+            }
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            board.make_move(moves.get((rng as usize) % moves.count));
+            board.reset_accumulator_stack();
+        }
+    }
+
+    #[test]
     fn debug_game_position() {
         let mut board = Board::default();
         for s in [
@@ -1285,7 +1360,7 @@ mod tests {
             rng ^= rng >> 7;
             rng ^= rng << 17;
             let pick = (rng as usize) % moves.count;
-            board.make_move(moves.moves[pick]);
+            board.make_move(moves.get(pick));
             board.reset_accumulator_stack();
         }
     }
@@ -1329,7 +1404,7 @@ mod tests {
                 rng ^= rng << 13;
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
-                board.make_move(moves.moves[(rng as usize) % moves.count]);
+                board.make_move(moves.get((rng as usize) % moves.count));
                 board.reset_accumulator_stack();
             }
         }

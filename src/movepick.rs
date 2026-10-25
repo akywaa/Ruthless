@@ -40,6 +40,12 @@ pub struct MovePicker {
     checkers: Bitboard,
     pinned: Bitboard,
     king_info_ready: bool,
+    /// Opponent threats in the node's position, computed at most once and
+    /// shared by move scoring and the search's history updates.
+    threats: Option<Bitboard>,
+    /// Check squares for this node, computed at most once and shared by every
+    /// move scored here and by the search's pruning decisions.
+    check_squares: Option<[Bitboard; 6]>,
     /// Whether the move returned by the last `next()` call is a capture with
     /// SEE >= 0. Cached here so the search does not have to run SEE a second
     /// time on the same move.
@@ -63,8 +69,37 @@ impl MovePicker {
             checkers: Bitboard::EMPTY,
             pinned: Bitboard::EMPTY,
             king_info_ready: false,
+            threats: None,
+            check_squares: None,
             last_see_ge_zero: true,
         }
+    }
+
+    /// Opponent threats for the position this picker was created for.
+    #[inline(always)]
+    pub fn threats(&mut self, board: &Board) -> Bitboard {
+        match self.threats {
+            Some(t) => t,
+            None => {
+                let t = board.opponent_threats();
+                self.threats = Some(t);
+                t
+            }
+        }
+    }
+
+    /// Whether `m` gives a direct check, using per-node precomputed squares.
+    #[inline(always)]
+    pub fn gives_check(&mut self, board: &Board, m: Move) -> bool {
+        let squares = match self.check_squares {
+            Some(squares) => squares,
+            None => {
+                let squares = board.check_squares();
+                self.check_squares = Some(squares);
+                squares
+            }
+        };
+        board.gives_check_with(m, &squares)
     }
 
     pub fn new_qsearch(tt_move: Move) -> Self {
@@ -83,6 +118,8 @@ impl MovePicker {
             checkers: Bitboard::EMPTY,
             pinned: Bitboard::EMPTY,
             king_info_ready: false,
+            threats: None,
+            check_squares: None,
             last_see_ge_zero: true,
         }
     }
@@ -260,18 +297,18 @@ impl MovePicker {
         }
 
         self.scores.swap(self.cur_idx, best_idx);
-        self.moves.moves.swap(self.cur_idx, best_idx);
+        self.moves.swap(self.cur_idx, best_idx);
 
-        let m = self.moves.moves[self.cur_idx];
+        let m = self.moves.get(self.cur_idx);
         self.cur_idx += 1;
         m
     }
 
     fn score_noisy(&mut self, board: &Board, noisy_history: &[[[[i32; 2]; 6]; 64]; 12]) {
-        let threats = board.opponent_threats();
+        let threats = self.threats(board);
 
         for i in 0..self.moves.count {
-            let m = self.moves.moves[i];
+            let m = self.moves.get(i);
             let attacker = board.piece_on[m.from()];
             let captured = board.piece_on[m.to()];
             let victim_pt = match m.move_type() {
@@ -295,7 +332,7 @@ impl MovePicker {
                 if m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Queen {
                     score += 3000;
                 }
-                if board.gives_direct_check(m) {
+                if self.gives_check(board, m) {
                     score += 2000;
                 }
 
@@ -323,7 +360,7 @@ impl MovePicker {
         let ply_idx = ply as usize;
 
         for i in 0..self.moves.count {
-            let m = self.moves.moves[i];
+            let m = self.moves.get(i);
             let from = m.from();
             let to = m.to();
             let piece = board.piece_on[from];
@@ -351,7 +388,7 @@ impl MovePicker {
 
             let is_threatened_to = to_threat == 1;
 
-            if board.gives_direct_check(m) && !is_threatened_to {
+            if self.gives_check(board, m) && !is_threatened_to {
                 score += 2000;
             }
 

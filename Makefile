@@ -2,6 +2,10 @@
 
 .PHONY: all pgo clean release-v2 release-v3 release-v4
 
+# Host triple, used to locate the binary cargo-pgo produces.
+HOST := $(shell rustc -vV | sed -n 's/^host: //p')
+EXE := $(if $(filter Windows_NT,$(OS)),.exe,)
+
 all:
 	cargo build --release
 
@@ -27,7 +31,14 @@ pgo:
 	cargo pgo run -- bench
 	@echo "3/3: Building optimized engine..."
 	cargo pgo optimize
-	@echo "PGO build complete! The binary is located in target/x86_64-unknown-linux-gnu/release/"
+	@mkdir -p target/release
+	@if [ -f "target/$(HOST)/release/Ruthless$(EXE)" ]; then \
+		cp "target/$(HOST)/release/Ruthless$(EXE)" "target/release/Ruthless$(EXE)"; \
+		cp "target/$(HOST)/release/Ruthless$(EXE)" "target/release/Ruthless-pgo$(EXE)"; \
+		echo "PGO build complete: target/release/Ruthless$(EXE) (copy kept as Ruthless-pgo$(EXE))"; \
+	else \
+		echo "PGO build complete: look for Ruthless$(EXE) under target/$(HOST)/release/"; \
+	fi
 
 clean:
 	cargo clean

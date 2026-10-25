@@ -1,3 +1,4 @@
+use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut, Not};
 
 pub const SQUARE_NB: usize = 64;
@@ -308,7 +309,9 @@ impl std::fmt::Display for Move {
 
 #[derive(Copy, Clone)]
 pub struct MoveList {
-    pub moves: [Move; 256],
+    // Only `0..count` is ever initialized, so the array must not be zeroed up
+    // front: that would mean a 512-byte memset on every move generation.
+    moves: [MaybeUninit<Move>; 256],
     pub count: usize,
 }
 
@@ -316,19 +319,32 @@ impl MoveList {
     #[inline(always)]
     pub fn new() -> Self {
         Self {
-            moves: [Move::NULL; 256],
+            moves: [MaybeUninit::uninit(); 256],
             count: 0,
         }
     }
 
     #[inline(always)]
     pub fn push(&mut self, m: Move) {
-        self.moves[self.count] = m;
+        self.moves[self.count].write(m);
         self.count += 1;
     }
 
     #[inline(always)]
+    pub fn get(&self, index: usize) -> Move {
+        debug_assert!(index < self.count);
+        unsafe { self.moves[index].assume_init() }
+    }
+
+    #[inline(always)]
+    pub fn swap(&mut self, a: usize, b: usize) {
+        self.moves.swap(a, b);
+    }
+
+    #[inline(always)]
     pub fn as_slice(&self) -> &[Move] {
-        &self.moves[..self.count]
+        // `MaybeUninit<Move>` has the layout of `Move`, and `0..count` is fully
+        // initialized, so the prefix is a valid slice of moves.
+        unsafe { std::slice::from_raw_parts(self.moves.as_ptr() as *const Move, self.count) }
     }
 }

@@ -321,13 +321,12 @@ unsafe {
     }
 
     #[inline(always)]
-    fn quiet_history_score(&self, board: &Board, ply: u8, m: Move) -> i32 {
+    fn quiet_history_score(&self, board: &Board, ply: u8, m: Move, pawn_threats: Bitboard) -> i32 {
         let us = board.side_to_move as usize;
         let piece = board.piece_on[m.from()];
         let p_idx = (board.pawn_hash as usize) & 511;
-        let threats = board.opponent_pawn_threats();
-        let from_th = threats.contains(m.from()) as usize;
-        let to_th = threats.contains(m.to()) as usize;
+        let from_th = pawn_threats.contains(m.from()) as usize;
+        let to_th = pawn_threats.contains(m.to()) as usize;
 
         self.history[us][from_th][to_th][m.from() as usize][m.to() as usize]
             + self.pawn_history[p_idx][piece as usize][m.to() as usize]
@@ -382,7 +381,7 @@ unsafe {
             return Move::NULL;
         }
         if legal_moves.count == 1 {
-            return legal_moves.moves[0];
+            return legal_moves.get(0);
         }
 
         self.nodes = 0;
@@ -394,7 +393,15 @@ unsafe {
         self.root_best_move_pending = Move::NULL;
         board.root_ply = board.history.len();
 
-        let mut best_move = legal_moves.moves[0];
+        // If the search is interrupted before the first iteration finishes, a
+        // legal TT move is a much better fallback than whichever move the
+        // generator happened to emit first.
+        let mut best_move = self
+            .tt
+            .probe(board.tt_hash)
+            .map(|e| e.best_move)
+            .filter(|&m| m != Move::NULL && legal_moves.as_slice().contains(&m))
+            .unwrap_or(legal_moves.get(0));
         let mut prev_best_move = Move::NULL;
         let mut score = 0;
         let mut prev_score = 0;
@@ -1041,7 +1048,7 @@ unsafe {
         };
 
         let mut picker = MovePicker::new(tt_move, killers, counter_move);
-        let mut threats_cache: Option<Bitboard> = None;
+        let mut pawn_threats: Option<Bitboard> = None;
 
         while let Some(m) = picker.next(
             board,
@@ -1060,10 +1067,10 @@ unsafe {
             let is_capture = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
             let is_quiet = !is_capture && m.move_type() != MoveType::Promotion;
             let hist = if is_quiet {
-                self.quiet_history_score(board, ply, m)
+                let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                self.quiet_history_score(board, ply, m, pt)
             } else {
-                let threats = *threats_cache.get_or_insert_with(|| board.opponent_threats());
-                self.noisy_history_score(board, m, threats)
+                self.noisy_history_score(board, m, picker.threats(board))
             };
 
             // LMR will search later moves shallower than `depth`, so shallow
@@ -1079,8 +1086,9 @@ unsafe {
             // Do not prune while the best score so far is a loss: the remaining
             // moves may still hold the only defence.
             if !tt_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
-                // Quiet-move pruning is the only user of the direct-check test.
-                if is_quiet && !board.gives_direct_check(m) {
+                // Quiet moves that check the enemy king are never pruned. The
+                // picker's cached check squares make this a single lookup.
+                if is_quiet && !picker.gives_check(board, m) {
                     if moves_searched >= lmp_threshold && hist < 2000 {
                         continue;
                     }
@@ -1134,9 +1142,9 @@ unsafe {
                 self.played_moves[ply as usize] = m;
                 self.played_pieces[ply as usize] = board.piece_on[m.from()];
                 self.prev_is_capture[ply as usize] = is_capture;
-                let pawn_threats = board.opponent_pawn_threats();
-                self.played_threat_state[ply as usize] = ((pawn_threats.contains(m.from()) as u8) << 1)
-                    | (pawn_threats.contains(m.to()) as u8);
+                let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                self.played_threat_state[ply as usize] = ((pt.contains(m.from()) as u8) << 1)
+                    | (pt.contains(m.to()) as u8);
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
@@ -1236,20 +1244,22 @@ unsafe {
                 return 0;
             }
 
+            // The TT move is only an ordering hint, so it is the move with the
+            // best score of this node even when no move raised alpha. Leaving
+            // it empty on fail-low nodes would strip the move from the entry
+            // and trigger a bogus internal iterative reduction on the next
+            // visit.
             if score > best_score {
                 best_score = score;
+                best_move = m;
                 if ply == 0 && !self.stop.load(Ordering::Relaxed) {
                     self.root_best_move_pending = m;
                     self.root_best_idx = moves_searched - 1;
                 }
             }
 
-            // Only a move that actually raised alpha is worth storing as the
-            // TT best move. A fail-low move carries a score that was cut off at
-            // alpha and would wreck move ordering on later visits.
             if score > alpha {
                 alpha = score;
-                best_move = m;
             }
 
             if alpha >= beta {
@@ -1263,7 +1273,7 @@ unsafe {
                     _ => board.piece_on[m.to()].piece_type(),
                 } as usize;
 
-                let threats = *threats_cache.get_or_insert_with(|| board.opponent_threats());
+                let threats = picker.threats(board);
                 let to_threatened = threats.contains(m.to()) as usize;
 
                 if is_quiet {
@@ -1280,9 +1290,9 @@ unsafe {
 
                     let us = board.side_to_move as usize;
                     let p_idx = (board.pawn_hash as usize) & 511;
-                    let pawn_threats = board.opponent_pawn_threats();
-                    let m_from_th = pawn_threats.contains(m.from()) as usize;
-                    let m_to_th = pawn_threats.contains(m.to()) as usize;
+                    let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                    let m_from_th = pt.contains(m.from()) as usize;
+                    let m_to_th = pt.contains(m.to()) as usize;
 
                     update_history(
                         &mut self.history[us][m_from_th][m_to_th][m.from() as usize][m.to() as usize],
@@ -1299,8 +1309,8 @@ unsafe {
 
                         let q_pc = board.piece_on[qm.from()] as usize;
                         if q_pc < 12 {
-                            let q_from_th = pawn_threats.contains(qm.from()) as usize;
-                            let q_to_th = pawn_threats.contains(qm.to()) as usize;
+                            let q_from_th = pt.contains(qm.from()) as usize;
+                            let q_to_th = pt.contains(qm.to()) as usize;
                             update_history(
                                 &mut self.history[us][q_from_th][q_to_th][qm.from() as usize][qm.to() as usize],
                                 -malus,
@@ -1478,12 +1488,14 @@ unsafe {
         }
 
         // Hard cap on qsearch depth so long check sequences cannot explode
-        // the tree beyond the main search line.
-        if qply >= 16 {
+        // the tree beyond the main search line. The cap only applies outside
+        // of check: standing pat on the static evaluation of an attacked king
+        // is meaningless, so a check at the limit still gets its evasions.
+        let in_check = board.in_check();
+
+        if qply >= 16 && !in_check {
             return self.corrected_eval(board, ply, self.raw_eval(board));
         }
-
-        let in_check = board.in_check();
         let mut tt_move = Move::NULL;
         let mut tt_score: Option<i32> = None;
         let mut tt_flag = TTFlag::None;
@@ -1542,8 +1554,9 @@ unsafe {
             // array does not need to be zeroed up front.
             let mut scores: [std::mem::MaybeUninit<i32>; 256] =
                 [const { std::mem::MaybeUninit::uninit() }; 256];
+            let pawn_threats = board.opponent_pawn_threats();
             for i in 0..moves.count {
-                let m = moves.moves[i];
+                let m = moves.get(i);
                 let score = if m == tt_move {
                     1_000_000
                 } else if board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant {
@@ -1554,7 +1567,7 @@ unsafe {
                     let attacker = board.piece_on[m.from()].piece_type();
                     100_000 + crate::eval::PIECE_VALUES[victim as usize] * 10 - crate::eval::PIECE_VALUES[attacker as usize]
                 } else {
-                    self.quiet_history_score(board, ply, m)
+                    self.quiet_history_score(board, ply, m, pawn_threats)
                 };
                 scores[i].write(score);
             }
@@ -1567,9 +1580,9 @@ unsafe {
                     }
                 }
                 scores.swap(i, best_idx);
-                moves.moves.swap(i, best_idx);
+                moves.swap(i, best_idx);
 
-                let m = moves.moves[i];
+                let m = moves.get(i);
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = m;
                     self.played_pieces[ply as usize] = board.piece_on[m.from()];
@@ -1684,7 +1697,7 @@ unsafe {
                     _ => board.piece_on[m.to()].piece_type(),
                 } as usize;
                 if moving_pc < 12 && victim_pt < 6 {
-                    let threats = board.opponent_threats();
+                    let threats = picker.threats(board);
                     let to_threatened = threats.contains(m.to()) as usize;
                     update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt][to_threatened], 100);
                 }

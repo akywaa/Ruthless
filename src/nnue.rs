@@ -50,22 +50,24 @@ pub fn network() -> &'static Network {
             std::ptr::copy_nonoverlapping(NETWORK_BYTES.as_ptr(), ptr, NETWORK_BYTES.len());
             let net = &*(ptr as *const Network);
 
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            #[cfg(target_arch = "x86_64")]
             {
                 // The AVX2 output layer multiplies clipped activations (0..=QA)
                 // by output weights in 16-bit lanes, which is only exact while
                 // |weight| * QA fits into an i16. Reject a net that would
                 // silently produce wrong evaluations instead.
-                let mut max_abs = 0i32;
-                for bucket in &net.output_weights {
-                    for &w in bucket.iter() {
-                        max_abs = max_abs.max((w as i32).abs());
+                if has_avx2() {
+                    let mut max_abs = 0i32;
+                    for bucket in &net.output_weights {
+                        for &w in bucket.iter() {
+                            max_abs = max_abs.max((w as i32).abs());
+                        }
                     }
+                    assert!(
+                        max_abs * i32::from(QA) <= i32::from(i16::MAX),
+                        "network output weights exceed the 16-bit SIMD range"
+                    );
                 }
-                assert!(
-                    max_abs * i32::from(QA) <= i32::from(i16::MAX),
-                    "network output weights exceed the 16-bit SIMD range"
-                );
             }
 
             net
@@ -92,110 +94,14 @@ impl Accumulator {
     pub fn add_feature_side(&mut self, piece: Piece, sq: Square, ksq: Square, color: Color) {
         let net = network();
         let idx = feature_index_side(piece, sq, ksq, color);
-        let weights = &net.feature_weights[idx].vals;
-        let side = color as usize;
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            unsafe {
-                vec_add_avx512(&mut self.vals[side], weights);
-                return;
-            }
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(all(target_feature = "avx512f", target_feature = "avx512bw"))
-        ))]
-        {
-            unsafe {
-                vec_add_avx2(&mut self.vals[side], weights);
-                return;
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            unsafe {
-                vec_add_neon(&mut self.vals[side], weights);
-                return;
-            }
-        }
-
-        #[cfg(not(any(
-            all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512bw"
-            ),
-            all(target_arch = "x86_64", target_feature = "avx2"),
-            target_arch = "aarch64"
-        )))]
-        {
-            for i in 0..HIDDEN_SIZE {
-                self.vals[side][i] += weights[i];
-            }
-        }
+        add_feature_weights(&mut self.vals[color as usize], &net.feature_weights[idx].vals);
     }
 
     #[inline(always)]
     pub fn remove_feature_side(&mut self, piece: Piece, sq: Square, ksq: Square, color: Color) {
         let net = network();
         let idx = feature_index_side(piece, sq, ksq, color);
-        let weights = &net.feature_weights[idx].vals;
-        let side = color as usize;
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ))]
-        {
-            unsafe {
-                vec_sub_avx512(&mut self.vals[side], weights);
-                return;
-            }
-        }
-
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(all(target_feature = "avx512f", target_feature = "avx512bw"))
-        ))]
-        {
-            unsafe {
-                vec_sub_avx2(&mut self.vals[side], weights);
-                return;
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            unsafe {
-                vec_sub_neon(&mut self.vals[side], weights);
-                return;
-            }
-        }
-
-        #[cfg(not(any(
-            all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "avx512bw"
-            ),
-            all(target_arch = "x86_64", target_feature = "avx2"),
-            target_arch = "aarch64"
-        )))]
-        {
-            for i in 0..HIDDEN_SIZE {
-                self.vals[side][i] -= weights[i];
-            }
-        }
+        sub_feature_weights(&mut self.vals[color as usize], &net.feature_weights[idx].vals);
     }
 
     #[inline(always)]
@@ -220,6 +126,119 @@ impl Accumulator {
             if piece != Piece::None {
                 self.add_feature_side(piece, Square::new(sq as u8), ksq, color);
             }
+        }
+    }
+}
+
+/// AVX2 support, cached after the first runtime check. Builds compiled with
+/// AVX2 enabled answer `true` at compile time, so the vector code keeps being
+/// inlined exactly as before; portable builds dispatch at runtime instead of
+/// falling back to the scalar loops on every AVX2 machine.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn has_avx2() -> bool {
+    #[cfg(target_feature = "avx2")]
+    {
+        true
+    }
+
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        // 0 = not checked yet, 1 = unsupported, 2 = supported.
+        static AVX2: AtomicU8 = AtomicU8::new(0);
+
+        match AVX2.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let supported = std::arch::is_x86_feature_detected!("avx2");
+                AVX2.store(if supported { 2 } else { 1 }, Ordering::Relaxed);
+                supported
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn add_feature_weights(vals: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        unsafe { vec_add_avx512(vals, weights) };
+        return;
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+    ))]
+    {
+        if has_avx2() {
+            unsafe { vec_add_avx2(vals, weights) };
+            return;
+        }
+        for (dst, &w) in vals.iter_mut().zip(weights.iter()) {
+            *dst += w;
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { vec_add_neon(vals, weights) };
+        return;
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        for (dst, &w) in vals.iter_mut().zip(weights.iter()) {
+            *dst += w;
+        }
+    }
+}
+
+#[inline(always)]
+fn sub_feature_weights(vals: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        unsafe { vec_sub_avx512(vals, weights) };
+        return;
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+    ))]
+    {
+        if has_avx2() {
+            unsafe { vec_sub_avx2(vals, weights) };
+            return;
+        }
+        for (dst, &w) in vals.iter_mut().zip(weights.iter()) {
+            *dst -= w;
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { vec_sub_neon(vals, weights) };
+        return;
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        for (dst, &w) in vals.iter_mut().zip(weights.iter()) {
+            *dst -= w;
         }
     }
 }
@@ -274,11 +293,39 @@ pub fn output_bucket(board: &Board) -> usize {
     ((board.occupied.count() as usize - 2) / 4).min(7)
 }
 
-#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "avx2"))))]
 #[inline(always)]
 fn screlu(x: i16) -> i32 {
     let y = i32::from(x).clamp(0, i32::from(QA));
     y * y
+}
+
+/// Scalar reference output layer. Always compiled: it is the fallback for
+/// machines without AVX2 and the reference the SIMD kernels are tested against.
+fn evaluate_scalar(
+    acc: &Accumulator,
+    us: usize,
+    them: usize,
+    bucket: usize,
+    net: &'static Network,
+) -> i32 {
+    let mut output = 0i64;
+
+    // First weight half pairs with the side to move, the second half with the
+    // opponent (dual-perspective training).
+    for i in 0..HIDDEN_SIZE {
+        output += screlu(acc.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
+    }
+
+    for i in 0..HIDDEN_SIZE {
+        output += screlu(acc.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
+    }
+
+    output /= i64::from(QA);
+    output += i64::from(net.output_bias[bucket]);
+    output *= SCALE as i64;
+    output /= i64::from(QA) * i64::from(QB);
+
+    output as i32
 }
 
 #[inline(always)]
@@ -286,72 +333,47 @@ pub fn evaluate(board: &Board) -> i32 {
     let net = network();
     let bucket = output_bucket(board);
     let acc = &board.accumulators[board.acc_index];
+    let us = board.side_to_move as usize;
+    let them = us ^ 1;
+    evaluate_acc(acc, us, them, bucket, net)
+}
 
+#[inline(always)]
+fn evaluate_acc(
+    acc: &Accumulator,
+    us: usize,
+    them: usize,
+    bucket: usize,
+    net: &'static Network,
+) -> i32 {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "avx512bw"
     ))]
     {
-        unsafe {
-            let us = board.side_to_move as usize;
-            let them = us ^ 1;
-            return evaluate_avx512(acc, us, them, bucket, net);
-        }
+        return unsafe { evaluate_avx512(acc, us, them, bucket, net) };
     }
 
     #[cfg(all(
         target_arch = "x86_64",
-        target_feature = "avx2",
         not(all(target_feature = "avx512f", target_feature = "avx512bw"))
     ))]
     {
-        unsafe {
-            let us = board.side_to_move as usize;
-            let them = us ^ 1;
-            return evaluate_avx2(acc, us, them, bucket, net);
+        if has_avx2() {
+            return unsafe { evaluate_avx2(acc, us, them, bucket, net) };
         }
+        return evaluate_scalar(acc, us, them, bucket, net);
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe {
-            let us = board.side_to_move as usize;
-            let them = us ^ 1;
-            return evaluate_neon(acc, us, them, bucket, net);
-        }
+        return unsafe { evaluate_neon(acc, us, them, bucket, net) };
     }
 
-    #[cfg(not(any(
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "avx512bw"
-        ),
-        all(target_arch = "x86_64", target_feature = "avx2"),
-        target_arch = "aarch64"
-    )))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        let mut output = 0i64;
-
-        // First weight half pairs with the side to move, the second half with the
-        // opponent (dual-perspective training).
-        let us = board.side_to_move as usize;
-        let them = us ^ 1;
-        for i in 0..HIDDEN_SIZE {
-            output += screlu(acc.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
-        }
-
-        for i in 0..HIDDEN_SIZE {
-            output += screlu(acc.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
-        }
-
-        output /= i64::from(QA);
-        output += i64::from(net.output_bias[bucket]);
-        output *= SCALE as i64;
-        output /= i64::from(QA) * i64::from(QB);
-
-        output as i32
+        evaluate_scalar(acc, us, them, bucket, net)
     }
 }
 
@@ -439,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(target_arch = "x86_64")]
     fn avx2_matches_scalar_random_walk() {
         if !is_x86_feature_detected!("avx2") {
             return;
@@ -460,18 +482,7 @@ mod tests {
                 let acc = &board.accumulators[board.acc_index];
                 // Scalar reference in the same [side-to-move, non-side-to-move]
                 // ordering and perspective used by the production evaluate().
-                let mut out = 0i64;
-                for i in 0..HIDDEN_SIZE {
-                    out += screlu(acc.vals[us][i]) as i64 * i64::from(net.output_weights[bucket][i]);
-                }
-                for i in 0..HIDDEN_SIZE {
-                    out += screlu(acc.vals[them][i]) as i64 * i64::from(net.output_weights[bucket][HIDDEN_SIZE + i]);
-                }
-                out /= i64::from(QA);
-                out += i64::from(net.output_bias[bucket]);
-                out *= SCALE as i64;
-                out /= i64::from(QA) * i64::from(QB);
-                let expected = out as i32;
+                let expected = evaluate_scalar(acc, us, them, bucket, net);
                 let got = unsafe { evaluate_avx2(acc, us, them, bucket, net) };
                 assert_eq!(got, expected, "AVX2 mismatch after {}", m);
                 board.undo_move(m, undo);
@@ -480,7 +491,7 @@ mod tests {
             rng ^= rng >> 7;
             rng ^= rng << 17;
             let pick = (rng as usize) % moves.count;
-            board.make_move(moves.moves[pick]);
+            board.make_move(moves.get(pick));
             // Collapse the accumulator stack; otherwise the walk overflows the
             // 256-ply stack and panics at board.rs make_move.
             board.reset_accumulator_stack();
@@ -488,7 +499,7 @@ mod tests {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
     use std::arch::x86_64::*;
@@ -503,7 +514,7 @@ unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn vec_sub_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
     use std::arch::x86_64::*;
@@ -518,7 +529,7 @@ unsafe fn vec_sub_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn evaluate_avx2(
     acc: &Accumulator,

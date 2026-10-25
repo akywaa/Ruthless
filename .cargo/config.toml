@@ -1,10 +1,15 @@
-# Portable x86-64 baseline (SSE4.2 + POPCNT). Never default to
-# `target-cpu=native`: such a binary dies with "illegal instruction" on any
-# machine that lacks one of the build host's ISA extensions.
-#
-# Release builds for a specific microarchitecture level (see README):
+# Default to the build host's CPU: the fastest binary for the machine doing
+# the build. Such a binary dies with "illegal instruction" on any machine that
+# lacks one of the build host's ISA extensions, so builds meant for other
+# people must target an explicit level instead (see README):
 #   RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
 #   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
 #   RUSTFLAGS="-C target-cpu=x86-64-v4" cargo build --release
+#
+# RUSTFLAGS set in the environment overrides the flags below. PGO comes on top
+# of this: `make pgo` on Unix, `pgo.bat` on Windows.
+#
+# The NNUE kernels dispatch on AVX2 at runtime, so even a v2 build uses the
+# vector paths on AVX2 hardware.
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=native"]

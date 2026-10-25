@@ -25,7 +25,20 @@ to share, pick an x86-64 level explicitly:
     RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
 
 Use `x86-64-v2` for the baseline or `x86-64-v4` for AVX-512. `make release-v2`,
-`release-v3` and `release-v4` do the same thing.
+`release-v3` and `release-v4` do the same thing. The NNUE kernels pick AVX2 at
+runtime, so a v2 build still uses the vector paths on AVX2 hardware.
+
+For the last few percent, build with profile-guided optimization:
+
+    cargo pgo instrument
+    cargo pgo run -- bench
+    cargo pgo optimize
+
+(`make pgo` on Unix, `pgo.bat` on Windows.) This needs `llvm-tools`
+(`rustup component add llvm-tools`) and `cargo-pgo` (`cargo install cargo-pgo`).
+The optimized binary is copied to `target/release/` and kept as
+`Ruthless-pgo` next to it, so a later plain `cargo build --release` cannot
+overwrite the only copy.
 
 To enable Syzygy support, put [Fathom](https://github.com/jdart1/Fathom) in
 `deps/Fathom` before building. Without it the engine builds fine, just

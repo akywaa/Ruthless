@@ -4,7 +4,7 @@ use crate::types::{Color, Piece, Square};
 pub const HIDDEN_SIZE: usize = 1024;
 pub const NUM_INPUT_BUCKETS: usize = 10;
 pub const NUM_OUTPUT_BUCKETS: usize = 8;
-pub const SCALE: i32 = 400;
+pub const SCALE: i32 = 880;
 pub const QA: i16 = 255;
 pub const QB: i16 = 64;
 

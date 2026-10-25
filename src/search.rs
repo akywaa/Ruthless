@@ -91,6 +91,10 @@ pub struct Searcher {
     prev_is_capture: [bool; MAX_PLY],
     played_threat_state: [u8; MAX_PLY],
     eval_stack: [i32; MAX_PLY],
+    // Reduction (in plies) applied to the move that reached each ply. Only set
+    // around a reduced search and reset right after it, so a child node can
+    // tell how much its parent move was reduced.
+    reduction_stack: [u8; MAX_PLY],
     root_move_nodes: [u64; 256],
     root_best_idx: usize,
     // Best root move of the iteration currently in progress. It is promoted to
@@ -193,6 +197,7 @@ cont_corr: alloc_box_zeroed(),
             prev_is_capture: [false; MAX_PLY],
             played_threat_state: [0; MAX_PLY],
             eval_stack: [0; MAX_PLY],
+            reduction_stack: [0; MAX_PLY],
             root_move_nodes: [0; 256],
             root_best_idx: 0,
             root_best_move_pending: Move::NULL,
@@ -224,6 +229,7 @@ unsafe {
         self.prev_is_capture = [false; MAX_PLY];
         self.played_threat_state = [0; MAX_PLY];
         self.eval_stack = [0; MAX_PLY];
+        self.reduction_stack = [0; MAX_PLY];
         self.root_move_nodes = [0; 256];
         self.root_best_idx = 0;
         self.root_best_move_pending = Move::NULL;
@@ -751,6 +757,29 @@ unsafe {
             self.eval_stack[ply as usize] = if in_check { EVAL_SENTINEL } else { static_eval };
         }
 
+        // Hindsight reduction adjustment. If the move that reached this node was
+        // reduced hard and the static evaluation did not get better for us, the
+        // reduction may have been too aggressive, so hand the depth back. A
+        // heavily reduced move that improved our standing a lot confirms the
+        // reduction and lets the node be searched one ply shallower.
+        if ply > 0 && !in_check {
+            let prev_idx = (ply - 1) as usize;
+            let prior_reduction = self.reduction_stack[prev_idx];
+            self.reduction_stack[prev_idx] = 0;
+            let parent_eval = self.eval_stack[prev_idx];
+
+            if prior_reduction > 0 && parent_eval != EVAL_SENTINEL {
+                let opponent_worsening = static_eval > -parent_eval;
+
+                if prior_reduction >= 3 && !opponent_worsening {
+                    depth = depth.saturating_add(1);
+                }
+                if prior_reduction >= 2 && depth >= 2 && static_eval + parent_eval > 166 {
+                    depth -= 1;
+                }
+            }
+        }
+
         // A TT score backed by the right bound is usually a sharper position
         // estimate than the raw eval, so use it for pruning decisions.
         let mut eval = static_eval;
@@ -1162,6 +1191,9 @@ unsafe {
             let score = if moves_searched == 0 {
                 let next_depth = (depth as i32 - 1 + ext).clamp(0, MAX_PLY as i32 - 1) as u8;
                 let child_cut = !is_pv && !cut_node;
+                if (ply as usize) < MAX_PLY {
+                    self.reduction_stack[ply as usize] = 0;
+                }
                 -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, child_cut)
             } else {
                 let mut r = 0;
@@ -1220,7 +1252,15 @@ unsafe {
 
                 let reduced = (depth as i32 - 1 - r).max(0) as u8;
 
+                // Record the applied reduction for the child node, which uses it
+                // to compensate an over-aggressive reduction (hindsight).
+                if (ply as usize) < MAX_PLY {
+                    self.reduction_stack[ply as usize] = r as u8;
+                }
                 let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL, true);
+                if (ply as usize) < MAX_PLY {
+                    self.reduction_stack[ply as usize] = 0;
+                }
 
                 if s > alpha && reduced < depth - 1 {
                     s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node);

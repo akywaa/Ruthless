@@ -1284,22 +1284,22 @@ unsafe {
                 return 0;
             }
 
-            // The TT move is only an ordering hint, so it is the move with the
-            // best score of this node even when no move raised alpha. Leaving
-            // it empty on fail-low nodes would strip the move from the entry
-            // and trigger a bogus internal iterative reduction on the next
-            // visit.
             if score > best_score {
                 best_score = score;
-                best_move = m;
                 if ply == 0 && !self.stop.load(Ordering::Relaxed) {
                     self.root_best_move_pending = m;
                     self.root_best_idx = moves_searched - 1;
                 }
             }
 
+            // Only a move that actually raised alpha becomes the TT move. A
+            // fail-low move carries a score cut off at alpha and would wreck
+            // move ordering on later visits, and suppressing the internal
+            // iterative reduction it triggers costs far more nodes than the
+            // ordering hint is worth.
             if score > alpha {
                 alpha = score;
+                best_move = m;
             }
 
             if alpha >= beta {

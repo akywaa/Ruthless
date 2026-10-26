@@ -41,6 +41,17 @@ pub type ContHist = [[[[[i16; 64]; 12]; 64]; 12]; 4];
 /// attacked by enemy pawns: `[side][from_threat][to_threat][from][to]`.
 pub type MainHistory = [[[[[i32; 64]; 64]; 2]; 2]; 2];
 
+/// One move of the root position together with the score it got in the last
+/// iteration. The list is kept sorted so the root move that scored best is
+/// searched first on the next iteration.
+#[derive(Clone, Copy)]
+pub struct RootMove {
+    pub mv: Move,
+    pub score: i32,
+    pub nodes: u64,
+    pub bound: TTFlag,
+}
+
 // LMR reduction table. Rebuilt whenever the LMR tunables change so the hot
 // path is a single relaxed load instead of two atomic loads plus a float divide.
 const LMR_TABLE_LEN: usize = 64 * 64;
@@ -97,8 +108,10 @@ pub struct Searcher {
     // around a reduced search and reset right after it, so a child node can
     // tell how much its parent move was reduced.
     reduction_stack: [u8; MAX_PLY],
-    root_move_nodes: [u64; 256],
-    root_best_idx: usize,
+    // Per-move scores of the root position. After every completed iteration the
+    // list is sorted by score, which is also the order the root picker uses in
+    // the next iteration.
+    root_moves: Vec<RootMove>,
     // Best root move of the iteration currently in progress. It is promoted to
     // root_best_move only once the whole depth iteration finishes, so an
     // interrupted search can never commit a move from a half-searched iteration.
@@ -201,8 +214,7 @@ cont_corr: alloc_box_zeroed(),
             played_threat_state: [0; MAX_PLY],
             eval_stack: [0; MAX_PLY],
             reduction_stack: [0; MAX_PLY],
-            root_move_nodes: [0; 256],
-            root_best_idx: 0,
+            root_moves: Vec::new(),
             root_best_move_pending: Move::NULL,
             root_best_move: Move::NULL,
             root_score: 0,
@@ -233,8 +245,7 @@ unsafe {
         self.played_threat_state = [0; MAX_PLY];
         self.eval_stack = [0; MAX_PLY];
         self.reduction_stack = [0; MAX_PLY];
-        self.root_move_nodes = [0; 256];
-        self.root_best_idx = 0;
+        self.root_moves.clear();
         self.root_best_move_pending = Move::NULL;
         self.root_best_move = Move::NULL;
         self.root_score = 0;
@@ -420,8 +431,20 @@ unsafe {
         let mut prev_score = 0;
         let mut stable_iterations = 0;
 
+        self.root_moves.clear();
+        for &m in legal_moves.as_slice() {
+            self.root_moves.push(RootMove {
+                mv: m,
+                score: -INFINITY,
+                nodes: 0,
+                bound: TTFlag::Exact,
+            });
+        }
+
         for depth in 1..=max_depth {
-            self.root_move_nodes = [0; 256];
+            for root_move in &mut self.root_moves {
+                root_move.nodes = 0;
+            }
             if depth >= 4 {
                 let mut full_window = false;
                 let mut delta = 25;
@@ -469,6 +492,11 @@ unsafe {
             if self.root_best_move_pending != Move::NULL {
                 best_move = self.root_best_move_pending;
             }
+
+            // Rank the root moves for the next iteration. A pass that finished
+            // inside the aspiration window scored every root move, so the order
+            // is a reliable best-first ordering.
+            self.root_moves.sort_by_key(|rm| std::cmp::Reverse(rm.score));
 
             let elapsed = self.start_time.elapsed().as_millis().max(1);
             let total_nodes = self.shared_nodes.load(Ordering::Relaxed) + (self.nodes & 1023);
@@ -523,9 +551,9 @@ unsafe {
                 let pv_factor = (1.25 - 0.05 * (stable_iterations as f32)).max(0.7);
                 let eval_factor = if eval_stable { 0.85 } else { 1.15 };
 
-                let root_total: u64 = self.root_move_nodes.iter().sum();
-                let best_share = if root_total > 0 {
-                    self.root_move_nodes[self.root_best_idx.min(255)] as f32 / root_total as f32
+                let root_total: u64 = self.root_moves.iter().map(|rm| rm.nodes).sum();
+                let best_share = if root_total > 0 && !self.root_moves.is_empty() {
+                    self.root_moves[0].nodes as f32 / root_total as f32
                 } else {
                     0.5
                 };
@@ -573,7 +601,7 @@ unsafe {
         let target_depth = (max_depth as usize + 8).min(MAX_PLY) as u8;
 
         for depth in start_depth..=target_depth {
-            self.root_move_nodes = [0; 256];
+            self.root_moves.clear();
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -1296,7 +1324,17 @@ unsafe {
             board.undo_move(m, undo);
 
             if ply == 0 {
-                self.root_move_nodes[moves_searched] = self.nodes - nodes_before;
+                if let Some(idx) = self.root_moves.iter().position(|rm| rm.mv == m) {
+                    self.root_moves[idx].nodes = self.nodes - nodes_before;
+                    self.root_moves[idx].score = score;
+                    self.root_moves[idx].bound = if score >= beta {
+                        TTFlag::LowerBound
+                    } else if score <= alpha_orig {
+                        TTFlag::UpperBound
+                    } else {
+                        TTFlag::Exact
+                    };
+                }
             }
             moves_searched += 1;
 
@@ -1308,7 +1346,6 @@ unsafe {
                 best_score = score;
                 if ply == 0 && !self.stop.load(Ordering::Relaxed) {
                     self.root_best_move_pending = m;
-                    self.root_best_idx = moves_searched - 1;
                 }
             }
 

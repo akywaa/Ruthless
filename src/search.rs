@@ -382,6 +382,11 @@ unsafe {
         soft_time: Option<u128>,
         hard_time: Option<u128>,
     ) -> Move {
+        self.root_best_move = Move::NULL;
+        self.root_score = 0;
+        self.completed_depth = 0;
+        self.root_best_move_pending = Move::NULL;
+
         let legal_moves = generate_legal_moves(board);
         if legal_moves.count == 0 {
             return Move::NULL;
@@ -396,7 +401,6 @@ unsafe {
         self.tt.new_search();
         self.soft_time_ms = soft_time;
         self.hard_time_ms = hard_time;
-        self.root_best_move_pending = Move::NULL;
         board.root_ply = board.history.len();
 
         // If the search is interrupted before the first iteration finishes, a
@@ -558,6 +562,9 @@ unsafe {
         self.nodes_at_last_check = 0;
         self.start_time = Instant::now();
         self.soft_time_ms = soft_time;
+        self.root_best_move = Move::NULL;
+        self.root_score = 0;
+        self.completed_depth = 0;
         let mut score = 0;
         let start_depth = 1 + (self.thread_id % 2) as u8;
         let target_depth = (max_depth as usize + 8).min(MAX_PLY) as u8;
@@ -567,6 +574,8 @@ unsafe {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
+
+            self.root_best_move_pending = Move::NULL;
 
             if depth >= 4 {
                 let mut full_window = false;
@@ -607,17 +616,19 @@ unsafe {
                 score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false);
             }
 
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+
             self.root_score = score;
             self.completed_depth = depth;
-            if let Some(entry) = self.tt.probe(board.tt_hash) {
-                if entry.best_move != Move::NULL {
-                    self.root_best_move = entry.best_move;
-                }
+            if self.root_best_move_pending != Move::NULL {
+                self.root_best_move = self.root_best_move_pending;
             }
         }
     }
 
-    fn extract_pv(&self, board: &mut Board, depth: u8) -> Vec<Move> {
+    pub(crate) fn extract_pv(&self, board: &mut Board, depth: u8) -> Vec<Move> {
         let mut pv = Vec::new();
         let mut undos = Vec::new();
 

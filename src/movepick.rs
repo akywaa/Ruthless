@@ -192,6 +192,9 @@ impl MovePicker {
                             continue;
                         }
 
+                        // Fixed SEE 0 split. A history-dependent threshold was
+                        // proposed but not applied: bad captures are already
+                        // pruned by capture history in the search loop.
                         if see(board, m, 0) {
                             if self.is_legal(board, m) {
                                 self.last_see_ge_zero = true;

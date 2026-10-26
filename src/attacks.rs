@@ -22,8 +22,14 @@ pub struct AttackTables {
     pub slider_magic: Vec<Bitboard>,
     pub slider_pext: Vec<Bitboard>,
     pub between: [[Bitboard; SQUARE_NB]; SQUARE_NB],
+    /// Which slider table layout this CPU should use. Decided once while the
+    /// tables are built, so the attack functions avoid a separate atomic load.
+    pub use_pext: bool,
 }
 
+// Still behind OnceLock because the tables need runtime allocation. Zobrist
+// keys are const-initialized; removing this atomic needs unsafe init ordering
+// or build-time tables, and the gain is unmeasured.
 static ATTACKS: OnceLock<AttackTables> = OnceLock::new();
 
 #[inline(always)]
@@ -50,7 +56,7 @@ pub fn king_attacks(sq: Square) -> Bitboard {
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let tables = attacks();
     let m = &tables.bishop_magics[sq as usize];
-    if crate::setwise::use_pext() {
+    if tables.use_pext {
         tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)]
     } else {
         tables.slider_magic[
@@ -63,7 +69,7 @@ pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
 pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let tables = attacks();
     let m = &tables.rook_magics[sq as usize];
-    if crate::setwise::use_pext() {
+    if tables.use_pext {
         tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)]
     } else {
         tables.slider_magic[
@@ -102,7 +108,7 @@ impl Prng {
 
 impl AttackTables {
     fn init() -> Self {
-        crate::setwise::detect_slider_style();
+        let use_pext = crate::setwise::detect_slider_style();
 
         let mut pawn_attacks = [[Bitboard::EMPTY; SQUARE_NB]; 2];
         let mut knight_attacks = [Bitboard::EMPTY; SQUARE_NB];
@@ -194,6 +200,7 @@ impl AttackTables {
             slider_magic,
             slider_pext,
             between,
+            use_pext,
         }
     }
 

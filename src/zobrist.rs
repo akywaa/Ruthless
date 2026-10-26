@@ -9,17 +9,20 @@ pub struct ZobristKeys {
     pub fiftymove_clock: [u64; 16],
 }
 
-static ZOBRIST: OnceLock<ZobristKeys> = OnceLock::new();
+// The keys only depend on compile-time constants, so they are built during
+// const evaluation instead of behind a OnceLock. That keeps the hot paths
+// (`piece_key` is called several times per move) free of atomic loads.
+static ZOBRIST: ZobristKeys = ZobristKeys::init();
 
 #[inline(always)]
 pub fn zobrist() -> &'static ZobristKeys {
-    ZOBRIST.get_or_init(ZobristKeys::init)
+    &ZOBRIST
 }
 
 struct XorShift64(u64);
 
 impl XorShift64 {
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -28,30 +31,43 @@ impl XorShift64 {
 }
 
 impl ZobristKeys {
-    fn init() -> Self {
+    const fn init() -> Self {
         let mut rng = XorShift64(0x18F2_48A7_C593_4B01);
         let mut pieces = [[0u64; SQUARE_NB]; PIECE_NB];
-        for p in 0..PIECE_NB {
-            for sq in 0..SQUARE_NB {
+        // Const evaluation cannot use `for` loops, so the tables are filled by
+        // index with `while` loops. The key sequence is identical to the one the
+        // previous runtime initializer produced.
+        let mut p = 0;
+        while p < PIECE_NB {
+            let mut sq = 0;
+            while sq < SQUARE_NB {
                 pieces[p][sq] = rng.next();
+                sq += 1;
             }
+            p += 1;
         }
 
         let mut castling = [0u64; 16];
-        for item in &mut castling {
-            *item = rng.next();
+        let mut i = 0;
+        while i < 16 {
+            castling[i] = rng.next();
+            i += 1;
         }
 
         let mut ep = [0u64; 8];
-        for item in &mut ep {
-            *item = rng.next();
+        let mut i = 0;
+        while i < 8 {
+            ep[i] = rng.next();
+            i += 1;
         }
 
         let side = rng.next();
 
         let mut fiftymove_clock = [0u64; 16];
-        for item in &mut fiftymove_clock {
-            *item = rng.next();
+        let mut i = 0;
+        while i < 16 {
+            fiftymove_clock[i] = rng.next();
+            i += 1;
         }
 
         Self {

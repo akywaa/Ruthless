@@ -956,7 +956,9 @@ impl Board {
 
         self.history.push(self.hash);
 
-        // Copy current accumulator to next ply
+        // Full 2 KiB accumulator copy per move. Lazy updates (materialize a
+        // stored FeatureDelta in evaluate) were considered but not applied:
+        // they touch make/undo and king-bucket refresh, with no measured gain.
         self.accumulators[self.acc_index + 1] = self.accumulators[self.acc_index];
         self.acc_index += 1;
 

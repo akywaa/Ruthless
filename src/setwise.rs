@@ -2,24 +2,18 @@ use crate::attacks::{bishop_attacks, rook_attacks};
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType, Square};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-// Slider indexing style, picked once at startup. PEXT needs BMI2, but on AMD
-// Zen 1/2 (family 0x17) BMI2 is emulated in microcode and is much slower than
-// a magic multiply-shift, so those CPUs keep using the magic tables.
-static USE_PEXT: AtomicBool = AtomicBool::new(false);
-
-#[inline(always)]
-pub fn use_pext() -> bool {
-    USE_PEXT.load(Ordering::Relaxed)
-}
-
 /// Chooses between the PEXT and the magic slider tables for this machine.
-pub fn detect_slider_style() {
+/// PEXT needs BMI2, but on AMD Zen 1/2 (family 0x17) BMI2 is emulated in
+/// microcode and is much slower than a magic multiply-shift, so those CPUs keep
+/// using the magic tables. The result is stored in `AttackTables` at startup.
+pub fn detect_slider_style() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        let fast = std::arch::is_x86_feature_detected!("bmi2") && !is_slow_pext_amd();
-        USE_PEXT.store(fast, Ordering::Relaxed);
+        std::arch::is_x86_feature_detected!("bmi2") && !is_slow_pext_amd()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
     }
 }
 

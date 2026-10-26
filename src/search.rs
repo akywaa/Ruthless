@@ -41,9 +41,11 @@ pub type ContHist = [[[[[i16; 64]; 12]; 64]; 12]; 4];
 /// attacked by enemy pawns: `[side][from_threat][to_threat][from][to]`.
 pub type MainHistory = [[[[[i32; 64]; 64]; 2]; 2]; 2];
 
-/// One move of the root position together with the score it got in the last
-/// iteration. The list is kept sorted so the root move that scored best is
-/// searched first on the next iteration.
+/// One move of the root position together with the score and node count it got
+/// in the last iteration. The list is sorted by score for time management only.
+///
+/// Feeding it to the root `MovePicker` was tested (400 games, 5000 nodes/move)
+/// and lost 40 +/- 17 Elo (LOS 1.1%), so the picker keeps its own ordering.
 #[derive(Clone, Copy)]
 pub struct RootMove {
     pub mv: Move,
@@ -108,9 +110,9 @@ pub struct Searcher {
     // around a reduced search and reset right after it, so a child node can
     // tell how much its parent move was reduced.
     reduction_stack: [u8; MAX_PLY],
-    // Per-move scores of the root position. After every completed iteration the
-    // list is sorted by score, which is also the order the root picker uses in
-    // the next iteration.
+    // Per-move scores and node counts of the root position, sorted after every
+    // completed iteration for the time manager. Do not use this list for root
+    // move ordering: see `RootMove` for the measured result.
     root_moves: Vec<RootMove>,
     // Best root move of the iteration currently in progress. It is promoted to
     // root_best_move only once the whole depth iteration finishes, so an
@@ -493,9 +495,8 @@ unsafe {
                 best_move = self.root_best_move_pending;
             }
 
-            // Rank the root moves for the next iteration. A pass that finished
-            // inside the aspiration window scored every root move, so the order
-            // is a reliable best-first ordering.
+            // Rank the root moves by score so the time manager can tell how
+            // much of the iteration went into the current best move.
             self.root_moves.sort_by_key(|rm| std::cmp::Reverse(rm.score));
 
             let elapsed = self.start_time.elapsed().as_millis().max(1);
@@ -758,6 +759,8 @@ unsafe {
         }
 
         let in_check = board.in_check();
+        // Bounded in-check extension (commit fe01c69). Removing it or limiting
+        // it to PV nodes was proposed but never SPRT-tested, so it stays.
         if in_check && (ply as usize) < MAX_PLY - 1 && excluded_move == Move::NULL {
             depth = depth.saturating_add(1);
         }
@@ -1284,7 +1287,9 @@ unsafe {
                         r += 1;
                     }
 
-                    // Never reduce checks: critical for tactics.
+                    // Never reduce checks: critical for tactics (commit e02f693).
+                    // The proposed soft r -= 1 was not SPRT-tested, so it was
+                    // not applied.
                     if gives_check {
                         r = 0;
                     }

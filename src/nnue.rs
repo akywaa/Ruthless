@@ -35,6 +35,11 @@ pub struct Network {
 
 static NETWORK_BYTES: &[u8] = include_bytes!("../resources/ruthless.bin");
 
+#[repr(C, align(64))]
+struct ZeroWeights([i16; HIDDEN_SIZE]);
+
+static ZERO_WEIGHTS: ZeroWeights = ZeroWeights([0; HIDDEN_SIZE]);
+
 static NETWORK_ALIGNED: std::sync::OnceLock<&'static Network> = std::sync::OnceLock::new();
 
 #[inline(always)]
@@ -98,22 +103,9 @@ impl Accumulator {
     }
 
     #[inline(always)]
-    pub fn remove_feature_side(&mut self, piece: Piece, sq: Square, ksq: Square, color: Color) {
-        let net = network();
-        let idx = feature_index_side(piece, sq, ksq, color);
-        sub_feature_weights(&mut self.vals[color as usize], &net.feature_weights[idx].vals);
-    }
-
-    #[inline(always)]
     pub fn add_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
         self.add_feature_side(piece, sq, w_ksq, Color::White);
         self.add_feature_side(piece, sq, b_ksq, Color::Black);
-    }
-
-    #[inline(always)]
-    pub fn remove_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
-        self.remove_feature_side(piece, sq, w_ksq, Color::White);
-        self.remove_feature_side(piece, sq, b_ksq, Color::Black);
     }
 
     pub fn refresh_side(&mut self, piece_on: &[Piece; 64], ksq: Square, color: Color) {
@@ -126,6 +118,27 @@ impl Accumulator {
             if piece != Piece::None {
                 self.add_feature_side(piece, Square::new(sq as u8), ksq, color);
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn apply_delta(&mut self, delta: &FeatureDelta) {
+        let net = network();
+
+        for side in 0..2 {
+            let adds = &delta.adds[side];
+            let subs = &delta.subs[side];
+            if adds[0].is_none() && adds[1].is_none() && subs[0].is_none() && subs[1].is_none() {
+                continue;
+            }
+
+            let zero = &ZERO_WEIGHTS.0;
+            let add1 = adds[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
+            let add2 = adds[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
+            let sub1 = subs[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
+            let sub2 = subs[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
+
+            apply_delta_weights(&mut self.vals[side], add1, add2, sub1, sub2);
         }
     }
 }
@@ -203,14 +216,20 @@ fn add_feature_weights(vals: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZ
 }
 
 #[inline(always)]
-fn sub_feature_weights(vals: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+fn apply_delta_weights(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add1: &[i16; HIDDEN_SIZE],
+    add2: &[i16; HIDDEN_SIZE],
+    sub1: &[i16; HIDDEN_SIZE],
+    sub2: &[i16; HIDDEN_SIZE],
+) {
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "avx512bw"
     ))]
     {
-        unsafe { vec_sub_avx512(vals, weights) };
+        unsafe { vec_delta_avx512(vals, add1, add2, sub1, sub2) };
         return;
     }
 
@@ -220,26 +239,37 @@ fn sub_feature_weights(vals: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZ
     ))]
     {
         if has_avx2() {
-            unsafe { vec_sub_avx2(vals, weights) };
+            unsafe { vec_delta_avx2(vals, add1, add2, sub1, sub2) };
             return;
         }
-        for (dst, &w) in vals.iter_mut().zip(weights.iter()) {
-            *dst -= w;
-        }
+        scalar_delta(vals, add1, add2, sub1, sub2);
         return;
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { vec_sub_neon(vals, weights) };
+        unsafe { vec_delta_neon(vals, add1, add2, sub1, sub2) };
         return;
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        for (dst, &w) in vals.iter_mut().zip(weights.iter()) {
-            *dst -= w;
-        }
+    scalar_delta(vals, add1, add2, sub1, sub2);
+}
+
+#[inline(always)]
+fn scalar_delta(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add1: &[i16; HIDDEN_SIZE],
+    add2: &[i16; HIDDEN_SIZE],
+    sub1: &[i16; HIDDEN_SIZE],
+    sub2: &[i16; HIDDEN_SIZE],
+) {
+    for i in 0..HIDDEN_SIZE {
+        vals[i] = vals[i]
+            .wrapping_add(add1[i])
+            .wrapping_add(add2[i])
+            .wrapping_sub(sub1[i])
+            .wrapping_sub(sub2[i]);
     }
 }
 
@@ -286,6 +316,61 @@ pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, view: Color) ->
     let piece_idx = oriented_piece(piece, view);
 
     king_bucket(oriented_ksq) * 768 + piece_idx * 64 + final_sq
+}
+
+/// Feature changes of one move, grouped per point of view. A move touches at
+/// most two features per side (a castling king and rook), so a fixed-size
+/// buffer is enough and the whole delta can be applied in one memory pass.
+#[derive(Copy, Clone)]
+pub struct FeatureDelta {
+    adds: [[Option<usize>; 2]; 2],
+    subs: [[Option<usize>; 2]; 2],
+    add_count: [usize; 2],
+    sub_count: [usize; 2],
+}
+
+impl FeatureDelta {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            adds: [[None; 2]; 2],
+            subs: [[None; 2]; 2],
+            add_count: [0; 2],
+            sub_count: [0; 2],
+        }
+    }
+
+    #[inline(always)]
+    pub fn add(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square, skip: Option<Color>) {
+        if skip != Some(Color::White) {
+            let view = Color::White as usize;
+            self.adds[view][self.add_count[view]] =
+                Some(feature_index_side(piece, sq, w_ksq, Color::White));
+            self.add_count[view] += 1;
+        }
+        if skip != Some(Color::Black) {
+            let view = Color::Black as usize;
+            self.adds[view][self.add_count[view]] =
+                Some(feature_index_side(piece, sq, b_ksq, Color::Black));
+            self.add_count[view] += 1;
+        }
+    }
+
+    #[inline(always)]
+    pub fn sub(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square, skip: Option<Color>) {
+        if skip != Some(Color::White) {
+            let view = Color::White as usize;
+            self.subs[view][self.sub_count[view]] =
+                Some(feature_index_side(piece, sq, w_ksq, Color::White));
+            self.sub_count[view] += 1;
+        }
+        if skip != Some(Color::Black) {
+            let view = Color::Black as usize;
+            self.subs[view][self.sub_count[view]] =
+                Some(feature_index_side(piece, sq, b_ksq, Color::Black));
+            self.sub_count[view] += 1;
+        }
+    }
 }
 
 #[inline(always)]
@@ -551,15 +636,28 @@ unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn vec_sub_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+unsafe fn vec_delta_avx2(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add1: &[i16; HIDDEN_SIZE],
+    add2: &[i16; HIDDEN_SIZE],
+    sub1: &[i16; HIDDEN_SIZE],
+    sub2: &[i16; HIDDEN_SIZE],
+) {
     use std::arch::x86_64::*;
     unsafe {
-        let a_ptr = acc.as_mut_ptr() as *mut __m256i;
-        let w_ptr = weights.as_ptr() as *const __m256i;
+        let d_ptr = vals.as_mut_ptr() as *mut __m256i;
+        let a1_ptr = add1.as_ptr() as *const __m256i;
+        let a2_ptr = add2.as_ptr() as *const __m256i;
+        let s1_ptr = sub1.as_ptr() as *const __m256i;
+        let s2_ptr = sub2.as_ptr() as *const __m256i;
+
         for i in 0..(HIDDEN_SIZE / 16) {
-            let va = _mm256_load_si256(a_ptr.add(i));
-            let vw = _mm256_load_si256(w_ptr.add(i));
-            _mm256_store_si256(a_ptr.add(i), _mm256_sub_epi16(va, vw));
+            let v = _mm256_loadu_si256(d_ptr.add(i));
+            let v = _mm256_add_epi16(v, _mm256_loadu_si256(a1_ptr.add(i)));
+            let v = _mm256_add_epi16(v, _mm256_loadu_si256(a2_ptr.add(i)));
+            let v = _mm256_sub_epi16(v, _mm256_loadu_si256(s1_ptr.add(i)));
+            let v = _mm256_sub_epi16(v, _mm256_loadu_si256(s2_ptr.add(i)));
+            _mm256_storeu_si256(d_ptr.add(i), v);
         }
     }
 }
@@ -644,15 +742,28 @@ unsafe fn vec_add_avx512(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SI
     target_feature = "avx512bw"
 ))]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn vec_sub_avx512(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+unsafe fn vec_delta_avx512(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add1: &[i16; HIDDEN_SIZE],
+    add2: &[i16; HIDDEN_SIZE],
+    sub1: &[i16; HIDDEN_SIZE],
+    sub2: &[i16; HIDDEN_SIZE],
+) {
     use std::arch::x86_64::*;
     unsafe {
-        let a_ptr = acc.as_mut_ptr() as *mut __m512i;
-        let w_ptr = weights.as_ptr() as *const __m512i;
+        let d_ptr = vals.as_mut_ptr() as *mut __m512i;
+        let a1_ptr = add1.as_ptr() as *const __m512i;
+        let a2_ptr = add2.as_ptr() as *const __m512i;
+        let s1_ptr = sub1.as_ptr() as *const __m512i;
+        let s2_ptr = sub2.as_ptr() as *const __m512i;
+
         for i in 0..(HIDDEN_SIZE / 32) {
-            let va = _mm512_loadu_si512(a_ptr.add(i));
-            let vw = _mm512_loadu_si512(w_ptr.add(i));
-            _mm512_storeu_si512(a_ptr.add(i), _mm512_sub_epi16(va, vw));
+            let v = _mm512_loadu_si512(d_ptr.add(i));
+            let v = _mm512_add_epi16(v, _mm512_loadu_si512(a1_ptr.add(i)));
+            let v = _mm512_add_epi16(v, _mm512_loadu_si512(a2_ptr.add(i)));
+            let v = _mm512_sub_epi16(v, _mm512_loadu_si512(s1_ptr.add(i)));
+            let v = _mm512_sub_epi16(v, _mm512_loadu_si512(s2_ptr.add(i)));
+            _mm512_storeu_si512(d_ptr.add(i), v);
         }
     }
 }
@@ -724,15 +835,28 @@ unsafe fn vec_add_neon(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn vec_sub_neon(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
+unsafe fn vec_delta_neon(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add1: &[i16; HIDDEN_SIZE],
+    add2: &[i16; HIDDEN_SIZE],
+    sub1: &[i16; HIDDEN_SIZE],
+    sub2: &[i16; HIDDEN_SIZE],
+) {
     use std::arch::aarch64::*;
     unsafe {
-        let a_ptr = acc.as_mut_ptr();
-        let w_ptr = weights.as_ptr();
+        let d_ptr = vals.as_mut_ptr();
+        let a1_ptr = add1.as_ptr();
+        let a2_ptr = add2.as_ptr();
+        let s1_ptr = sub1.as_ptr();
+        let s2_ptr = sub2.as_ptr();
+
         for i in (0..HIDDEN_SIZE).step_by(8) {
-            let va = vld1q_s16(a_ptr.add(i));
-            let vw = vld1q_s16(w_ptr.add(i));
-            vst1q_s16(a_ptr.add(i), vsubq_s16(va, vw));
+            let mut v = vld1q_s16(d_ptr.add(i));
+            v = vaddq_s16(v, vld1q_s16(a1_ptr.add(i)));
+            v = vaddq_s16(v, vld1q_s16(a2_ptr.add(i)));
+            v = vsubq_s16(v, vld1q_s16(s1_ptr.add(i)));
+            v = vsubq_s16(v, vld1q_s16(s2_ptr.add(i)));
+            vst1q_s16(d_ptr.add(i), v);
         }
     }
 }

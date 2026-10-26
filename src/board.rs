@@ -1,6 +1,6 @@
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks, between};
 use crate::bitboard::Bitboard;
-use crate::nnue::Accumulator;
+use crate::nnue::{Accumulator, FeatureDelta};
 use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB, ACC_STACK_SIZE};
 use crate::zobrist::{castling_key, ep_key, fiftymove_key, piece_key, side_key};
 
@@ -988,29 +988,23 @@ impl Board {
             (w_ksq, b_ksq)
         };
 
-        if !refresh_us {
-            self.accumulators[self.acc_index].remove_feature(moving_piece, from, acc_w_ksq, acc_b_ksq);
-        } else {
-            // The opponent's king stays put, so its view is still current.
-            self.accumulators[self.acc_index].remove_feature_side(moving_piece, from, self.king_square(them), them);
+        // Our own view is refreshed from scratch later, so only the opponent's
+        // features have to be tracked in that case.
+        let skip = if refresh_us { Some(us) } else { None };
+        let mut delta = FeatureDelta::new();
+
+        delta.sub(moving_piece, from, acc_w_ksq, acc_b_ksq, skip);
+        if move_type != MoveType::Promotion {
+            delta.add(moving_piece, to, acc_w_ksq, acc_b_ksq, skip);
         }
 
         match move_type {
             MoveType::Normal => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
-                    if !refresh_us {
-                        self.accumulators[self.acc_index].remove_feature(undo.captured, to, acc_w_ksq, acc_b_ksq);
-                    } else {
-                        self.accumulators[self.acc_index].remove_feature_side(undo.captured, to, self.king_square(them), them);
-                    }
+                    delta.sub(undo.captured, to, acc_w_ksq, acc_b_ksq, skip);
                 }
                 self.put_piece(moving_piece, to);
-                if !refresh_us {
-                    self.accumulators[self.acc_index].add_feature(moving_piece, to, acc_w_ksq, acc_b_ksq);
-                } else {
-                    self.accumulators[self.acc_index].add_feature_side(moving_piece, to, self.king_square(them), them);
-                }
 
                 if moving_piece.piece_type() == PieceType::Pawn
                     && ((from as i8) - (to as i8)).abs() == 16
@@ -1025,7 +1019,6 @@ impl Board {
             }
             MoveType::Castling => {
                 self.put_piece(moving_piece, to);
-                self.accumulators[self.acc_index].add_feature_side(moving_piece, to, self.king_square(them), them);
 
                 let (rook_from, rook_to) = match to {
                     Square::G1 => (Square::H1, Square::F1),
@@ -1037,28 +1030,28 @@ impl Board {
                 let rook = self.remove_piece(rook_from);
                 self.put_piece(rook, rook_to);
 
-                self.accumulators[self.acc_index].remove_feature_side(rook, rook_from, self.king_square(them), them);
-                self.accumulators[self.acc_index].add_feature_side(rook, rook_to, self.king_square(them), them);
+                delta.sub(rook, rook_from, acc_w_ksq, acc_b_ksq, skip);
+                delta.add(rook, rook_to, acc_w_ksq, acc_b_ksq, skip);
             }
             MoveType::EnPassant => {
                 let cap_sq = Square::from_coords(to.file(), from.rank());
                 let cap_pawn = self.remove_piece(cap_sq);
-                self.accumulators[self.acc_index].remove_feature(cap_pawn, cap_sq, w_ksq, b_ksq);
+                delta.sub(cap_pawn, cap_sq, acc_w_ksq, acc_b_ksq, skip);
 
                 self.put_piece(moving_piece, to);
-                self.accumulators[self.acc_index].add_feature(moving_piece, to, w_ksq, b_ksq);
             }
             MoveType::Promotion => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
-                    self.accumulators[self.acc_index].remove_feature(undo.captured, to, w_ksq, b_ksq);
+                    delta.sub(undo.captured, to, acc_w_ksq, acc_b_ksq, skip);
                 }
                 let promo_piece = Piece::new(us, m.promo_type());
                 self.put_piece(promo_piece, to);
-                self.accumulators[self.acc_index].add_feature(promo_piece, to, w_ksq, b_ksq);
+                delta.add(promo_piece, to, acc_w_ksq, acc_b_ksq, skip);
             }
         }
 
+        self.accumulators[self.acc_index].apply_delta(&delta);
         if refresh_us {
             self.refresh_accumulator_side(us);
         }

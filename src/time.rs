@@ -25,6 +25,8 @@ pub struct TimeControl {
     pub binc: u128,
     pub movestogo: Option<u128>,
     pub movetime: Option<u128>,
+    /// `go nodes`: stop after this many nodes instead of by the clock.
+    pub nodes: Option<u64>,
 }
 
 pub struct TimeLimits {
@@ -33,6 +35,8 @@ pub struct TimeLimits {
     /// True for `go movetime`, where the whole budget should be used instead of
     /// being scaled down by search-stability heuristics.
     pub fixed: bool,
+    /// Node budget from `go nodes`, checked in every node.
+    pub node_limit: Option<u64>,
 }
 
 pub struct TimeManager;
@@ -41,12 +45,22 @@ impl TimeManager {
     pub fn allocate(board: &Board, tc: &TimeControl) -> TimeLimits {
         let overhead = move_overhead();
 
+        if let Some(nodes) = tc.nodes {
+            return TimeLimits {
+                soft_limit: None,
+                hard_limit: None,
+                fixed: false,
+                node_limit: Some(nodes.max(1)),
+            };
+        }
+
         if let Some(mt) = tc.movetime {
             let t = mt.saturating_sub(overhead).max(5);
             return TimeLimits {
                 soft_limit: Some(t),
                 hard_limit: Some(t),
                 fixed: true,
+                node_limit: None,
             };
         }
 
@@ -71,6 +85,7 @@ impl TimeManager {
                     soft_limit: Some(soft),
                     hard_limit: Some(hard),
                     fixed: false,
+                    node_limit: None,
                 };
             }
 
@@ -97,12 +112,14 @@ impl TimeManager {
                 soft_limit: Some(soft),
                 hard_limit: Some(hard),
                 fixed: false,
+                node_limit: None,
             }
         } else {
             TimeLimits {
                 soft_limit: None,
                 hard_limit: None,
                 fixed: false,
+                node_limit: None,
             }
         }
     }

@@ -77,6 +77,8 @@ pub struct Searcher {
     // True when the budget came from `go movetime`, where dynamic scaling of
     // the soft limit must not be applied.
     pub fixed_time: bool,
+    // Node budget from `go nodes`; `None` means the search is time limited.
+    pub node_limit: Option<u64>,
     killers: [[Move; 2]; MAX_PLY],
     history: Box<MainHistory>,
     pawn_history: Box<[[[i32; 64]; 12]; 512]>,
@@ -183,6 +185,7 @@ impl Searcher {
             soft_time_ms: None,
             hard_time_ms: None,
             fixed_time: false,
+            node_limit: None,
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: alloc_box_zeroed(),
             pawn_history: alloc_box_zeroed(),
@@ -657,6 +660,12 @@ unsafe {
     }
 
     fn check_time(&mut self) {
+    if let Some(limit) = self.node_limit {
+        if self.nodes >= limit {
+            self.stop.store(true, Ordering::Relaxed);
+            return;
+        }
+    }
     if self.nodes >= self.nodes_at_last_check + 1024 {
         self.nodes_at_last_check += 1024;
         self.shared_nodes.fetch_add(1024, Ordering::Relaxed);

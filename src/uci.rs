@@ -299,6 +299,10 @@ fn parse_go(tokens: &[&str]) -> (u8, TimeControl, bool) {
                 tc.movestogo = tokens.get(i + 1).and_then(|s| s.parse().ok());
                 i += 1;
             }
+            "nodes" => {
+                tc.nodes = tokens.get(i + 1).and_then(|s| s.parse().ok());
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
@@ -342,6 +346,7 @@ fn run_bench(pool: &mut ThreadPool) {
                     soft_limit: None,
                     hard_limit: None,
                     fixed: false,
+                    node_limit: None,
                 },
             );
             total_nodes += pool.shared_nodes.load(Ordering::Relaxed)

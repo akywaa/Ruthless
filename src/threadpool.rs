@@ -257,6 +257,7 @@ impl ThreadPool {
         }
 
         self.main_searcher.fixed_time = limits.fixed;
+        self.main_searcher.node_limit = limits.node_limit;
         let best_move =
             self.main_searcher.search(board, depth, limits.soft_limit, limits.hard_limit);
 

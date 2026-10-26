@@ -20,6 +20,7 @@ Examples:
 import argparse
 import math
 import multiprocessing as mp
+import random
 import sys
 import time
 
@@ -71,12 +72,21 @@ def parse_value(value):
 def play_game(job):
     """Play a single game and return (result_for_a, pgn_text, error)."""
     idx, opening, a_spec, b_spec, limit, max_plies, _seed, pgn_notes = job
+    # `opening` is either a list of UCI moves or a number of random book plies.
     a_path, a_opts = parse_engine(a_spec)
     b_path, b_opts = parse_engine(b_spec)
 
     board = chess.Board()
-    for uci in opening:
-        board.push_uci(uci)
+    rng = random.Random(_seed)
+    if isinstance(opening, int):
+        for _ in range(opening):
+            moves = list(board.legal_moves)
+            if not moves:
+                break
+            board.push(rng.choice(moves))
+    else:
+        for uci in opening:
+            board.push_uci(uci)
     game = chess.pgn.Game.from_board(board)
 
     white_is_a = idx % 2 == 0
@@ -188,6 +198,12 @@ def main():
     ap.add_argument("--b", required=True, help="engine B (path[:opt=val,...])")
     ap.add_argument("--games", type=int, default=100)
     ap.add_argument("--nodes", type=int, default=20000, help="nodes per move")
+    ap.add_argument(
+        "--random-opening-plies",
+        type=int,
+        default=6,
+        help="random book plies before the engines take over (0 = fixed OPENINGS list)",
+    )
     ap.add_argument("--movetime", type=int, default=0, help="ms per move instead of --nodes")
     ap.add_argument("--max-plies", type=int, default=400)
     ap.add_argument("--concurrency", type=int, default=max(1, (mp.cpu_count() or 2) // 2))
@@ -203,17 +219,22 @@ def main():
 
     jobs = []
     for i in range(args.games):
-        # Each opening is played twice, once with each colour assignment.
-        opening = OPENINGS[(i // 2) % len(OPENINGS)]
+        # Fixed book: each line is played with both colours. Random book: every
+        # game gets its own line, seeded per game so runs are reproducible.
+        if args.random_opening_plies > 0:
+            opening = args.random_opening_plies
+        else:
+            opening = OPENINGS[(i // 2) % len(OPENINGS)]
         notes = [("Nodes", str(args.nodes))] if args.movetime == 0 else []
         jobs.append((
             i,
-            list(opening),
+            opening,
             args.a,
             args.b,
             limit,
             args.max_plies,
-            args.seed + i,
+            # Paired games share an opening and swap colours.
+            args.seed + i // 2,
             notes,
         ))
 

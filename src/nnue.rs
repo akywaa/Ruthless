@@ -461,6 +461,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    fn avx512_matches_scalar_random_walk() {
+        let mut board = Board::default();
+        let mut rng: u64 = 0xC0FF_EE00_1234_5678;
+        for _ in 0..400 {
+            let moves = generate_legal_moves(&mut board);
+            if moves.count == 0 {
+                break;
+            }
+            for &m in moves.as_slice() {
+                let undo = board.make_move(m);
+                let net = network();
+                let bucket = output_bucket(&board);
+                let us = board.side_to_move as usize;
+                let them = us ^ 1;
+                let acc = &board.accumulators[board.acc_index];
+                let expected = evaluate_scalar(acc, us, them, bucket, net);
+                let got = unsafe { evaluate_avx512(acc, us, them, bucket, net) };
+                assert_eq!(got, expected, "AVX-512 mismatch after {}", m);
+                board.undo_move(m, undo);
+            }
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let pick = (rng as usize) % moves.count;
+            board.make_move(moves.get(pick));
+            board.reset_accumulator_stack();
+        }
+    }
+
+    #[test]
     #[cfg(target_arch = "x86_64")]
     fn avx2_matches_scalar_random_walk() {
         if !is_x86_feature_detected!("avx2") {
@@ -640,53 +675,31 @@ unsafe fn evaluate_avx512(
     unsafe {
         let zero = _mm512_setzero_si512();
         let qa = _mm512_set1_epi16(QA);
-        let mut acc64 = _mm512_setzero_si512();
+        // Sixteen i32 lanes. Each lane only ever sums a few dozen products of
+        // at most QA * QA * 128, so i32 cannot overflow here.
+        let mut sum = _mm512_setzero_si512();
 
         let mut evaluate_side = |vals: &[i16; HIDDEN_SIZE], offset: usize| {
             let v_ptr = vals.as_ptr() as *const __m512i;
             let w_ptr = net.output_weights[bucket][offset..].as_ptr() as *const __m512i;
-            let mut l_acc = _mm512_setzero_si512();
 
             for chunk in 0..(HIDDEN_SIZE / 32) {
                 let v = _mm512_loadu_si512(v_ptr.add(chunk));
-                let clamped = _mm512_min_epi16(_mm512_max_epi16(v, zero), qa);
-
-                let low_16 = _mm512_castsi512_si256(clamped);
-                let high_16 = _mm512_extracti64x4_epi64::<1>(clamped);
-                let y_low = _mm512_cvtepi16_epi32(low_16);
-                let y_high = _mm512_cvtepi16_epi32(high_16);
-
+                let x = _mm512_min_epi16(_mm512_max_epi16(v, zero), qa);
                 let w = _mm512_loadu_si512(w_ptr.add(chunk));
-                let w_low = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(w));
-                let w_high = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(w));
 
-                let p_low = _mm512_mullo_epi32(_mm512_mullo_epi32(y_low, y_low), w_low);
-                let p_high = _mm512_mullo_epi32(_mm512_mullo_epi32(y_high, y_high), w_high);
-
-                l_acc = _mm512_add_epi64(l_acc, _mm512_cvtepi32_epi64(_mm512_castsi512_si256(p_low)));
-                l_acc = _mm512_add_epi64(
-                    l_acc,
-                    _mm512_cvtepi32_epi64(_mm512_extracti64x4_epi64::<1>(p_low)),
-                );
-                l_acc = _mm512_add_epi64(
-                    l_acc,
-                    _mm512_cvtepi32_epi64(_mm512_castsi512_si256(p_high)),
-                );
-                l_acc = _mm512_add_epi64(
-                    l_acc,
-                    _mm512_cvtepi32_epi64(_mm512_extracti64x4_epi64::<1>(p_high)),
-                );
+                // x is in 0..=QA and |w| * QA fits in an i16 (checked when the
+                // network is loaded), so this 16-bit product is exact.
+                let xw = _mm512_mullo_epi16(x, w);
+                // madd sums adjacent pairs into i32 lanes: x * (x * w) = x^2 * w.
+                sum = _mm512_add_epi32(sum, _mm512_madd_epi16(x, xw));
             }
-
-            acc64 = _mm512_add_epi64(acc64, l_acc);
         };
 
         evaluate_side(&acc.vals[us], 0);
         evaluate_side(&acc.vals[them], HIDDEN_SIZE);
 
-        let res = _mm512_reduce_add_epi64(acc64);
-
-        let mut output = res;
+        let mut output = i64::from(_mm512_reduce_add_epi32(sum));
         output /= i64::from(QA);
         output += i64::from(net.output_bias[bucket]);
         output *= SCALE as i64;

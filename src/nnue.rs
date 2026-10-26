@@ -141,6 +141,30 @@ impl Accumulator {
             apply_delta_weights(&mut self.vals[side], add1, add2, sub1, sub2);
         }
     }
+
+    /// Reverses [`Accumulator::apply_delta`]. Used by `Board::undo_move`, which
+    /// updates the single accumulator in place instead of copying a 2 KiB
+    /// snapshot for every child node.
+    #[inline(always)]
+    pub fn apply_delta_inverse(&mut self, delta: &FeatureDelta) {
+        let net = network();
+
+        for side in 0..2 {
+            let adds = &delta.adds[side];
+            let subs = &delta.subs[side];
+            if adds[0].is_none() && adds[1].is_none() && subs[0].is_none() && subs[1].is_none() {
+                continue;
+            }
+
+            let zero = &ZERO_WEIGHTS.0;
+            let add1 = adds[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
+            let add2 = adds[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
+            let sub1 = subs[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
+            let sub2 = subs[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
+
+            apply_delta_weights(&mut self.vals[side], sub1, sub2, add1, add2);
+        }
+    }
 }
 
 /// AVX2 support, cached after the first runtime check. Builds compiled with
@@ -417,7 +441,7 @@ fn evaluate_scalar(
 pub fn evaluate(board: &Board) -> i32 {
     let net = network();
     let bucket = output_bucket(board);
-    let acc = &board.accumulators[board.acc_index];
+    let acc = &board.accumulator;
     let us = board.side_to_move as usize;
     let them = us ^ 1;
     evaluate_acc(acc, us, them, bucket, net)
@@ -474,7 +498,7 @@ mod tests {
         let them = (!board.side_to_move) as usize;
         let bucket = output_bucket(board);
         let (a, b) = if swap { (them, us) } else { (us, them) };
-        let acc = &board.accumulators[board.acc_index];
+        let acc = &board.accumulator;
         let mut output = 0i64;
         for i in 0..HIDDEN_SIZE {
             output += screlu(acc.vals[a][i]) as i64 * i64::from(net.output_weights[bucket][i]);
@@ -511,9 +535,9 @@ mod tests {
         let net = network();
         let k = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         let kq = Board::from_fen("4k3/8/8/8/8/8/3Q4/4K3 w - - 0 1").unwrap();
-        let changed = k.accumulators[k.acc_index].vals[0]
+        let changed = k.accumulator.vals[0]
             .iter()
-            .zip(kq.accumulators[kq.acc_index].vals[0].iter())
+            .zip(kq.accumulator.vals[0].iter())
             .filter(|(a, b)| a != b)
             .count();
         println!("hidden units changed by adding white Q: {}", changed);
@@ -565,7 +589,7 @@ mod tests {
                 let bucket = output_bucket(&board);
                 let us = board.side_to_move as usize;
                 let them = us ^ 1;
-                let acc = &board.accumulators[board.acc_index];
+                let acc = &board.accumulator;
                 let expected = evaluate_scalar(acc, us, them, bucket, net);
                 let got = unsafe { evaluate_avx512(acc, us, them, bucket, net) };
                 assert_eq!(got, expected, "AVX-512 mismatch after {}", m);
@@ -599,7 +623,7 @@ mod tests {
                 let bucket = output_bucket(&board);
                 let us = board.side_to_move as usize;
                 let them = us ^ 1;
-                let acc = &board.accumulators[board.acc_index];
+                let acc = &board.accumulator;
                 // Scalar reference in the same [side-to-move, non-side-to-move]
                 // ordering and perspective used by the production evaluate().
                 let expected = evaluate_scalar(acc, us, them, bucket, net);

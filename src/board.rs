@@ -1,6 +1,6 @@
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks, between};
 use crate::bitboard::Bitboard;
-use crate::nnue::{Accumulator, FeatureDelta};
+use crate::nnue::{Accumulator, FeatureDelta, HIDDEN_SIZE};
 use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB, ACC_STACK_SIZE};
 use crate::zobrist::{castling_key, ep_key, fiftymove_key, piece_key, side_key};
 
@@ -25,6 +25,8 @@ pub struct UndoState {
     pub captured: Piece,
     pub hash: u64,
     pub non_pawn_hash: [u64; 2],
+    /// Feature changes of the move, replayed backwards by `undo_move`.
+    pub delta: FeatureDelta,
 }
 
 #[derive(Clone)]
@@ -46,8 +48,11 @@ pub struct Board {
     // Index in `history` of the search root. Repetitions at or after it are
     // twofold draws, repetitions before it need a third occurrence.
     pub root_ply: usize,
-    pub accumulators: Box<[Accumulator; ACC_STACK_SIZE]>,
-    pub acc_index: usize,
+    pub accumulator: Accumulator,
+    /// Parent half-accumulator saved only for moves that refresh one side from
+    /// scratch (a king crossing a bucket or the centre mirror). Indexed by ply.
+    pub acc_backup: Box<[[i16; HIDDEN_SIZE]; ACC_STACK_SIZE]>,
+    pub acc_depth: usize,
 }
 
 impl Board {
@@ -73,27 +78,29 @@ impl Board {
             non_pawn_hash: [0; 2],
             history: Vec::with_capacity(256),
             root_ply: 0,
-            accumulators: vec![Accumulator::new(); ACC_STACK_SIZE]
+            accumulator: Accumulator::new(),
+            acc_backup: vec![[0i16; HIDDEN_SIZE]; ACC_STACK_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
-            acc_index: 0,
+            acc_depth: 0,
         }
     }
 
+    /// The accumulator is updated in place, so there is no per-ply stack to
+    /// reset. Only the backup cursor has to return to the root.
     pub fn reset_accumulator_stack(&mut self) {
-        self.accumulators[0] = self.accumulators[self.acc_index];
-        self.acc_index = 0;
+        self.acc_depth = 0;
     }
 
     pub fn refresh_accumulator(&mut self) {
-        self.accumulators[self.acc_index] = Accumulator::new();
+        self.accumulator = Accumulator::new();
         let w_ksq = self.king_square(Color::White);
         let b_ksq = self.king_square(Color::Black);
         for sq in 0..64 {
             let piece = self.piece_on[sq];
             if piece != Piece::None {
-                self.accumulators[self.acc_index]
+                self.accumulator
                     .add_feature(piece, Square::new(sq as u8), w_ksq, b_ksq);
             }
         }
@@ -102,12 +109,12 @@ impl Board {
     pub fn refresh_accumulator_side(&mut self, color: Color) {
         let piece_on = self.piece_on;
         let ksq = self.king_square(color);
-        self.accumulators[self.acc_index].refresh_side(&piece_on, ksq, color);
+        self.accumulator.refresh_side(&piece_on, ksq, color);
     }
 
     pub fn from_fen(fen: &str) -> Result<Self, String> {
         let mut board = Self::new();
-        board.acc_index = 0;
+        board.acc_depth = 0;
         let parts: Vec<&str> = fen.split_whitespace().collect();
         if parts.is_empty() {
             return Err("Empty FEN string".to_string());
@@ -901,13 +908,12 @@ impl Board {
             captured: Piece::None,
             hash: self.hash,
             non_pawn_hash: self.non_pawn_hash,
+            delta: FeatureDelta::new(),
         };
 
         self.history.push(self.hash);
-
-        // Copy current accumulator to next ply
-        self.accumulators[self.acc_index + 1] = self.accumulators[self.acc_index];
-        self.acc_index += 1;
+        // A null move changes no piece, so the accumulator stays as it is.
+        self.acc_depth += 1;
 
         if self.ep_square.is_valid() {
             self.hash ^= ep_key(self.ep_square.file());
@@ -924,7 +930,7 @@ impl Board {
 
     pub fn undo_null_move(&mut self, undo: UndoState) {
         self.history.pop();
-        self.acc_index -= 1;
+        self.acc_depth -= 1;
         self.side_to_move = !self.side_to_move;
         self.castling_rights = undo.castling_rights;
         self.ep_square = undo.ep_square;
@@ -945,22 +951,17 @@ impl Board {
         let w_ksq = self.king_square(Color::White);
         let b_ksq = self.king_square(Color::Black);
 
-        let undo = UndoState {
+        let mut undo = UndoState {
             castling_rights: self.castling_rights,
             ep_square: self.ep_square,
             halfmove_clock: self.halfmove_clock,
             captured: self.piece_on[to],
             hash: self.hash,
             non_pawn_hash: self.non_pawn_hash,
+            delta: FeatureDelta::new(),
         };
 
         self.history.push(self.hash);
-
-        // Full 2 KiB accumulator copy per move. Lazy updates (materialize a
-        // stored FeatureDelta in evaluate) were considered but not applied:
-        // they touch make/undo and king-bucket refresh, with no measured gain.
-        self.accumulators[self.acc_index + 1] = self.accumulators[self.acc_index];
-        self.acc_index += 1;
 
         if self.ep_square.is_valid() {
             self.hash ^= ep_key(self.ep_square.file());
@@ -1053,10 +1054,18 @@ impl Board {
             }
         }
 
-        self.accumulators[self.acc_index].apply_delta(&delta);
+        // A refresh overwrites our side without tracking its old features, so
+        // save that half for undo. Every other move is reverted exactly by
+        // applying the delta backwards.
+        if refresh_us {
+            self.acc_backup[self.acc_depth].copy_from_slice(&self.accumulator.vals[us as usize]);
+        }
+        undo.delta = delta;
+        self.accumulator.apply_delta(&delta);
         if refresh_us {
             self.refresh_accumulator_side(us);
         }
+        self.acc_depth += 1;
 
         let new_castling = self.castling_rights & CASTLING_RIGHTS_MASK[from as usize] & CASTLING_RIGHTS_MASK[to as usize];
         if new_castling != self.castling_rights {
@@ -1077,16 +1086,25 @@ impl Board {
 
     pub fn undo_move(&mut self, m: Move, undo: UndoState) {
         self.history.pop();
+        self.acc_depth -= 1;
         self.side_to_move = !self.side_to_move;
         let us = self.side_to_move;
-
-        if us == Color::Black {
-            self.fullmove_number = self.fullmove_number.saturating_sub(1);
-        }
 
         let from = m.from();
         let to = m.to();
         let move_type = m.move_type();
+
+        let refresh_us = self.piece_on[to].piece_type() == PieceType::King
+            && (move_type == MoveType::Castling
+                || crate::nnue::needs_accumulator_refresh(from, to, us));
+        if refresh_us {
+            self.accumulator.vals[us as usize] = self.acc_backup[self.acc_depth];
+        }
+        self.accumulator.apply_delta_inverse(&undo.delta);
+
+        if us == Color::Black {
+            self.fullmove_number = self.fullmove_number.saturating_sub(1);
+        }
 
         let moved_piece = self.remove_piece(to);
 
@@ -1128,7 +1146,6 @@ impl Board {
         self.hash = undo.hash;
         self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
-        self.acc_index -= 1;
     }
 }
 
@@ -1343,13 +1360,13 @@ mod tests {
                 break;
             }
             for &m in moves.as_slice() {
-                let before = board.accumulators[board.acc_index].vals;
+                let before = board.accumulator.vals;
                 let undo = board.make_move(m);
                 let mut check = board.clone();
                 check.refresh_accumulator();
-                assert_eq!(board.accumulators[board.acc_index].vals, check.accumulators[check.acc_index].vals, "make mismatch on {}", m);
+                assert_eq!(board.accumulator.vals, check.accumulator.vals, "make mismatch on {}", m);
                 board.undo_move(m, undo);
-                assert_eq!(board.accumulators[board.acc_index].vals, before, "undo mismatch on {}", m);
+                assert_eq!(board.accumulator.vals, before, "undo mismatch on {}", m);
             }
             rng ^= rng << 13;
             rng ^= rng >> 7;
@@ -1381,19 +1398,19 @@ mod tests {
                     break;
                 }
                 for &m in moves.as_slice() {
-                    let before = board.accumulators[board.acc_index].vals;
+                    let before = board.accumulator.vals;
                     let undo = board.make_move(m);
                     let mut check = board.clone();
                     check.refresh_accumulator();
                     assert_eq!(
-                        board.accumulators[board.acc_index].vals,
-                        check.accumulators[check.acc_index].vals,
+                        board.accumulator.vals,
+                        check.accumulator.vals,
                         "make mismatch on {} in {}",
                         m,
                         fen
                     );
                     board.undo_move(m, undo);
-                    assert_eq!(board.accumulators[board.acc_index].vals, before, "undo mismatch on {}", m);
+                    assert_eq!(board.accumulator.vals, before, "undo mismatch on {}", m);
                 }
 
                 rng ^= rng << 13;

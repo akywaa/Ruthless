@@ -23,6 +23,9 @@ pub static RFP_BASE: AtomicI32 = AtomicI32::new(80);
 pub static RFP_IMPROVING: AtomicI32 = AtomicI32::new(20);
 pub static FUTILITY_BASE: AtomicI32 = AtomicI32::new(70);
 pub static FUTILITY_MARGIN: AtomicI32 = AtomicI32::new(75);
+// Tried 3 -> 4 and reverted: strength was neutral (50.0% over 150 games) while
+// nodes at fixed depth rose ~5.5% (a deeper reduction makes the null move fail
+// to cut off more often, so the tree grows instead of shrinking).
 pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
 pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(200);
 pub static CORR_WEIGHT: AtomicI32 = AtomicI32::new(153);
@@ -764,8 +767,11 @@ unsafe {
             self.killers[(ply + 2) as usize] = [Move::NULL; 2];
         }
 
-        // Bounded in-check extension (commit fe01c69). Removing it or limiting
-        // it to PV nodes was proposed but never SPRT-tested, so it stays.
+        // Bounded in-check extension (commit fe01c69). Do not remove it or
+        // limit it to the first check of a series: extending only the first
+        // check was tested and reverted (+15.8% nodes at fixed depth = worse
+        // selectivity, match only drew level). The extension helps the search
+        // reach cutoffs, so it stays unconditional.
         if in_check && (ply as usize) < MAX_PLY - 1 && excluded_move == Move::NULL {
             depth = depth.saturating_add(1);
         }
@@ -934,6 +940,8 @@ unsafe {
             // scale the margin down if our position is improving rapidly
             let rfp_margin = ((base - imp) * (depth as i32) - improvement / 16).max(0);
 
+            // Do not raise this ceiling beyond 6 (e.g. to 8): tested and
+            // reverted, -30 Elo over 150 games with no gain in depth.
             if depth <= 6 && eval - rfp_margin >= beta {
                 return (eval + beta) / 2;
             }
@@ -1181,12 +1189,16 @@ unsafe {
                 // Quiet moves that check the enemy king are never pruned. The
                 // picker's cached check squares make this a single lookup.
                 if is_quiet && !picker.gives_check(board, m) {
-                    if moves_searched >= lmp_threshold && hist < 2000 {
+                    // 4000 (was 2000): a higher bar prunes more quiet moves,
+                    // accepted at -5.9% nodes at fixed depth and +19 Elo.
+                    if moves_searched >= lmp_threshold && hist < 4000 {
                         continue;
                     }
 
                     let futility_margin = FUTILITY_BASE.load(Ordering::Relaxed)
                         + FUTILITY_MARGIN.load(Ordering::Relaxed) * (lmr_depth + 1);
+                    // Do not raise this futility cap from 5 to 7: tested and
+                    // reverted, only -2.7% nodes for -23 Elo.
                     if lmr_depth <= 5
                         && alpha.abs() < MATE_SCORE - 100
                         && eval + futility_margin <= alpha
@@ -1209,6 +1221,8 @@ unsafe {
                     continue;
                 }
 
+                // Do not raise this losing-capture SEE cap from 5 to 7 either:
+                // tested together with futility, reverted for -23 Elo.
                 if !is_quiet && lmr_depth <= 5 {
                     // A move handed out by the picker's good-noisy stage already
                     // has SEE >= 0, which always clears the negative threshold
@@ -1620,18 +1634,14 @@ unsafe {
             return self.corrected_eval(board, ply, self.raw_eval(board));
         }
         let mut tt_move = Move::NULL;
-        let mut tt_score: Option<i32> = None;
-        let mut tt_flag = TTFlag::None;
         let mut tt_raw_eval = crate::tt::RAW_EVAL_NONE;
 
         if let Some(entry) = self.tt.probe(board.tt_hash) {
             tt_move = entry.best_move;
-            tt_score = Some(score_from_tt(entry.score, ply));
-            tt_flag = entry.flag;
             tt_raw_eval = entry.raw_eval;
 
-            let s = tt_score.unwrap();
-            match tt_flag {
+            let s = score_from_tt(entry.score, ply);
+            match entry.flag {
                 TTFlag::Exact => return s,
                 TTFlag::LowerBound if s >= beta => return s,
                 TTFlag::UpperBound if s <= alpha => return s,

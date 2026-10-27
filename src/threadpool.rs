@@ -15,7 +15,6 @@ pub struct SearchParams {
     pub board: Board,
     pub depth: u8,
     pub soft_time: Option<u128>,
-    pub hard_time: Option<u128>,
     pub stop: Arc<AtomicBool>,
     pub clear_histories: bool,
 }
@@ -242,7 +241,6 @@ impl ThreadPool {
             board: board.clone(),
             depth,
             soft_time: limits.soft_limit,
-            hard_time: limits.hard_limit,
             stop: Arc::clone(&self.stop_signal),
             clear_histories,
         };

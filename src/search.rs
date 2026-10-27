@@ -27,11 +27,15 @@ pub static FUTILITY_MARGIN: AtomicI32 = AtomicI32::new(75);
 // nodes at fixed depth rose ~5.5% (a deeper reduction makes the null move fail
 // to cut off more often, so the tree grows instead of shrinking).
 pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
-pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(200);
+// 200 -> 300 was accepted only together with the singular margin below: the
+// pair measures -7% nodes at fixed depth 12 at neutral strength (50.3% over
+// 300 games, two seeds). Do not tune this knob on its own, the two interact
+// strongly -- 300 with the old margin grew the tree +38%.
+pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(300);
 pub static CORR_WEIGHT: AtomicI32 = AtomicI32::new(153);
 pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(13);
 pub static LMR_BASE: AtomicI32 = AtomicI32::new(0);
-pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(240);
+pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(180);
 
 /// Continuation history indexed by
 /// `[layer][previous piece][previous to][current piece][current to]`.
@@ -1084,7 +1088,10 @@ unsafe {
             && (tt_flag == TTFlag::Exact || tt_flag == TTFlag::LowerBound)
             && tt_score.abs() < MATE_SCORE - 100
         {
-            let singular_margin = (depth as i32) * 2;
+            // *2 -> *3 only pays off together with NMP_EVAL_DIV = 300 above;
+            // on its own it grew the tree +10%. *4 lost strength (47.7% over
+            // 150 games), so *3 stays.
+            let singular_margin = (depth as i32) * 3;
             let singular_beta = tt_score - singular_margin;
             let singular_depth = (depth - 1) / 2;
 
@@ -1649,7 +1656,9 @@ unsafe {
         // the tree beyond the main search line. The cap only applies outside
         // of check: standing pat on the static evaluation of an attacked king
         // is meaningless, so a check at the limit still gets its evasions.
-        if qply >= 16 && !in_check {
+        // Was 16; 12 shaved the long check sequences down a little (accepted,
+        // match 51.7%). Going lower (10) changes nothing, the cap is rarely hit.
+        if qply >= 12 && !in_check {
             return self.corrected_eval(board, ply, self.raw_eval(board));
         }
         let mut tt_move = Move::NULL;

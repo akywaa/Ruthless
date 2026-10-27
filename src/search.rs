@@ -456,7 +456,7 @@ unsafe {
             }
             if depth >= 4 {
                 let mut full_window = false;
-                let mut delta = 25;
+                let mut delta = 16;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
 
@@ -619,7 +619,7 @@ unsafe {
 
             if depth >= 4 {
                 let mut full_window = false;
-                let mut delta = 25;
+                let mut delta = 16;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
 

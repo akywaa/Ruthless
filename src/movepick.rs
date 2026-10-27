@@ -50,6 +50,9 @@ pub struct MovePicker {
     /// SEE >= 0. Cached here so the search does not have to run SEE a second
     /// time on the same move.
     pub last_see_ge_zero: bool,
+    /// Whether the last returned move came from the good-noisy stage, where SEE
+    /// was already proven to be >= 0.
+    pub last_good_noisy: bool,
 }
 
 impl MovePicker {
@@ -72,6 +75,7 @@ impl MovePicker {
             threats: None,
             check_squares: None,
             last_see_ge_zero: true,
+            last_good_noisy: false,
         }
     }
 
@@ -89,17 +93,15 @@ impl MovePicker {
     }
 
     /// Whether `m` gives a direct check, using per-node precomputed squares.
+    /// The squares are kept by reference so the 6-bitboard table is not copied
+    /// out of the picker on every call.
     #[inline(always)]
     pub fn gives_check(&mut self, board: &Board, m: Move) -> bool {
-        let squares = match self.check_squares {
-            Some(squares) => squares,
-            None => {
-                let squares = board.check_squares();
-                self.check_squares = Some(squares);
-                squares
-            }
-        };
-        board.gives_check_with(m, &squares)
+        if self.check_squares.is_none() {
+            self.check_squares = Some(board.check_squares());
+        }
+        let squares = self.check_squares.as_ref().unwrap();
+        board.gives_check_with(m, squares)
     }
 
     pub fn new_qsearch(tt_move: Move) -> Self {
@@ -121,6 +123,7 @@ impl MovePicker {
             threats: None,
             check_squares: None,
             last_see_ge_zero: true,
+            last_good_noisy: false,
         }
     }
 
@@ -150,6 +153,7 @@ impl MovePicker {
         played_pieces: &[Piece; MAX_PLY],
         played_moves: &[Move; MAX_PLY],
     ) -> Option<Move> {
+        self.last_good_noisy = false;
         loop {
             match self.stage {
                 Stage::TTMove => {
@@ -198,6 +202,7 @@ impl MovePicker {
                         if see(board, m, 0) {
                             if self.is_legal(board, m) {
                                 self.last_see_ge_zero = true;
+                                self.last_good_noisy = true;
                                 return Some(m);
                             }
                         } else if !self.qsearch && self.bad_noisy_count < self.bad_noisy.len() {

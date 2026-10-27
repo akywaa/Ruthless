@@ -443,6 +443,10 @@ unsafe {
             });
         }
 
+        // The root position does not change between iterations, so its check
+        // state is computed once and handed to every negamax call below.
+        let root_in_check = board.in_check();
+
         for depth in 1..=max_depth {
             for root_move in &mut self.root_moves {
                 root_move.nodes = 0;
@@ -454,7 +458,7 @@ unsafe {
                 let mut beta = (score + delta).min(INFINITY);
 
                 loop {
-                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false);
+                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false, root_in_check);
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -483,7 +487,7 @@ unsafe {
                     }
                 }
             } else {
-                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false);
+                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false, root_in_check);
             }
 
             if self.stop.load(Ordering::Relaxed) {
@@ -600,6 +604,7 @@ unsafe {
         let mut score = 0;
         let start_depth = 1 + (self.thread_id % 2) as u8;
         let target_depth = (max_depth as usize + 8).min(MAX_PLY) as u8;
+        let root_in_check = board.in_check();
 
         for depth in start_depth..=target_depth {
             self.root_moves.clear();
@@ -616,7 +621,7 @@ unsafe {
                 let mut beta = (score + delta).min(INFINITY);
 
                 loop {
-                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false);
+                    score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false, root_in_check);
                     if self.stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -645,7 +650,7 @@ unsafe {
                     }
                 }
             } else {
-                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false);
+                score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false, root_in_check);
             }
 
             if self.stop.load(Ordering::Relaxed) {
@@ -718,6 +723,7 @@ unsafe {
         is_pv: bool,
         excluded_move: Move,
         cut_node: bool,
+        in_check: bool,
     ) -> i32 {
         self.check_time();
         if self.stop.load(Ordering::Relaxed) {
@@ -758,7 +764,6 @@ unsafe {
             self.killers[(ply + 2) as usize] = [Move::NULL; 2];
         }
 
-        let in_check = board.in_check();
         // Bounded in-check extension (commit fe01c69). Removing it or limiting
         // it to PV nodes was proposed but never SPRT-tested, so it stays.
         if in_check && (ply as usize) < MAX_PLY - 1 && excluded_move == Move::NULL {
@@ -766,7 +771,7 @@ unsafe {
         }
 
         if depth == 0 {
-            return self.quiescence(board, alpha, beta, ply, 0);
+            return self.quiescence(board, alpha, beta, ply, 0, in_check);
         }
 
         self.nodes += 1;
@@ -935,7 +940,7 @@ unsafe {
 
             // Razoring
             if depth <= 2 && eval + 200 + 100 * (depth as i32) <= alpha {
-                let qscore = self.quiescence(board, alpha, beta, ply, 0);
+                let qscore = self.quiescence(board, alpha, beta, ply, 0, in_check);
                 if qscore <= alpha {
                     return qscore;
                 }
@@ -966,6 +971,8 @@ unsafe {
                 }
                 let undo = board.make_null_move();
                 self.tt.prefetch(board.tt_hash);
+                // A null move leaves the enemy king untouched, so the position
+                // after it can never be a check.
                 let score = -self.negamax(
                     board,
                     depth.saturating_sub(r),
@@ -975,6 +982,7 @@ unsafe {
                     false,
                     Move::NULL,
                     !cut_node,
+                    false,
                 );
                 board.undo_null_move(undo);
 
@@ -1020,7 +1028,9 @@ unsafe {
 
                     let undo = board.make_move(m);
                     self.tt.prefetch(board.tt_hash);
-                    let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0);
+                    let probcut_check = board.in_check();
+                    let mut score =
+                        -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0, probcut_check);
 
                     if score >= probcut_beta {
                         score = -self.negamax(
@@ -1032,6 +1042,7 @@ unsafe {
                             false,
                             Move::NULL,
                             !cut_node,
+                            probcut_check,
                         );
                     }
 
@@ -1070,6 +1081,7 @@ unsafe {
                 false,
                 tt_move,
                 cut_node,
+                in_check,
             );
 
             if self.stop.load(Ordering::Relaxed) {
@@ -1198,7 +1210,10 @@ unsafe {
                 }
 
                 if !is_quiet && lmr_depth <= 5 {
-                    if !see(board, m, -100 * (lmr_depth + 1)) {
+                    // A move handed out by the picker's good-noisy stage already
+                    // has SEE >= 0, which always clears the negative threshold
+                    // used here, so its SEE call can be skipped.
+                    if !picker.last_good_noisy && !see(board, m, -100 * (lmr_depth + 1)) {
                         continue;
                     }
 
@@ -1245,7 +1260,7 @@ unsafe {
                 if (ply as usize) < MAX_PLY {
                     self.reduction_stack[ply as usize] = 0;
                 }
-                -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, child_cut)
+                -self.negamax(board, next_depth, ply + 1, -beta, -alpha, is_pv, Move::NULL, child_cut, gives_check)
             } else {
                 let mut r = 0;
 
@@ -1310,17 +1325,17 @@ unsafe {
                 if (ply as usize) < MAX_PLY {
                     self.reduction_stack[ply as usize] = r as u8;
                 }
-                let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL, true);
+                let mut s = -self.negamax(board, reduced, ply + 1, -alpha - 1, -alpha, false, Move::NULL, true, gives_check);
                 if (ply as usize) < MAX_PLY {
                     self.reduction_stack[ply as usize] = 0;
                 }
 
                 if s > alpha && reduced < depth - 1 {
-                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node);
+                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node, gives_check);
                 }
 
                 if s > alpha && s < beta {
-                    s = -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, true, Move::NULL, false);
+                    s = -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, true, Move::NULL, false, gives_check);
                 }
 
                 s
@@ -1574,7 +1589,15 @@ unsafe {
         best_score
     }
 
-    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u8, qply: u8) -> i32 {
+    fn quiescence(
+        &mut self,
+        board: &mut Board,
+        mut alpha: i32,
+        beta: i32,
+        ply: u8,
+        qply: u8,
+        in_check: bool,
+    ) -> i32 {
         self.check_time();
         if self.stop.load(Ordering::Relaxed) {
             return 0;
@@ -1593,8 +1616,6 @@ unsafe {
         // the tree beyond the main search line. The cap only applies outside
         // of check: standing pat on the static evaluation of an attacked king
         // is meaningless, so a check at the limit still gets its evasions.
-        let in_check = board.in_check();
-
         if qply >= 16 && !in_check {
             return self.corrected_eval(board, ply, self.raw_eval(board));
         }
@@ -1693,7 +1714,8 @@ unsafe {
                 }
                 let undo = board.make_move(m);
                 self.tt.prefetch(board.tt_hash);
-                let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1);
+                let child_check = board.in_check();
+                let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1, child_check);
                 board.undo_move(m, undo);
 
                 if self.stop.load(Ordering::Relaxed) {
@@ -1779,7 +1801,8 @@ unsafe {
             }
             let undo = board.make_move(m);
             self.tt.prefetch(board.tt_hash);
-            let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1);
+            let child_check = board.in_check();
+            let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1, child_check);
             board.undo_move(m, undo);
 
             if self.stop.load(Ordering::Relaxed) {

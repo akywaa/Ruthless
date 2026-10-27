@@ -128,11 +128,24 @@ impl Accumulator {
         for side in 0..2 {
             let adds = &delta.adds[side];
             let subs = &delta.subs[side];
-            if adds[0].is_none() && adds[1].is_none() && subs[0].is_none() && subs[1].is_none() {
+            let add_count = delta.add_count[side];
+            let sub_count = delta.sub_count[side];
+            if add_count == 0 && sub_count == 0 {
                 continue;
             }
 
             let zero = &ZERO_WEIGHTS.0;
+
+            // Nearly every move changes exactly one feature per point of view,
+            // so that case runs on the two-op kernel instead of the general
+            // four-op one, which would waste half its work on zero vectors.
+            if add_count == 1 && sub_count == 1 {
+                let add = &net.feature_weights[adds[0].unwrap()].vals;
+                let sub = &net.feature_weights[subs[0].unwrap()].vals;
+                apply_delta_weights_11(&mut self.vals[side], add, sub);
+                continue;
+            }
+
             let add1 = adds[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
             let add2 = adds[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
             let sub1 = subs[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
@@ -152,11 +165,21 @@ impl Accumulator {
         for side in 0..2 {
             let adds = &delta.adds[side];
             let subs = &delta.subs[side];
-            if adds[0].is_none() && adds[1].is_none() && subs[0].is_none() && subs[1].is_none() {
+            let add_count = delta.add_count[side];
+            let sub_count = delta.sub_count[side];
+            if add_count == 0 && sub_count == 0 {
                 continue;
             }
 
             let zero = &ZERO_WEIGHTS.0;
+
+            if add_count == 1 && sub_count == 1 {
+                let add = &net.feature_weights[adds[0].unwrap()].vals;
+                let sub = &net.feature_weights[subs[0].unwrap()].vals;
+                apply_delta_weights_11(&mut self.vals[side], sub, add);
+                continue;
+            }
+
             let add1 = adds[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
             let add2 = adds[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
             let sub1 = subs[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
@@ -294,6 +317,55 @@ fn scalar_delta(
             .wrapping_add(add2[i])
             .wrapping_sub(sub1[i])
             .wrapping_sub(sub2[i]);
+    }
+}
+
+/// Two-op accumulator update, used when a move touches exactly one feature per
+/// point of view. The general kernel would add and subtract a zero vector in
+/// that case, which doubles its vector work for no benefit.
+#[inline(always)]
+fn apply_delta_weights_11(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add: &[i16; HIDDEN_SIZE],
+    sub: &[i16; HIDDEN_SIZE],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        unsafe { vec_delta_avx512_11(vals, add, sub) };
+        return;
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+    ))]
+    {
+        if has_avx2() {
+            unsafe { vec_delta_avx2_11(vals, add, sub) };
+            return;
+        }
+        scalar_delta_11(vals, add, sub);
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { vec_delta_neon_11(vals, add, sub) };
+        return;
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    scalar_delta_11(vals, add, sub);
+}
+
+#[inline(always)]
+fn scalar_delta_11(vals: &mut [i16; HIDDEN_SIZE], add: &[i16; HIDDEN_SIZE], sub: &[i16; HIDDEN_SIZE]) {
+    for i in 0..HIDDEN_SIZE {
+        vals[i] = vals[i].wrapping_add(add[i]).wrapping_sub(sub[i]);
     }
 }
 
@@ -688,6 +760,28 @@ unsafe fn vec_delta_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+unsafe fn vec_delta_avx2_11(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add: &[i16; HIDDEN_SIZE],
+    sub: &[i16; HIDDEN_SIZE],
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let d_ptr = vals.as_mut_ptr() as *mut __m256i;
+        let a_ptr = add.as_ptr() as *const __m256i;
+        let s_ptr = sub.as_ptr() as *const __m256i;
+
+        for i in 0..(HIDDEN_SIZE / 16) {
+            let v = _mm256_loadu_si256(d_ptr.add(i));
+            let v = _mm256_add_epi16(v, _mm256_loadu_si256(a_ptr.add(i)));
+            let v = _mm256_sub_epi16(v, _mm256_loadu_si256(s_ptr.add(i)));
+            _mm256_storeu_si256(d_ptr.add(i), v);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 unsafe fn evaluate_avx2(
     acc: &Accumulator,
     us: usize,
@@ -756,6 +850,32 @@ unsafe fn vec_add_avx512(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SI
             let va = _mm512_loadu_si512(a_ptr.add(i));
             let vw = _mm512_loadu_si512(w_ptr.add(i));
             _mm512_storeu_si512(a_ptr.add(i), _mm512_add_epi16(va, vw));
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn vec_delta_avx512_11(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add: &[i16; HIDDEN_SIZE],
+    sub: &[i16; HIDDEN_SIZE],
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let d_ptr = vals.as_mut_ptr() as *mut __m512i;
+        let a_ptr = add.as_ptr() as *const __m512i;
+        let s_ptr = sub.as_ptr() as *const __m512i;
+
+        for i in 0..(HIDDEN_SIZE / 32) {
+            let v = _mm512_loadu_si512(d_ptr.add(i));
+            let v = _mm512_add_epi16(v, _mm512_loadu_si512(a_ptr.add(i)));
+            let v = _mm512_sub_epi16(v, _mm512_loadu_si512(s_ptr.add(i)));
+            _mm512_storeu_si512(d_ptr.add(i), v);
         }
     }
 }
@@ -854,6 +974,27 @@ unsafe fn vec_add_neon(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
             let va = vld1q_s16(a_ptr.add(i));
             let vw = vld1q_s16(w_ptr.add(i));
             vst1q_s16(a_ptr.add(i), vaddq_s16(va, vw));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_delta_neon_11(
+    vals: &mut [i16; HIDDEN_SIZE],
+    add: &[i16; HIDDEN_SIZE],
+    sub: &[i16; HIDDEN_SIZE],
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let d_ptr = vals.as_mut_ptr();
+        let a_ptr = add.as_ptr();
+        let s_ptr = sub.as_ptr();
+
+        for i in (0..HIDDEN_SIZE).step_by(8) {
+            let mut v = vld1q_s16(d_ptr.add(i));
+            v = vaddq_s16(v, vld1q_s16(a_ptr.add(i)));
+            v = vsubq_s16(v, vld1q_s16(s_ptr.add(i)));
+            vst1q_s16(d_ptr.add(i), v);
         }
     }
 }

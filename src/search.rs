@@ -456,6 +456,10 @@ unsafe {
             }
             if depth >= 4 {
                 let mut full_window = false;
+                // Aspiration window. The start delta was 25; narrowing it to 16
+                // was accepted at -9.6% nodes at fixed depth 12 with a level
+                // 150-game match (49.0%, -7 +/- 28 Elo). The loop below widens
+                // the window again, so a too-narrow start only costs a re-search.
                 let mut delta = 16;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
@@ -619,6 +623,10 @@ unsafe {
 
             if depth >= 4 {
                 let mut full_window = false;
+                // Aspiration window. The start delta was 25; narrowing it to 16
+                // was accepted at -9.6% nodes at fixed depth 12 with a level
+                // 150-game match (49.0%, -7 +/- 28 Elo). The loop below widens
+                // the window again, so a too-narrow start only costs a re-search.
                 let mut delta = 16;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
@@ -1191,10 +1199,16 @@ unsafe {
                 if is_quiet && !picker.gives_check(board, m) {
                     // 4000 (was 2000): a higher bar prunes more quiet moves,
                     // accepted at -5.9% nodes at fixed depth and +19 Elo.
+                    // Breaking out entirely at `lmp_threshold * 2` was tested
+                    // and reverted: it also drops the high-history quiets this
+                    // line lets through, so the tree grew +16.9% at fixed depth.
                     if moves_searched >= lmp_threshold && hist < 4000 {
                         continue;
                     }
 
+                    // A `!improving` discount here (e.g. -35) was tested and
+                    // reverted: a smaller margin prunes less, so the tree grew
+                    // +27.6% at fixed depth 12 instead of shrinking.
                     let futility_margin = FUTILITY_BASE.load(Ordering::Relaxed)
                         + FUTILITY_MARGIN.load(Ordering::Relaxed) * (lmr_depth + 1);
                     // Do not raise this futility cap from 5 to 7: tested and
@@ -1321,6 +1335,11 @@ unsafe {
                     // reduction entirely, which measured 28% more nodes at the
                     // same depth. Checks stay exempt (commit e02f693).
                     r = r.clamp(1, depth as i32 - 2);
+                    // Checks stay at full depth. Softening this into a partial
+                    // reduction was tested and reverted: `r - 1` cost +23.7%
+                    // nodes and `r / 2` +6.2% at fixed depth 12, because check
+                    // cutoffs are worth the full search and a shallower one
+                    // makes the tree grow instead of shrink.
                     if gives_check {
                         r = 0;
                     }

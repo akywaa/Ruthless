@@ -253,6 +253,25 @@ impl TranspositionTable {
         target_entry.key.store(key ^ new_data, Ordering::Relaxed);
     }
 
+    /// Permille of the table that is in use, sampled over the first 1000
+    /// clusters. This is the usual UCI `hashfull` estimate, so a GUI sees the
+    /// same numbers it sees from other engines.
+    pub fn hashfull(&self) -> usize {
+        let sample = self.len.min(1000);
+        let mut used = 0usize;
+
+        for cluster in self.clusters.iter().take(sample) {
+            for entry in &cluster.entries {
+                let data = entry.data.load(Ordering::Relaxed);
+                if bound_of(((data >> 16) & 0xFF) as u8) != TTFlag::None {
+                    used += 1;
+                }
+            }
+        }
+
+        used / 4
+    }
+
     pub fn clear(&self) {
         for cluster in &self.clusters {
             for entry in &cluster.entries {

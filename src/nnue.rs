@@ -134,22 +134,20 @@ impl Accumulator {
                 continue;
             }
 
-            let zero = &ZERO_WEIGHTS.0;
-
             // Nearly every move changes exactly one feature per point of view,
             // so that case runs on the two-op kernel instead of the general
             // four-op one, which would waste half its work on zero vectors.
             if add_count == 1 && sub_count == 1 {
-                let add = &net.feature_weights[adds[0].unwrap()].vals;
-                let sub = &net.feature_weights[subs[0].unwrap()].vals;
+                let add = &net.feature_weights[adds[0] as usize].vals;
+                let sub = &net.feature_weights[subs[0] as usize].vals;
                 apply_delta_weights_11(&mut self.vals[side], add, sub);
                 continue;
             }
 
-            let add1 = adds[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
-            let add2 = adds[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
-            let sub1 = subs[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
-            let sub2 = subs[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
+            let add1 = feature_weights_or_zero(net, adds[0]);
+            let add2 = feature_weights_or_zero(net, adds[1]);
+            let sub1 = feature_weights_or_zero(net, subs[0]);
+            let sub2 = feature_weights_or_zero(net, subs[1]);
 
             apply_delta_weights(&mut self.vals[side], add1, add2, sub1, sub2);
         }
@@ -171,19 +169,17 @@ impl Accumulator {
                 continue;
             }
 
-            let zero = &ZERO_WEIGHTS.0;
-
             if add_count == 1 && sub_count == 1 {
-                let add = &net.feature_weights[adds[0].unwrap()].vals;
-                let sub = &net.feature_weights[subs[0].unwrap()].vals;
+                let add = &net.feature_weights[adds[0] as usize].vals;
+                let sub = &net.feature_weights[subs[0] as usize].vals;
                 apply_delta_weights_11(&mut self.vals[side], sub, add);
                 continue;
             }
 
-            let add1 = adds[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
-            let add2 = adds[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
-            let sub1 = subs[0].map_or(zero, |idx| &net.feature_weights[idx].vals);
-            let sub2 = subs[1].map_or(zero, |idx| &net.feature_weights[idx].vals);
+            let add1 = feature_weights_or_zero(net, adds[0]);
+            let add2 = feature_weights_or_zero(net, adds[1]);
+            let sub1 = feature_weights_or_zero(net, subs[0]);
+            let sub2 = feature_weights_or_zero(net, subs[1]);
 
             apply_delta_weights(&mut self.vals[side], sub1, sub2, add1, add2);
         }
@@ -414,13 +410,20 @@ pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, view: Color) ->
     king_bucket(oriented_ksq) * 768 + piece_idx * 64 + final_sq
 }
 
+/// Marker for an unused feature slot in a [`FeatureDelta`]. The largest index
+/// `feature_index_side` can produce is just under 7680, so u16 has room for it.
+const NO_FEATURE: u16 = u16::MAX;
+
 /// Feature changes of one move, grouped per point of view. A move touches at
 /// most two features per side (a castling king and rook), so a fixed-size
 /// buffer is enough and the whole delta can be applied in one memory pass.
+/// Slots hold u16 indices with [`NO_FEATURE`] for "empty" instead of
+/// `Option<usize>`: the delta is built and copied on every make/undo, and the
+/// optional layout made it 160 bytes of stack traffic per move.
 #[derive(Copy, Clone)]
 pub struct FeatureDelta {
-    adds: [[Option<usize>; 2]; 2],
-    subs: [[Option<usize>; 2]; 2],
+    adds: [[u16; 2]; 2],
+    subs: [[u16; 2]; 2],
     add_count: [usize; 2],
     sub_count: [usize; 2],
 }
@@ -429,8 +432,8 @@ impl FeatureDelta {
     #[inline(always)]
     pub fn new() -> Self {
         Self {
-            adds: [[None; 2]; 2],
-            subs: [[None; 2]; 2],
+            adds: [[NO_FEATURE; 2]; 2],
+            subs: [[NO_FEATURE; 2]; 2],
             add_count: [0; 2],
             sub_count: [0; 2],
         }
@@ -441,13 +444,13 @@ impl FeatureDelta {
         if skip != Some(Color::White) {
             let view = Color::White as usize;
             self.adds[view][self.add_count[view]] =
-                Some(feature_index_side(piece, sq, w_ksq, Color::White));
+                feature_index_side(piece, sq, w_ksq, Color::White) as u16;
             self.add_count[view] += 1;
         }
         if skip != Some(Color::Black) {
             let view = Color::Black as usize;
             self.adds[view][self.add_count[view]] =
-                Some(feature_index_side(piece, sq, b_ksq, Color::Black));
+                feature_index_side(piece, sq, b_ksq, Color::Black) as u16;
             self.add_count[view] += 1;
         }
     }
@@ -457,15 +460,26 @@ impl FeatureDelta {
         if skip != Some(Color::White) {
             let view = Color::White as usize;
             self.subs[view][self.sub_count[view]] =
-                Some(feature_index_side(piece, sq, w_ksq, Color::White));
+                feature_index_side(piece, sq, w_ksq, Color::White) as u16;
             self.sub_count[view] += 1;
         }
         if skip != Some(Color::Black) {
             let view = Color::Black as usize;
             self.subs[view][self.sub_count[view]] =
-                Some(feature_index_side(piece, sq, b_ksq, Color::Black));
+                feature_index_side(piece, sq, b_ksq, Color::Black) as u16;
             self.sub_count[view] += 1;
         }
+    }
+}
+
+/// Weight vector of a delta slot, or the shared zero vector when the slot is
+/// unused.
+#[inline(always)]
+fn feature_weights_or_zero(net: &'static Network, idx: u16) -> &'static [i16; HIDDEN_SIZE] {
+    if idx == NO_FEATURE {
+        &ZERO_WEIGHTS.0
+    } else {
+        &net.feature_weights[idx as usize].vals
     }
 }
 

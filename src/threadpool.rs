@@ -119,6 +119,11 @@ impl ThreadPool {
             let _ = handle.join();
         }
 
+        // A helper that was armed for a search but woke up on the Exit command
+        // above returned without decrementing, so clear the counter here instead
+        // of letting the next search wait for it forever.
+        self.active_helpers.store(0, Ordering::Release);
+
         self.num_threads = target_num;
         self.main_searcher.num_threads = target_num;
 
@@ -174,7 +179,6 @@ impl ThreadPool {
                             }
                             let mut board_clone = params.board;
                             helper.stop = Arc::clone(&params.stop);
-                            active_clone.fetch_add(1, Ordering::Relaxed);
                             helper.search_helper(&mut board_clone, params.depth, params.soft_time);
 
                             if helper.completed_depth > 0 && helper.root_best_move != Move::NULL {
@@ -245,8 +249,13 @@ impl ThreadPool {
             clear_histories,
         };
 
-        // Wake up sleeping helpers instantly
+        // Wake up sleeping helpers instantly. The helper counter is armed here,
+        // before the wake-up: bumping it inside the helper left a window in
+        // which the main thread saw zero, and returned from its own search (and
+        // read the result slots) while the helpers had not started yet.
         if self.num_threads > 1 {
+            self.active_helpers
+                .store((self.num_threads - 1) as u64, Ordering::Release);
             let (lock, cvar) = &*self.shared_state;
             let mut state = lock.lock().unwrap();
             state.command = Command::Search(params);
@@ -314,7 +323,14 @@ impl ThreadPool {
                 + (self.main_searcher.nodes & 1023);
             let elapsed = search_start.elapsed().as_millis().max(1);
             let nps = (total_nodes as u128 * 1000) / elapsed;
-            print_search_result(&selected, total_nodes, nps, elapsed);
+            print_search_result(
+                &selected,
+                total_nodes,
+                nps,
+                elapsed,
+                self.main_searcher.seldepth,
+                self.tt.hashfull(),
+            );
         }
 
         selected.best_move
@@ -366,7 +382,14 @@ impl ThreadPool {
     }
 }
 
-fn print_search_result(result: &SearchResult, nodes: u64, nps: u128, time: u128) {
+fn print_search_result(
+    result: &SearchResult,
+    nodes: u64,
+    nps: u128,
+    time: u128,
+    seldepth: u8,
+    hashfull: usize,
+) {
     let pv = result
         .pv
         .iter()
@@ -378,18 +401,20 @@ fn print_search_result(result: &SearchResult, nodes: u64, nps: u128, time: u128)
         let mate_dist = (MATE_SCORE - result.score.abs() + 1) / 2;
         let sign = if result.score > 0 { 1 } else { -1 };
         println!(
-            "info depth {} score mate {} nodes {} nps {} time {} pv {}",
+            "info depth {} seldepth {} score mate {} nodes {} nps {} hashfull {} time {} pv {}",
             result.depth,
+            seldepth,
             mate_dist * sign,
             nodes,
             nps,
+            hashfull,
             time,
             pv
         );
     } else {
         println!(
-            "info depth {} score cp {} nodes {} nps {} time {} pv {}",
-            result.depth, result.score, nodes, nps, time, pv
+            "info depth {} seldepth {} score cp {} nodes {} nps {} hashfull {} time {} pv {}",
+            result.depth, seldepth, result.score, nodes, nps, hashfull, time, pv
         );
     }
 }

@@ -763,7 +763,10 @@ impl Board {
         self.is_repetition()
             || (self.halfmove_clock >= 100
                 && (!self.in_check() || crate::movegen::generate_legal_moves(self).count > 0))
-            || self.draw_by_material()
+            // Material draws need at most four pieces on the board (K vs K,
+            // K+N vs K, K+B vs K, same-coloured bishops), so the expensive
+            // pawn/rook/queen scan is skipped in every other position.
+            || (self.occupied.count() <= 4 && self.draw_by_material())
     }
 
     #[inline(always)]
@@ -846,6 +849,9 @@ impl Board {
 
         let current_key = self.hash;
         let mut index = count - 1;
+        // Hoisted: `cuckoo()` goes through a OnceLock, which has no business
+        // running inside the repetition loop.
+        let cuckoo = crate::zobrist::cuckoo();
 
         let mut compared_ply = 3;
         while compared_ply <= max_steps {
@@ -855,7 +861,6 @@ impl Board {
             let diff = current_key ^ self.history[index];
             let mut c_idx = crate::zobrist::h1(diff);
 
-            let cuckoo = crate::zobrist::cuckoo();
             if cuckoo.keys[c_idx] != diff {
                 c_idx = crate::zobrist::h2(diff);
                 if cuckoo.keys[c_idx] != diff {

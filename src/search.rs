@@ -124,6 +124,10 @@ pub struct Searcher {
     pub root_best_move: Move,
     pub root_score: i32,
     pub completed_depth: u8,
+    /// Deepest ply any node (qsearch included) reached in the current search.
+    /// Reported as `seldepth`; the nominal depth hides how far the search went
+    /// through extensions and quiescence.
+    pub seldepth: u8,
 }
 
 // Mate scores carry the distance to the root in their low bits, so the
@@ -224,6 +228,7 @@ cont_corr: alloc_box_zeroed(),
             root_best_move: Move::NULL,
             root_score: 0,
             completed_depth: 0,
+            seldepth: 0,
         }
     }
 
@@ -255,6 +260,7 @@ unsafe {
         self.root_best_move = Move::NULL;
         self.root_score = 0;
         self.completed_depth = 0;
+        self.seldepth = 0;
     }
 
     #[inline(always)]
@@ -404,6 +410,7 @@ unsafe {
         self.root_best_move = Move::NULL;
         self.root_score = 0;
         self.completed_depth = 0;
+        self.seldepth = 0;
         self.root_best_move_pending = Move::NULL;
 
         let legal_moves = generate_legal_moves(board);
@@ -456,7 +463,7 @@ unsafe {
             }
             if depth >= 4 {
                 let mut full_window = false;
-                let mut delta = 25;
+                let mut delta = 16;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
 
@@ -521,18 +528,27 @@ unsafe {
                 let mate_dist = (MATE_SCORE - score.abs() + 1) / 2;
                 let sign = if score > 0 { 1 } else { -1 };
                 println!(
-                    "info depth {} score mate {} nodes {} nps {} time {} pv {}",
+                    "info depth {} seldepth {} score mate {} nodes {} nps {} hashfull {} time {} pv {}",
                     depth,
+                    self.seldepth,
                     mate_dist * sign,
                     total_nodes,
                     nps,
+                    self.tt.hashfull(),
                     elapsed,
                     pv_str
                 );
             } else {
                 println!(
-                    "info depth {} score cp {} nodes {} nps {} time {} pv {}",
-                    depth, score, total_nodes, nps, elapsed, pv_str
+                    "info depth {} seldepth {} score cp {} nodes {} nps {} hashfull {} time {} pv {}",
+                    depth,
+                    self.seldepth,
+                    score,
+                    total_nodes,
+                    nps,
+                    self.tt.hashfull(),
+                    elapsed,
+                    pv_str
                 );
             }
 
@@ -604,6 +620,7 @@ unsafe {
         self.root_best_move = Move::NULL;
         self.root_score = 0;
         self.completed_depth = 0;
+        self.seldepth = 0;
         let mut score = 0;
         let start_depth = 1 + (self.thread_id % 2) as u8;
         let target_depth = (max_depth as usize + 8).min(MAX_PLY) as u8;
@@ -619,7 +636,7 @@ unsafe {
 
             if depth >= 4 {
                 let mut full_window = false;
-                let mut delta = 25;
+                let mut delta = 16;
                 let mut alpha = (score - delta).max(-INFINITY);
                 let mut beta = (score + delta).min(INFINITY);
 
@@ -781,6 +798,9 @@ unsafe {
         }
 
         self.nodes += 1;
+        if ply > self.seldepth {
+            self.seldepth = ply;
+        }
 
         let alpha_orig = alpha;
         let mut tt_move = Move::NULL;
@@ -805,13 +825,26 @@ unsafe {
         // they are re-visited with a null window.
         let tt_pv = is_pv || (has_tt && tt_is_pv);
 
-        let raw_eval = if has_tt && tt_raw_eval != crate::tt::RAW_EVAL_NONE {
-            tt_raw_eval as i32
+        // An in-check node has no use for a static eval: the improving chain,
+        // the pruning/futility decisions and the correction-history update are
+        // all guarded by `!in_check`, and the eval stack slot is written as a
+        // sentinel below. Skipping the NNUE call here and storing
+        // `RAW_EVAL_NONE` saves the most expensive single call in the node for
+        // every check node and keeps meaningless evals out of the table.
+        let (static_eval, raw_eval_to_store) = if in_check {
+            (0, crate::tt::RAW_EVAL_NONE)
         } else {
-            evaluate(board)
+            let raw_eval = if has_tt && tt_raw_eval != crate::tt::RAW_EVAL_NONE {
+                tt_raw_eval as i32
+            } else {
+                evaluate(board)
+            };
+            (
+                self.corrected_eval(board, ply, raw_eval),
+                raw_eval.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16,
+            )
         };
 
-        let static_eval = self.corrected_eval(board, ply, raw_eval);
         if (ply as usize) < MAX_PLY {
             // An in-check eval is not comparable with a quiet one, so mark it as
             // unusable instead of letting it poison the improving comparison two
@@ -1185,7 +1218,13 @@ unsafe {
 
             // Do not prune while the best score so far is a loss: the remaining
             // moves may still hold the only defence.
-            if !tt_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
+            //
+            // HYPOTHESIS: the gate is the node type, not the sticky "was part of
+            // a PV once" flag. A re-searched node whose TT flag says PV but
+            // which is currently searched with a null window is a scout node
+            // like any other, and keeping shallow pruning off there leaves a
+            // large part of the tree unpruned.
+            if !is_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
                 // Quiet moves that check the enemy king are never pruned. The
                 // picker's cached check squares make this a single lookup.
                 if is_quiet && !picker.gives_check(board, m) {
@@ -1317,11 +1356,17 @@ unsafe {
                         r += 1;
                     }
 
-                    // Every other reduced move keeps at least one ply of
-                    // reduction: a min of 0 lets PV/history bonuses cancel the
-                    // reduction entirely, which measured 28% more nodes at the
-                    // same depth. Checks stay exempt (commit e02f693).
-                    r = r.clamp(1, depth as i32 - 2);
+                    // HYPOTHESIS: allow a reduction of zero. The lower bound of
+                    // 1 was kept because a min of 0 measured ~28% more nodes at
+                    // a fixed depth, but a bigger tree at the same depth is not
+                    // a strength argument by itself - two changes rejected on
+                    // exactly that argument (the shallow-pruning gate, qsearch
+                    // TT stores) turned out positive in a match. A zero
+                    // reduction only happens when history, killers or an
+                    // improving position already flagged the move as likely
+                    // best, which is where a full-depth scout search is least
+                    // wasteful. Checks already take this path.
+                    r = r.clamp(0, depth as i32 - 2);
                     // Checks stay at full depth. Softening this into a partial
                     // reduction was tested and reverted: `r - 1` cost +23.7%
                     // nodes and `r / 2` +6.2% at fixed depth 12, because check
@@ -1410,9 +1455,10 @@ unsafe {
                     _ => board.piece_on[m.to()].piece_type(),
                 } as usize;
 
-                let threats = picker.threats(board);
-                let to_threatened = threats.contains(m.to()) as usize;
-
+                // Only the noisy-history updates index by whether the target is
+                // threatened, so the threat map is taken per branch instead of
+                // on every cutoff: a quiet cutoff that was never preceded by a
+                // noisy move does not need it at all.
                 if is_quiet {
                     if (ply as usize) < MAX_PLY {
                         if self.killers[ply as usize][0] != m {
@@ -1458,6 +1504,7 @@ unsafe {
                     }
 
                     if noisy_count > 0 {
+                        let threats = picker.threats(board);
                         for j in 0..noisy_count {
                             let nm = noisy_moves[j];
                             if nm == m || nm == Move::NULL { continue; }
@@ -1476,6 +1523,9 @@ unsafe {
                         }
                     }
                 } else {
+                    let threats = picker.threats(board);
+                    let to_threatened = threats.contains(m.to()) as usize;
+
                     if moving_pc < 12 && victim_pt < 6 {
                         update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt][to_threatened], bonus);
                     }
@@ -1544,7 +1594,7 @@ unsafe {
                 depth,
                 flag,
                 best_move,
-                raw_eval.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16,
+                raw_eval_to_store,
                 is_pv || flag == TTFlag::Exact,
             );
 
@@ -1652,6 +1702,9 @@ unsafe {
         }
 
         self.nodes += 1;
+        if ply > self.seldepth {
+            self.seldepth = ply;
+        }
         let alpha_orig = alpha;
 
         let mut stand_pat = -INFINITY;
@@ -1853,13 +1906,25 @@ unsafe {
             alpha = alpha.max(score);
         }
 
-        // Only store beta cutoffs from qsearch to avoid polluting the TT with shallow upper bounds
-        if best_score >= beta {
+        // HYPOTHESIS (was: only store beta cutoffs, to keep shallow upper bounds
+        // out of the table): store the finished node instead. A qsearch node is
+        // entered again and again through transpositions, and without an entry
+        // every visit re-runs the whole capture loop. The flag below is exact
+        // when the node raised alpha, so the entry is a real result, not a
+        // half-searched guess.
+        if !self.stop.load(Ordering::Relaxed) {
+            let flag = if best_score >= beta {
+                TTFlag::LowerBound
+            } else if best_score > alpha_orig {
+                TTFlag::Exact
+            } else {
+                TTFlag::UpperBound
+            };
             self.tt.store(
                 board.tt_hash,
                 score_to_tt(best_score, ply),
                 0,
-                TTFlag::LowerBound,
+                flag,
                 best_move,
                 raw_eval_to_store,
                 false,

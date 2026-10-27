@@ -313,6 +313,12 @@ impl MovePicker {
     }
 
     fn score_noisy(&mut self, board: &Board, noisy_history: &[[[[i32; 2]; 6]; 64]; 12]) {
+        // Nothing to score means nothing to look up: the threat map is only an
+        // input of the per-move scores below, and the caller still gets it from
+        // the cache on demand.
+        if self.moves.count == 0 {
+            return;
+        }
         let threats = self.threats(board);
 
         for i in 0..self.moves.count {

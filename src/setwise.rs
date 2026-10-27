@@ -19,14 +19,19 @@ pub fn detect_slider_style() -> bool {
 
 #[cfg(target_arch = "x86_64")]
 fn is_slow_pext_amd() -> bool {
-    // CPUID leaves are available on every x86_64 CPU.
-    let leaf1 = std::arch::x86_64::__cpuid(1);
-    let is_amd = leaf1.ebx == 0x6874_7541
-        && leaf1.edx == 0x6972_6D65
-        && leaf1.ecx == 0x444D_4163;
+    // The 12-byte vendor string lives in CPUID leaf 0 (ebx, edx, ecx = "Auth",
+    // "enti", "cAMD"); leaf 1 carries the family and model instead. Reading
+    // the vendor from leaf 1 made this check fail on every AMD CPU, so Zen 1/2
+    // kept the microcoded PEXT path instead of the magic tables.
+    let leaf0 = std::arch::x86_64::__cpuid(0);
+    let is_amd = leaf0.ebx == 0x6874_7541
+        && leaf0.edx == 0x6974_6E65
+        && leaf0.ecx == 0x444D_4163;
     if !is_amd {
         return false;
     }
+
+    let leaf1 = std::arch::x86_64::__cpuid(1);
 
     let base_family = (leaf1.eax >> 8) & 0xF;
     let ext_family = (leaf1.eax >> 20) & 0xFF;

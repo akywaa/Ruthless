@@ -1,6 +1,6 @@
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks, between};
 use crate::bitboard::Bitboard;
-use crate::nnue::{Accumulator, FeatureDelta, HIDDEN_SIZE};
+use crate::nnue::{Accumulator, FeatureDelta, ThreatAccumulator, ThreatList, HIDDEN_SIZE};
 use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB, ACC_STACK_SIZE};
 use crate::zobrist::{castling_key, ep_key, fiftymove_key, piece_key, side_key};
 
@@ -49,6 +49,13 @@ pub struct Board {
     // twofold draws, repetitions before it need a third occurrence.
     pub root_ply: usize,
     pub accumulator: Accumulator,
+    /// Threat inputs are accumulated separately from the piece-square rows:
+    /// they depend on which pieces attack which, not on where the pieces are
+    /// relative to the king, so a move only touches the rows of threats it
+    /// creates or destroys. `threat_lists` holds the exact feature set that was
+    /// summed into `threat`, which is what makes that diff exact.
+    pub threat: ThreatAccumulator,
+    pub threat_lists: [ThreatList; 2],
     /// Parent half-accumulator saved only for moves that refresh one side from
     /// scratch (a king crossing a bucket or the centre mirror). Indexed by ply.
     pub acc_backup: Box<[[i16; HIDDEN_SIZE]; ACC_STACK_SIZE]>,
@@ -79,6 +86,8 @@ impl Board {
             history: Vec::with_capacity(256),
             root_ply: 0,
             accumulator: Accumulator::new(),
+            threat: ThreatAccumulator::new(),
+            threat_lists: [ThreatList::new(); 2],
             acc_backup: vec![[0i16; HIDDEN_SIZE]; ACC_STACK_SIZE]
                 .into_boxed_slice()
                 .try_into()
@@ -103,6 +112,29 @@ impl Board {
                 self.accumulator
                     .add_feature(piece, Square::new(sq as u8), w_ksq, b_ksq);
             }
+        }
+        self.refresh_threats();
+    }
+
+    /// Rebuilds the threat inputs from scratch. Only the reference path and
+    /// position setup use this; moves update the same state incrementally.
+    pub fn refresh_threats(&mut self) {
+        let Some(heimdall) = crate::nnue::network().heimdall.as_deref() else {
+            // The legacy network has no threat inputs; leaving the accumulator
+            // zeroed keeps both formats on one board representation.
+            self.threat = ThreatAccumulator::new();
+            self.threat_lists = [ThreatList::new(); 2];
+            return;
+        };
+        let Some(weights) = heimdall.threat_weights.as_deref() else {
+            return;
+        };
+
+        for side in 0..2 {
+            let mut list = ThreatList::new();
+            crate::nnue::collect_threats(self, Color::from_index(side), &mut list);
+            self.threat.refresh_side(side, &list, weights);
+            self.threat_lists[side] = list;
         }
     }
 

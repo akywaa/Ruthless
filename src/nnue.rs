@@ -741,6 +741,23 @@ pub struct ThreatWeights {
     pub rows: Vec<i8>,
 }
 
+#[cfg(test)]
+impl ThreatWeights {
+    /// Synthetic weights for tests: the layout and arithmetic are what matter
+    /// here, not whether the numbers came out of a trainer.
+    pub fn random(seed: u64) -> Self {
+        let mut state = seed | 1;
+        let mut rows = vec![0i8; TOTAL_THREATS * HIDDEN_SIZE];
+        for value in rows.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *value = (state >> 32) as i8;
+        }
+        Self { rows }
+    }
+}
+
 #[repr(C, align(64))]
 pub struct HeimdallHead {
     /// `[bucket][output][input]`: one neuron's weights are contiguous, so the
@@ -757,7 +774,7 @@ pub struct HeimdallHead {
 /// from the piece-square accumulator so a threat-only change never touches the
 /// 768-input feature rows.
 #[repr(C, align(64))]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ThreatAccumulator {
     pub vals: [[i16; HIDDEN_SIZE]; 2],
 }
@@ -1273,6 +1290,66 @@ impl ThreatAccumulator {
         apply_threat_rows(&mut acc, weights, list.as_slice(), true);
         self.vals[side] = acc;
     }
+
+    /// Diffs two sorted feature lists and applies only the changed rows. Calling
+    /// it with the arguments swapped undoes the update exactly: the accumulator
+    /// is the sum of the rows of the list, and both directions add and subtract
+    /// exactly the rows that entered or left it.
+    pub fn apply_diff(&mut self, side: usize, weights: &ThreatWeights, old: &[u16], new: &[u16]) {
+        let mut adds = [0u16; MAX_THREATS];
+        let mut subs = [0u16; MAX_THREATS];
+        let mut add_count = 0usize;
+        let mut sub_count = 0usize;
+
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < old.len() && j < new.len() {
+            match old[i].cmp(&new[j]) {
+                std::cmp::Ordering::Less => {
+                    subs[sub_count] = old[i];
+                    sub_count += 1;
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    adds[add_count] = new[j];
+                    add_count += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        while i < old.len() {
+            subs[sub_count] = old[i];
+            sub_count += 1;
+            i += 1;
+        }
+        while j < new.len() {
+            adds[add_count] = new[j];
+            add_count += 1;
+            j += 1;
+        }
+
+        let acc = &mut self.vals[side];
+        if sub_count > 0 {
+            apply_threat_rows(acc, weights, &subs[..sub_count], false);
+        }
+        if add_count > 0 {
+            apply_threat_rows(acc, weights, &adds[..add_count], true);
+        }
+    }
+}
+
+/// Threat weights of the active network, if it is a Heimdall-format one. The
+/// legacy net has no threat inputs, so this also serves as the gate that keeps
+/// the whole threat path off it.
+#[inline(always)]
+pub fn threat_weights() -> Option<&'static ThreatWeights> {
+    network()
+        .heimdall
+        .as_deref()
+        .and_then(|net| net.threat_weights.as_deref())
 }
 
 #[cfg(target_arch = "x86_64")]

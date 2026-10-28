@@ -138,6 +138,41 @@ impl Board {
         }
     }
 
+    /// Advances the threat inputs to the current position. Only the threat rows
+    /// that appeared or disappeared are touched, which is what keeps a move from
+    /// costing a full 60144-feature rebuild. Slider discoveries, en passant and
+    /// castling need no special cases: the collector derives the active set from
+    /// the board, and the diff against the stored set is exact by construction.
+    pub fn sync_threats_with(&mut self, weights: &crate::nnue::ThreatWeights) {
+        for side in 0..2 {
+            let mut next = ThreatList::new();
+            crate::nnue::collect_threats(self, Color::from_index(side), &mut next);
+            self.threat.apply_diff(
+                side,
+                weights,
+                self.threat_lists[side].as_slice(),
+                next.as_slice(),
+            );
+            self.threat_lists[side] = next;
+        }
+    }
+
+    /// Rebuilds the parent's threat inputs from the child's feature sets, which
+    /// is the exact reverse of [`Board::sync_threats_with`].
+    pub fn restore_threats_with(
+        &mut self,
+        weights: &crate::nnue::ThreatWeights,
+        child: &[ThreatList; 2],
+    ) {
+        for side in 0..2 {
+            let mut parent = ThreatList::new();
+            crate::nnue::collect_threats(self, Color::from_index(side), &mut parent);
+            self.threat
+                .apply_diff(side, weights, child[side].as_slice(), parent.as_slice());
+            self.threat_lists[side] = parent;
+        }
+    }
+
     pub fn refresh_accumulator_side(&mut self, color: Color) {
         let piece_on = self.piece_on;
         let ksq = self.king_square(color);
@@ -1118,10 +1153,19 @@ impl Board {
         self.hash ^= side_key();
         self.refresh_tt_hash();
 
+        if let Some(weights) = crate::nnue::threat_weights() {
+            self.sync_threats_with(weights);
+        }
+
         undo
     }
 
     pub fn undo_move(&mut self, m: Move, undo: UndoState) {
+        // The board still holds the child position, so its threat feature sets
+        // are the state the accumulator was brought up to. Keep them to invert
+        // the diff once the pieces are back.
+        let child_threats = crate::nnue::threat_weights().map(|weights| (weights, self.threat_lists));
+
         self.history.pop();
         self.acc_depth -= 1;
         self.side_to_move = !self.side_to_move;
@@ -1183,6 +1227,10 @@ impl Board {
         self.hash = undo.hash;
         self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
+
+        if let Some((weights, child)) = child_threats {
+            self.restore_threats_with(weights, &child);
+        }
     }
 }
 
@@ -1385,6 +1433,76 @@ mod tests {
         println!("eval startpos (white to move) = {}", evaluate(&start));
         let noq = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1").unwrap();
         println!("eval white-no-queen (white to move) = {}", evaluate(&noq));
+    }
+
+    /// Rebuilds the threat inputs from scratch and compares them with what the
+    /// incremental path holds, both the feature sets and the accumulated rows.
+    fn assert_threat_state(
+        board: &Board,
+        weights: &crate::nnue::ThreatWeights,
+        ply: usize,
+        stage: &str,
+    ) {
+        let mut fresh = crate::nnue::ThreatAccumulator::new();
+        for side in 0..2 {
+            let mut list = ThreatList::new();
+            crate::nnue::collect_threats(board, Color::from_index(side), &mut list);
+            assert_eq!(
+                board.threat_lists[side].as_slice(),
+                list.as_slice(),
+                "{stage}: threat feature set at ply {ply}"
+            );
+            fresh.refresh_side(side, &list, weights);
+        }
+        assert_eq!(
+            fresh.vals, board.threat.vals,
+            "{stage}: threat accumulator at ply {ply}"
+        );
+    }
+
+    #[test]
+    fn threat_accumulator_roundtrip_random_walk() {
+        // Prefer the active network's threat rows; without a Heimdall network
+        // installed, synthetic weights exercise exactly the same code path.
+        let synthetic;
+        let weights: &crate::nnue::ThreatWeights = match crate::nnue::threat_weights() {
+            Some(weights) => weights,
+            None => {
+                synthetic = crate::nnue::ThreatWeights::random(0x51EE_DD00);
+                &synthetic
+            }
+        };
+
+        let mut board = Board::default();
+        board.sync_threats_with(weights);
+        assert_threat_state(&board, weights, 0, "root");
+
+        let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut ply = 0;
+        for _ in 0..1000 {
+            let moves = generate_legal_moves(&mut board);
+            if moves.count == 0 {
+                break;
+            }
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let m = moves.get((rng as usize) % moves.count);
+
+            let undo = board.make_move(m);
+            board.sync_threats_with(weights);
+            assert_threat_state(&board, weights, ply, "after make");
+
+            // This is the child state the undo has to invert, exactly like
+            // `Board::undo_move` captures it before touching the pieces.
+            let child = board.threat_lists;
+            board.undo_move(m, undo);
+            board.restore_threats_with(weights, &child);
+            assert_threat_state(&board, weights, ply, "after undo");
+            ply += 1;
+        }
+
+        assert!(ply > 500, "the walk should reach a reasonable depth ({ply} plies)");
     }
 
     #[test]

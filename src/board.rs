@@ -164,11 +164,11 @@ impl Board {
         weights: &crate::nnue::ThreatWeights,
         child: &[ThreatList; 2],
     ) {
-        for side in 0..2 {
+        for (side, child_list) in child.iter().enumerate() {
             let mut parent = ThreatList::new();
             crate::nnue::collect_threats(self, Color::from_index(side), &mut parent);
             self.threat
-                .apply_diff(side, weights, child[side].as_slice(), parent.as_slice());
+                .apply_diff(side, weights, child_list.as_slice(), parent.as_slice());
             self.threat_lists[side] = parent;
         }
     }
@@ -1480,7 +1480,7 @@ mod tests {
         let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
         let mut ply = 0;
         for _ in 0..1000 {
-            let moves = generate_legal_moves(&mut board);
+            let moves = generate_legal_moves(&board);
             if moves.count == 0 {
                 break;
             }
@@ -1503,6 +1503,37 @@ mod tests {
         }
 
         assert!(ply > 500, "the walk should reach a reasonable depth ({ply} plies)");
+    }
+
+    #[test]
+    fn threat_accumulator_handles_king_bucket_changes() {
+        let synthetic;
+        let weights: &crate::nnue::ThreatWeights = match crate::nnue::threat_weights() {
+            Some(weights) => weights,
+            None => {
+                synthetic = crate::nnue::ThreatWeights::random(0xF00D_1234);
+                &synthetic
+            }
+        };
+
+        // The king starts on the mirror line (e1) and then walks across it and
+        // through several buckets, which re-indexes every threat of that side.
+        let mut board = Board::from_fen("4k3/8/8/3n4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        board.sync_threats_with(weights);
+        assert_threat_state(&board, weights, 0, "root");
+
+        // Black shuffles its king back and forth while white crosses the mirror
+        // line and two bucket boundaries.
+        for (ply, text) in [
+            "e1d1", "e8d8", "d1c1", "d8c8", "c1b1", "c8d8", "b1b2", "d8e8", "b2a2",
+        ]
+        .iter()
+        .enumerate()
+        {
+            play(&mut board, text);
+            board.sync_threats_with(weights);
+            assert_threat_state(&board, weights, ply, text);
+        }
     }
 
     #[test]

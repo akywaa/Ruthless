@@ -115,8 +115,8 @@ fn load_legacy_network(bytes: &[u8], net: &mut Network) {
         let bucket = feature / FEATURES_PER_BUCKET;
         let rest = feature % FEATURES_PER_BUCKET;
         let src = &bytes[offset..offset + HIDDEN_SIZE * 2];
-        for new_bucket in 0..NUM_INPUT_BUCKETS {
-            if LEGACY_BUCKET_SOURCE[new_bucket] == bucket {
+        for (new_bucket, &source) in LEGACY_BUCKET_SOURCE.iter().enumerate() {
+            if source == bucket {
                 read_row(src, &mut net.feature_weights[new_bucket * FEATURES_PER_BUCKET + rest].vals);
             }
         }
@@ -139,41 +139,251 @@ fn load_legacy_network(bytes: &[u8], net: &mut Network) {
     }
 }
 
-fn init_network() -> &'static Network {
+/// Allocates the (large, effectively permanent) network storage on a 64-byte
+/// boundary, which is what the SIMD kernels load from.
+fn allocate_network() -> &'static mut Network {
     // The network is read at runtime: the embedded file holds a 10-bucket net
-    // that is expanded here, while the 16-bucket network would not fit the
-    // binary comfortably. Alignment matters for the SIMD kernels, so the block
-    // is allocated on a 64-byte boundary and never freed.
+    // that is expanded here, while a 16-bucket network with threat rows would
+    // not fit the binary comfortably. The block is never freed.
     let layout = std::alloc::Layout::from_size_align(std::mem::size_of::<Network>(), 64)
         .expect("invalid network layout");
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut Network;
     assert!(!ptr.is_null(), "out of memory allocating network");
+    unsafe { &mut *ptr }
+}
 
-    unsafe {
-        let net = &mut *ptr;
+fn init_network() -> &'static Network {
+    let net = allocate_network();
+
+    if !load_external_network(net) {
         load_legacy_network(NETWORK_BYTES, net);
+    }
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            // The AVX2 output layer multiplies clipped activations (0..=QA)
-            // by output weights in 16-bit lanes, which is only exact while
-            // |weight| * QA fits into an i16. Reject a net that would
-            // silently produce wrong evaluations instead.
-            if has_avx2() {
-                let mut max_abs = 0i32;
-                for bucket in &net.output_weights {
-                    for &w in bucket.iter() {
-                        max_abs = max_abs.max((w as i32).abs());
-                    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The AVX2 output layer multiplies clipped activations (0..=QA)
+        // by output weights in 16-bit lanes, which is only exact while
+        // |weight| * QA fits into an i16. Reject a net that would
+        // silently produce wrong evaluations instead.
+        if has_avx2() && net.heimdall.is_none() {
+            let mut max_abs = 0i32;
+            for bucket in &net.output_weights {
+                for &w in bucket.iter() {
+                    max_abs = max_abs.max((w as i32).abs());
                 }
-                assert!(
-                    max_abs * i32::from(QA) <= i32::from(i16::MAX),
-                    "network output weights exceed the 16-bit SIMD range"
-                );
+            }
+            assert!(
+                max_abs * i32::from(QA) <= i32::from(i16::MAX),
+                "network output weights exceed the 16-bit SIMD range"
+            );
+        }
+    }
+
+    net
+}
+
+/// Which network architecture the engine is running.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NetFormat {
+    /// The original embedded network: 10 buckets expanded to 16, linear output.
+    Legacy,
+    /// 16hm piece-square inputs plus threat inputs feeding the multilayer head.
+    Heimdall,
+}
+
+pub const HEIMDALL_NET_BYTES: usize = FEATURES_PER_BUCKET * NUM_INPUT_BUCKETS * HIDDEN_SIZE * 2
+    + TOTAL_THREATS * HIDDEN_SIZE
+    + HIDDEN_SIZE * 2
+    + HIDDEN_SIZE * L1_SIZE * NUM_OUTPUT_BUCKETS
+    + NUM_OUTPUT_BUCKETS * L1_SIZE * 4
+    + L2_IN * NUM_OUTPUT_BUCKETS * L2_SIZE * 4
+    + NUM_OUTPUT_BUCKETS * L2_SIZE * 4
+    + L2_SIZE * NUM_OUTPUT_BUCKETS * 4
+    + NUM_OUTPUT_BUCKETS * 4;
+
+/// Recognises a network file from its exact size. The two layouts cannot be
+/// confused: they differ by 35 MB.
+pub fn detect_format(len: usize) -> Option<NetFormat> {
+    if len == HEIMDALL_NET_BYTES {
+        Some(NetFormat::Heimdall)
+    } else if (LEGACY_NET_BYTES..HEIMDALL_NET_BYTES).contains(&len) {
+        Some(NetFormat::Legacy)
+    } else {
+        None
+    }
+}
+
+/// Cached answer to "is the active network a Heimdall one", read once per
+/// evaluation by the scaling in `eval`.
+#[inline(always)]
+pub fn uses_heimdall() -> bool {
+    network().heimdall.is_some()
+}
+
+struct NetBytes<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> NetBytes<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self.pos + len;
+        let slice = self
+            .data
+            .get(self.pos..end)
+            .ok_or_else(|| format!("network truncated at byte {}", self.pos))?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn i32(&mut self) -> Result<i32, String> {
+        let raw = self.take(4)?;
+        Ok(i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    fn i16_row(&mut self, dst: &mut [i16; HIDDEN_SIZE]) -> Result<(), String> {
+        let raw = self.take(HIDDEN_SIZE * 2)?;
+        read_row(raw, dst);
+        Ok(())
+    }
+}
+
+/// Loads a Heimdall-format network: the same disk layout Bullet writes, in the
+/// order `piece-square weights, threat rows, feature bias, L1, L2, L3`.
+///
+/// The layer-1 weights are stored input-major on disk (`input, bucket, output`)
+/// and transposed here into contiguous per-neuron rows, which is what every
+/// kernel in this file expects.
+fn load_heimdall_bytes(bytes: &[u8], net: &mut Network) -> Result<(), String> {
+    if bytes.len() != HEIMDALL_NET_BYTES {
+        return Err(format!(
+            "expected {HEIMDALL_NET_BYTES} bytes for the 16hm multilayer layout, got {}",
+            bytes.len()
+        ));
+    }
+
+    let mut reader = NetBytes::new(bytes);
+
+    for feature in 0..FEATURES_PER_BUCKET * NUM_INPUT_BUCKETS {
+        reader.i16_row(&mut net.feature_weights[feature].vals)?;
+    }
+
+    let raw = reader.take(TOTAL_THREATS * HIDDEN_SIZE)?;
+    // Signed bytes and raw bytes have the same layout and every bit pattern is
+    // a valid i8, so this reinterpretation is sound.
+    let signed = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+    let mut rows = vec![0i8; TOTAL_THREATS * HIDDEN_SIZE];
+    rows.copy_from_slice(signed);
+
+    reader.i16_row(&mut net.feature_bias.vals)?;
+
+    let mut head: Box<HeimdallHead> = Box::new(unsafe { std::mem::zeroed() });
+
+    for input in 0..HIDDEN_SIZE {
+        for bucket in 0..NUM_OUTPUT_BUCKETS {
+            let chunk = reader.take(L1_SIZE)?;
+            for (output, &byte) in chunk.iter().enumerate() {
+                head.l1_weights[bucket][output][input] = byte as i8;
             }
         }
+    }
+    for bucket in 0..NUM_OUTPUT_BUCKETS {
+        for output in 0..L1_SIZE {
+            head.l1_bias[bucket][output] = reader.i32()?;
+        }
+    }
+    for input in 0..L2_IN {
+        for bucket in 0..NUM_OUTPUT_BUCKETS {
+            for output in 0..L2_SIZE {
+                head.l2_weights[bucket][input][output] = reader.i32()?;
+            }
+        }
+    }
+    for bucket in 0..NUM_OUTPUT_BUCKETS {
+        for output in 0..L2_SIZE {
+            head.l2_bias[bucket][output] = reader.i32()?;
+        }
+    }
+    for input in 0..L2_SIZE {
+        for bucket in 0..NUM_OUTPUT_BUCKETS {
+            head.l3_weights[bucket][input][0] = reader.i32()?;
+        }
+    }
+    for bucket in 0..NUM_OUTPUT_BUCKETS {
+        head.l3_bias[bucket][0] = reader.i32()?;
+    }
 
-        &*ptr
+    debug_assert_eq!(reader.pos, HEIMDALL_NET_BYTES, "unread bytes in the network file");
+
+    net.heimdall = Some(Box::new(HeimdallNet {
+        head: *head,
+        threat_weights: Some(Box::new(ThreatWeights { rows })),
+    }));
+    Ok(())
+}
+
+fn external_net_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("RUTHLESS_NET") {
+        return Some(path.into());
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    for name in ["heimdall.bin", "resources/heimdall.bin"] {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Tries a network file next to the binary (or at `RUTHLESS_NET`). Anything that
+/// does not match a known layout is reported and ignored, so the engine keeps
+/// running on the embedded network.
+fn load_external_network(net: &mut Network) -> bool {
+    let Some(path) = external_net_path() else {
+        return false;
+    };
+
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("info string cannot read network {}: {error}", path.display());
+            return false;
+        }
+    };
+
+    match detect_format(bytes.len()) {
+        Some(NetFormat::Heimdall) => match load_heimdall_bytes(&bytes, net) {
+            Ok(()) => {
+                eprintln!(
+                    "info string loaded heimdall network {} ({} MiB)",
+                    path.display(),
+                    bytes.len() / (1024 * 1024)
+                );
+                true
+            }
+            Err(error) => {
+                eprintln!("info string rejected network {}: {error}", path.display());
+                false
+            }
+        },
+        Some(NetFormat::Legacy) => {
+            load_legacy_network(&bytes, net);
+            true
+        }
+        None => {
+            eprintln!(
+                "info string network {} has an unsupported size ({} bytes)",
+                path.display(),
+                bytes.len()
+            );
+            false
+        }
     }
 }
 
@@ -801,7 +1011,7 @@ fn pairwise_side_scalar(
         let a = i32::from(psq[i].wrapping_add(threats[i])).clamp(0, i32::from(QA));
         let b = i32::from(psq[i + PAIR_COUNT].wrapping_add(threats[i + PAIR_COUNT]))
             .min(i32::from(QA));
-        out[i] = ((a << FT_SCALE_BITS) * b >> 16).clamp(0, 255) as u8;
+        out[i] = (((a << FT_SCALE_BITS) * b) >> 16).clamp(0, 255) as u8;
     }
 }
 
@@ -919,7 +1129,6 @@ fn l1_forward(
             return;
         }
         l1_forward_scalar(weights, bias, input, out);
-        return;
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -1071,7 +1280,7 @@ fn init_threat_tables() -> ThreatTables {
 
     let mut global = 0u32;
     for color in 0..2 {
-        for kind in 0..6 {
+        for (kind, &target_count) in PIECE_TARGET_COUNT.iter().enumerate() {
             let piece = Piece::new(Color::from_index(color), PieceType::from_index(kind));
             let mut offset = 0u16;
             for sq in 0..64 {
@@ -1086,7 +1295,7 @@ fn init_threat_tables() -> ThreatTables {
             }
             tables.span[color][kind] = offset;
             tables.global[color][kind] = global as u16;
-            global += 2 * u32::from(PIECE_TARGET_COUNT[kind]) * u32::from(offset);
+            global += 2 * u32::from(target_count) * u32::from(offset);
         }
     }
     assert_eq!(
@@ -1109,10 +1318,9 @@ fn init_threat_tables() -> ThreatTables {
     }
 
     for acolor in 0..2 {
-        for akind in 0..6 {
+        for (akind, targets) in PIECE_TARGET_MAP.iter().enumerate() {
             for vcolor in 0..2 {
-                for vkind in 0..6 {
-                    let map = PIECE_TARGET_MAP[akind][vkind];
+                for (vkind, &map) in targets.iter().enumerate() {
                     // Same-type relations are stored once: opposite colours
                     // encode the pair in both directions, same-colour pairs
                     // (defences) in one. Pawn defences are the exception and
@@ -1207,17 +1415,17 @@ pub fn collect_threats(board: &Board, view: Color, out: &mut ThreatList) {
     let mask = perspective_mask(ksq, view);
 
     let mut by_type = [Bitboard::EMPTY; 6];
-    for kind in 0..6 {
+    for (kind, slot) in by_type.iter_mut().enumerate() {
         for color in 0..2 {
-            by_type[kind] |= board.pieces[Piece::new(Color::from_index(color), PieceType::from_index(kind))];
+            *slot |= board.pieces[Piece::new(Color::from_index(color), PieceType::from_index(kind))];
         }
     }
 
     // Union of the piece types each attacker type is allowed to threaten.
     let mut victims = [Bitboard::EMPTY; 6];
-    for akind in 0..6 {
-        for vkind in 0..6 {
-            if PIECE_TARGET_MAP[akind][vkind] >= 0 {
+    for (akind, targets) in PIECE_TARGET_MAP.iter().enumerate() {
+        for (vkind, &map) in targets.iter().enumerate() {
+            if map >= 0 {
                 victims[akind] |= by_type[vkind];
             }
         }
@@ -1413,10 +1621,9 @@ mod tests {
     fn expanded_buckets_share_the_legacy_rows() {
         let net = network();
         for feature in 0..FEATURES_PER_BUCKET {
-            for bucket in 0..NUM_INPUT_BUCKETS {
-                let source = LEGACY_BUCKET_SOURCE[bucket];
-                for other in 0..NUM_INPUT_BUCKETS {
-                    if LEGACY_BUCKET_SOURCE[other] == source {
+            for (bucket, &source) in LEGACY_BUCKET_SOURCE.iter().enumerate() {
+                for (other, &other_source) in LEGACY_BUCKET_SOURCE.iter().enumerate() {
+                    if other_source == source {
                         assert_eq!(
                             net.feature_weights[bucket * FEATURES_PER_BUCKET + feature].vals,
                             net.feature_weights[other * FEATURES_PER_BUCKET + feature].vals
@@ -1601,7 +1808,7 @@ mod tests {
 
     #[test]
     fn heimdall_head_simd_matches_scalar() {
-        let net = random_head(0x0DDB_A11);
+        let net = random_head(0x00DD_BA11);
         let mut rng = Rng(0xFEED);
         for _ in 0..32 {
             let (psq, threat) = random_accumulators(rng.next());
@@ -1623,6 +1830,88 @@ mod tests {
         assert_eq!(HIDDEN_SIZE % 32, 0);
         assert_eq!(L1_SHIFT, 8);
         assert_eq!(QUANT_FOURTH, 16_777_216);
+    }
+
+    #[test]
+    fn network_storage_is_aligned_for_simd() {
+        let net = network() as *const Network as usize;
+        assert_eq!(net % 64, 0, "the network must be 64-byte aligned");
+    }
+
+    #[test]
+    fn detect_format_recognises_both_layouts() {
+        assert_eq!(detect_format(LEGACY_NET_BYTES), Some(NetFormat::Legacy));
+        assert_eq!(detect_format(NETWORK_BYTES.len()), Some(NetFormat::Legacy));
+        assert_eq!(detect_format(HEIMDALL_NET_BYTES), Some(NetFormat::Heimdall));
+        assert_eq!(detect_format(HEIMDALL_NET_BYTES - 1), Some(NetFormat::Legacy));
+        assert_eq!(detect_format(0), None);
+        assert_eq!(detect_format(HEIMDALL_NET_BYTES + 1), None);
+    }
+
+    #[test]
+    fn heimdall_loader_reads_the_disk_layout() {
+        let mut bytes = vec![0u8; HEIMDALL_NET_BYTES];
+        let ft_bytes = FEATURES_PER_BUCKET * NUM_INPUT_BUCKETS * HIDDEN_SIZE * 2;
+        let threat_bytes = TOTAL_THREATS * HIDDEN_SIZE;
+        let bias_bytes = HIDDEN_SIZE * 2;
+        let l1_bytes = HIDDEN_SIZE * L1_SIZE * NUM_OUTPUT_BUCKETS;
+        let l1_bias_bytes = NUM_OUTPUT_BUCKETS * L1_SIZE * 4;
+        let l2_bytes = L2_IN * NUM_OUTPUT_BUCKETS * L2_SIZE * 4;
+        let l2_bias_bytes = NUM_OUTPUT_BUCKETS * L2_SIZE * 4;
+        let l3_bytes = L2_SIZE * NUM_OUTPUT_BUCKETS * 4;
+
+        let put_i16 = |bytes: &mut [u8], offset: usize, value: i16| {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        let put_i32 = |bytes: &mut [u8], offset: usize, value: i32| {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+
+        // Last piece-square feature, last lane.
+        let last_feature = FEATURES_PER_BUCKET * NUM_INPUT_BUCKETS - 1;
+        put_i16(&mut bytes, last_feature * HIDDEN_SIZE * 2 + 511 * 2, -1234);
+        // Last threat row, last lane: a signed byte, so 0x80 is -128.
+        bytes[ft_bytes + (TOTAL_THREATS - 1) * HIDDEN_SIZE + 511] = 0x80;
+        put_i16(&mut bytes, ft_bytes + threat_bytes + 511 * 2, 777);
+        // Layer 1 is stored input-major: (input, bucket, output).
+        let l1_base = ft_bytes + threat_bytes + bias_bytes;
+        bytes[l1_base + ((511 * NUM_OUTPUT_BUCKETS + 7) * L1_SIZE + 31)] = 0xF9;
+        let l1_bias_base = l1_base + l1_bytes;
+        put_i32(&mut bytes, l1_bias_base + (7 * L1_SIZE + 31) * 4, 123_456);
+        let l2_base = l1_bias_base + l1_bias_bytes;
+        put_i32(&mut bytes, l2_base + ((63 * NUM_OUTPUT_BUCKETS + 7) * L2_SIZE + 15) * 4, -654_321);
+        let l2_bias_base = l2_base + l2_bytes;
+        put_i32(&mut bytes, l2_bias_base + (7 * L2_SIZE + 15) * 4, 4242);
+        let l3_base = l2_bias_base + l2_bias_bytes;
+        put_i32(&mut bytes, l3_base + (15 * NUM_OUTPUT_BUCKETS + 7) * 4, 99);
+        let l3_bias_base = l3_base + l3_bytes;
+        put_i32(&mut bytes, l3_bias_base + 7 * 4, -99);
+
+        let net = allocate_network();
+        load_heimdall_bytes(&bytes, net).expect("the synthetic network must load");
+
+        assert_eq!((net as *mut Network as usize) % 64, 0);
+        assert_eq!(net.feature_weights[last_feature].vals[511], -1234);
+        assert_eq!(net.feature_bias.vals[511], 777);
+
+        let heimdall = net.heimdall.as_ref().expect("head must be present");
+        assert_eq!(heimdall.head.l1_weights[7][31][511], -7);
+        assert_eq!(heimdall.head.l1_bias[7][31], 123_456);
+        assert_eq!(heimdall.head.l2_weights[7][63][15], -654_321);
+        assert_eq!(heimdall.head.l2_bias[7][15], 4242);
+        assert_eq!(heimdall.head.l3_weights[7][15][0], 99);
+        assert_eq!(heimdall.head.l3_bias[7][0], -99);
+
+        let rows = &heimdall.threat_weights.as_ref().unwrap().rows;
+        assert_eq!(rows[(TOTAL_THREATS - 1) * HIDDEN_SIZE + 511], -128);
+        assert_eq!(rows.len(), TOTAL_THREATS * HIDDEN_SIZE);
+    }
+
+    #[test]
+    fn heimdall_loader_rejects_other_sizes() {
+        let net = allocate_network();
+        let short = vec![0u8; HEIMDALL_NET_BYTES - 8];
+        assert!(load_heimdall_bytes(&short, net).is_err());
     }
 
     const THREAT_TEST_FENS: [&str; 7] = [
@@ -1654,9 +1943,9 @@ mod tests {
         let tables = threat_tables();
         let mut total = 0usize;
         for color in 0..2 {
-            for kind in 0..6 {
+            for (kind, &target_count) in PIECE_TARGET_COUNT.iter().enumerate() {
                 let span = tables.span[color][kind] as usize;
-                total += 2 * PIECE_TARGET_COUNT[kind] as usize * span;
+                total += 2 * target_count as usize * span;
                 assert_eq!(tables.offsets[color][kind][0], 0);
                 assert!(
                     tables.offsets[color][kind].windows(2).all(|w| w[0] <= w[1]),
@@ -1726,7 +2015,7 @@ mod tests {
                 }
             }
 
-            let moves = generate_legal_moves(&mut board);
+            let moves = generate_legal_moves(&board);
             if moves.count == 0 {
                 break;
             }

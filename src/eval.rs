@@ -14,5 +14,13 @@ pub fn evaluate(board: &Board) -> i32 {
     let eval = nnue::evaluate(board);
     let material = board.non_pawn_material();
     let scale = (700 + material / 20).min(1024);
-    eval * scale * NORM_NUM / (1024 * NORM_DEN)
+
+    if nnue::uses_heimdall() {
+        // A Heimdall network is trained against its own 282 scale and already
+        // outputs centipawns, so squeezing it through the legacy normalisation
+        // would make it play at 45% of the evaluation it was trained for.
+        eval * scale / 1024
+    } else {
+        eval * scale * NORM_NUM / (1024 * NORM_DEN)
+    }
 }

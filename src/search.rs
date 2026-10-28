@@ -30,8 +30,8 @@ pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
 pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(200);
 pub static CORR_WEIGHT: AtomicI32 = AtomicI32::new(153);
 pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(13);
-pub static LMR_BASE: AtomicI32 = AtomicI32::new(0);
-pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(240);
+pub static LMR_BASE: AtomicI32 = AtomicI32::new(30);
+pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(225);
 
 /// Continuation history indexed by
 /// `[layer][previous piece][previous to][current piece][current to]`.

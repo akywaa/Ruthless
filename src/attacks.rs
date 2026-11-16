@@ -151,22 +151,22 @@ pub fn king_attacks(sq: Square) -> Bitboard {
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let tables = slider_tables();
     let m = &tables.bishop_magics[sq as usize];
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     if tables.use_pext {
-        tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)]
-    } else {
-        tables.slider_magic[m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)]
+        return tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)];
     }
+    tables.slider_magic[m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)]
 }
 
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let tables = slider_tables();
     let m = &tables.rook_magics[sq as usize];
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     if tables.use_pext {
-        tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)]
-    } else {
-        tables.slider_magic[m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)]
+        return tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)];
     }
+    tables.slider_magic[m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)]
 }
 
 #[inline(always)]

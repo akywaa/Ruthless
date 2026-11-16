@@ -4,17 +4,17 @@ use crate::board::Board;
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType, Square};
 // use pext on bmi2 cpus except amd zen 1/2 where it's slow
 pub fn detect_slider_style() -> bool {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
-        std::arch::is_x86_feature_detected!("bmi2") && !is_slow_pext_amd()
+        !is_slow_pext_amd()
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     {
         false
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 fn is_slow_pext_amd() -> bool {
     // check cpu vendor in leaf 0 and family in leaf 1
     let leaf0 = std::arch::x86_64::__cpuid(0);

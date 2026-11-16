@@ -30,10 +30,12 @@ pub struct MovePicker {
     moves: MoveList,
     // filled lazily when scoring
     scores: [MaybeUninit<i32>; 256],
+    raw_hist: [MaybeUninit<i32>; 256],
     cur_idx: usize,
     // bad captures buffer
-    bad_noisy: [MaybeUninit<Move>; 64],
+    bad_noisy: [MaybeUninit<(Move, i32)>; 64],
     bad_noisy_count: usize,
+    pawn_threats: Option<Bitboard>,
     qsearch: bool,
     in_check: bool,
     checkers: Bitboard,
@@ -45,6 +47,8 @@ pub struct MovePicker {
     pub last_see_ge_zero: bool,
     // true if last move came from good noisy
     pub last_good_noisy: bool,
+    pub last_hist: i32,
+    pub last_has_hist: bool,
     delta_threshold: i32,
 }
 
@@ -58,9 +62,11 @@ impl MovePicker {
             counter_move,
             moves: MoveList::new(),
             scores: [MaybeUninit::uninit(); 256],
+            raw_hist: [MaybeUninit::uninit(); 256],
             cur_idx: 0,
             bad_noisy: [MaybeUninit::uninit(); 64],
             bad_noisy_count: 0,
+            pawn_threats: None,
             qsearch: false,
             in_check,
             checkers: Bitboard::EMPTY,
@@ -69,6 +75,8 @@ impl MovePicker {
             check_squares: None,
             last_see_ge_zero: true,
             last_good_noisy: false,
+            last_hist: 0,
+            last_has_hist: false,
             delta_threshold: i32::MIN,
         }
     }
@@ -83,8 +91,13 @@ impl MovePicker {
         board.gives_check_with(m, squares)
     }
 
-    pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
-        Self {
+    #[inline(always)]
+pub fn pawn_threats(&mut self, board: &Board) -> Bitboard {
+    *self.pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats())
+}
+
+pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
+    Self {
             stage: if tt_move != Move::NULL { Stage::TTMove } else { Stage::GenerateNoisy },
             tt_move,
             killers: [Move::NULL; 2],
@@ -92,9 +105,11 @@ impl MovePicker {
             counter_move: Move::NULL,
             moves: MoveList::new(),
             scores: [MaybeUninit::uninit(); 256],
+            raw_hist: [MaybeUninit::uninit(); 256],
             cur_idx: 0,
             bad_noisy: [MaybeUninit::uninit(); 64],
             bad_noisy_count: 0,
+            pawn_threats: None,
             qsearch: true,
             in_check,
             checkers: Bitboard::EMPTY,
@@ -103,6 +118,8 @@ impl MovePicker {
             check_squares: None,
             last_see_ge_zero: true,
             last_good_noisy: false,
+            last_hist: 0,
+            last_has_hist: false,
             delta_threshold: i32::MIN,
         }
     }
@@ -184,6 +201,7 @@ impl MovePicker {
         played_moves: &[Move; MAX_PLY],
     ) -> Option<Move> {
         self.last_good_noisy = false;
+        self.last_has_hist = false;
         loop {
             match self.stage {
                 Stage::TTMove => {
@@ -206,7 +224,7 @@ impl MovePicker {
                 }
                 Stage::GoodNoisy => {
                     while self.cur_idx < self.moves.count {
-                        let m = self.pick_best();
+                        let (m, hist) = self.pick_best();
                         if m == self.tt_move {
                             continue;
                         }
@@ -231,10 +249,12 @@ impl MovePicker {
                             if self.is_legal(board, m) {
                                 self.last_see_ge_zero = true;
                                 self.last_good_noisy = true;
+                                self.last_hist = hist;
+                                self.last_has_hist = true;
                                 return Some(m);
                             }
                         } else if !self.qsearch && self.bad_noisy_count < self.bad_noisy.len() {
-                            self.bad_noisy[self.bad_noisy_count].write(m);
+                            self.bad_noisy[self.bad_noisy_count].write((m, hist));
                             self.bad_noisy_count += 1;
                         }
                     }
@@ -284,12 +304,14 @@ impl MovePicker {
                 }
                 Stage::Quiets => {
                     while self.cur_idx < self.moves.count {
-                        let m = self.pick_best();
+                        let (m, hist) = self.pick_best();
                         if m == self.tt_move || m == self.killers[0] || m == self.killers[1] || m == self.counter_move {
                             continue;
                         }
                         if self.is_legal(board, m) {
                             self.last_see_ge_zero = true;
+                            self.last_hist = hist;
+                            self.last_has_hist = true;
                             return Some(m);
                         }
                     }
@@ -298,10 +320,12 @@ impl MovePicker {
                 }
                 Stage::BadNoisy => {
                     while self.cur_idx < self.bad_noisy_count {
-                        let m = unsafe { self.bad_noisy[self.cur_idx].assume_init() };
+                        let (m, hist) = unsafe { self.bad_noisy[self.cur_idx].assume_init() };
                         self.cur_idx += 1;
                         if m != self.tt_move && self.is_legal(board, m) {
                             self.last_see_ge_zero = false;
+                            self.last_hist = hist;
+                            self.last_has_hist = true;
                             return Some(m);
                         }
                     }
@@ -312,7 +336,7 @@ impl MovePicker {
         }
     }
 
-    fn pick_best(&mut self) -> Move {
+    fn pick_best(&mut self) -> (Move, i32) {
         let mut best_score = unsafe { self.scores[self.cur_idx].assume_init() };
         let mut best_idx = self.cur_idx;
 
@@ -326,17 +350,19 @@ impl MovePicker {
 
         self.scores.swap(self.cur_idx, best_idx);
         self.moves.swap(self.cur_idx, best_idx);
+        self.raw_hist.swap(self.cur_idx, best_idx);
 
         let m = self.moves.get(self.cur_idx);
+        let hist = unsafe { self.raw_hist[self.cur_idx].assume_init() };
         self.cur_idx += 1;
-        m
+        (m, hist)
     }
 
     fn score_noisy(&mut self, board: &Board, noisy_history: &[[[[i32; 2]; 6]; 64]; 12]) {
         let pawn_threats = if self.moves.count == 0 {
             Bitboard::EMPTY
         } else {
-            board.opponent_pawn_threats()
+            self.pawn_threats(board)
         };
 
         for i in 0..self.moves.count {
@@ -368,8 +394,10 @@ impl MovePicker {
                 }
 
                 self.scores[i].write(score);
+                self.raw_hist[i].write(hist);
             } else {
                 self.scores[i].write(0);
+                self.raw_hist[i].write(0);
             }
         }
     }
@@ -385,7 +413,11 @@ impl MovePicker {
         played_moves: &[Move; MAX_PLY],
     ) {
         let us = board.side_to_move;
-        let pawn_threats = board.opponent_pawn_threats();
+        let pawn_threats = if self.moves.count == 0 {
+            Bitboard::EMPTY
+        } else {
+            self.pawn_threats(board)
+        };
         let p_idx = (board.pawn_hash as usize) & 511;
         let offsets = [1usize, 2, 4, 6];
         let ply_idx = ply as usize;
@@ -399,7 +431,7 @@ impl MovePicker {
             let from_threat = pawn_threats.contains(from) as usize;
             let to_threat = pawn_threats.contains(to) as usize;
 
-            let mut score = history[us as usize][from_threat][to_threat][from as usize][to as usize] + pawn_history[p_idx][piece as usize][to as usize];
+            let mut hist = history[us as usize][from_threat][to_threat][from as usize][to as usize] + pawn_history[p_idx][piece as usize][to as usize];
 
             for (layer, &offset) in offsets.iter().enumerate() {
                 if ply_idx >= offset {
@@ -407,10 +439,12 @@ impl MovePicker {
                     let prev_piece = played_pieces[prev_idx];
                     let prev_move = played_moves[prev_idx];
                     if prev_piece != Piece::None && prev_move != Move::NULL && (piece as usize) < 12 {
-                        score += conthist[layer][prev_piece as usize][prev_move.to() as usize][piece as usize][to as usize] as i32;
+                        hist += conthist[layer][prev_piece as usize][prev_move.to() as usize][piece as usize][to as usize] as i32;
                     }
                 }
             }
+
+            let mut score = hist;
 
             let is_threatened_to = to_threat == 1;
 
@@ -427,6 +461,7 @@ impl MovePicker {
             }
 
             self.scores[i].write(score);
+            self.raw_hist[i].write(hist);
         }
     }
 

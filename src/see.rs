@@ -23,9 +23,6 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
         return 0 >= threshold;
     }
 
-    let mut gain = [0i32; 32];
-    let mut d = 0;
-
     let target_pt = if move_type == MoveType::EnPassant {
         PieceType::Pawn
     } else if board.piece_on[to] == Piece::None {
@@ -34,24 +31,24 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
         board.piece_on[to].piece_type()
     };
 
-    gain[0] = if target_pt != PieceType::None { PIECE_VALUES[target_pt as usize] } else { 0 };
-
+    let mut swap = if target_pt != PieceType::None { PIECE_VALUES[target_pt as usize] } else { 0 };
     if move_type == MoveType::Promotion {
-        gain[0] += PIECE_VALUES[m.promo_type() as usize] - PIECE_VALUES[PieceType::Pawn as usize];
+        swap += PIECE_VALUES[m.promo_type() as usize] - PIECE_VALUES[PieceType::Pawn as usize];
     }
 
-    let mut pt = if move_type == MoveType::Promotion {
+    swap -= threshold;
+    if swap < 0 {
+        return false;
+    }
+
+    let pt = if move_type == MoveType::Promotion {
         m.promo_type()
     } else {
         board.piece_on[from].piece_type()
     };
 
-    // early exit if victim < threshold or winning even if attacker is lost
-    let swap = gain[0] - threshold;
-    if swap < 0 {
-        return false;
-    }
-    if PIECE_VALUES[pt as usize] <= swap {
+    swap = PIECE_VALUES[pt as usize] - swap;
+    if swap <= 0 {
         return true;
     }
 
@@ -67,6 +64,7 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
 
     let mut attackers = all_attackers(board, to, occ);
     let mut side = !board.side_to_move;
+    let mut res = 1;
 
     loop {
         let (next_pt, next_sq) = least_valuable_attacker(board, attackers & occ, side);
@@ -74,33 +72,28 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
             break;
         }
 
-        d += 1;
-        gain[d] = PIECE_VALUES[pt as usize];
-        pt = next_pt;
         occ.clear(next_sq);
-
-        if matches!(pt, PieceType::Pawn | PieceType::Bishop | PieceType::Queen) {
+        if matches!(next_pt, PieceType::Pawn | PieceType::Bishop | PieceType::Queen) {
             attackers |= bishop_attacks(to, occ) & bishops;
         }
-        if matches!(pt, PieceType::Rook | PieceType::Queen) {
+        if matches!(next_pt, PieceType::Rook | PieceType::Queen) {
             attackers |= rook_attacks(to, occ) & rooks;
         }
 
-        let opp_attackers = attackers & occ & board.occupied_co[!side];
-        if pt == PieceType::King && !opp_attackers.is_empty() {
-            d -= 1;
+        if next_pt == PieceType::King && !(attackers & occ & board.occupied_co[!side]).is_empty() {
+            break;
+        }
+
+        res ^= 1;
+        swap = PIECE_VALUES[next_pt as usize] - swap;
+        if swap < res {
             break;
         }
 
         side = !side;
     }
 
-    while d > 0 {
-        gain[d - 1] = gain[d - 1].saturating_sub(gain[d].max(0));
-        d -= 1;
-    }
-
-    gain[0] >= threshold
+    res != 0
 }
 
 fn all_attackers(board: &Board, sq: Square, occ: Bitboard) -> Bitboard {

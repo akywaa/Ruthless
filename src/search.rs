@@ -28,18 +28,6 @@ pub const CORR_BUCKETS: usize = 8;
 
 // spsa tuned params
 pub static RFP_BASE: AtomicI32 = AtomicI32::new(80);
-
-// instrumentation counters for evaluate calls
-pub static EVAL_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static EVAL_NEGAMAX: AtomicU64 = AtomicU64::new(0);
-pub static EVAL_QSEARCH: AtomicU64 = AtomicU64::new(0);
-pub static RFP_CUTOFFS: AtomicU64 = AtomicU64::new(0);
-pub static STANDPAT_CUTOFFS: AtomicU64 = AtomicU64::new(0);
-pub static EVAL_RFP_CUTOFF_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static EVAL_STANDPAT_CUTOFF_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static QSEARCH_NODES: AtomicU64 = AtomicU64::new(0);
-pub static QSEARCH_TT_HITS: AtomicU64 = AtomicU64::new(0);
-pub static QSEARCH_TT_RAW_HITS: AtomicU64 = AtomicU64::new(0);
 pub static RFP_IMPROVING: AtomicI32 = AtomicI32::new(20);
 pub static FUTILITY_BASE: AtomicI32 = AtomicI32::new(70);
 pub static FUTILITY_MARGIN: AtomicI32 = AtomicI32::new(75);
@@ -274,8 +262,6 @@ impl Searcher {
             }
         }
         let e = evaluate(board);
-        crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
-        crate::search::EVAL_QSEARCH.fetch_add(1, Ordering::Relaxed);
         e
     }
 
@@ -785,8 +771,6 @@ impl Searcher {
         }
 
         if (ply as usize) >= MAX_PLY {
-            crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
-            crate::search::EVAL_NEGAMAX.fetch_add(1, Ordering::Relaxed);
             return evaluate(board);
         }
 
@@ -854,17 +838,13 @@ impl Searcher {
         }
 
         // skip eval when in check
-        let mut evaluated_this_node = false;
         let (static_eval, raw_eval_to_store) = if in_check {
             (0, crate::tt::RAW_EVAL_NONE)
         } else {
             let raw_eval = if has_tt && tt_raw_eval != crate::tt::RAW_EVAL_NONE {
                 tt_raw_eval as i32
             } else {
-                evaluated_this_node = true;
                 let e = evaluate(board);
-                crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
-                crate::search::EVAL_NEGAMAX.fetch_add(1, Ordering::Relaxed);
                 self.tt.store_eval(board.tt_hash, e.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16);
                 e
             };
@@ -992,10 +972,6 @@ impl Searcher {
 
             // tried raising rfp depth to 8, reverted (-elo)
             if depth <= 6 && eval - rfp_margin >= beta {
-                crate::search::RFP_CUTOFFS.fetch_add(1, Ordering::Relaxed);
-                if evaluated_this_node {
-                    crate::search::EVAL_RFP_CUTOFF_CALLS.fetch_add(1, Ordering::Relaxed);
-                }
                 return (eval + beta) / 2;
             }
 
@@ -1061,7 +1037,8 @@ impl Searcher {
                     &self.played_pieces,
                     &self.played_moves,
                 ) {
-                    if !see(board, m, probcut_beta - static_eval) {
+                    let threshold = probcut_beta - static_eval;
+                    if (threshold > 0 || m == tt_move) && !see(board, m, threshold) {
                         continue;
                     }
 
@@ -1174,7 +1151,6 @@ impl Searcher {
         };
 
         let mut picker = MovePicker::new(tt_move, killers, counter_move, in_check);
-        let mut pawn_threats: Option<Bitboard> = None;
         let mut discovered_candidates: Option<Bitboard> = None;
         let their_king = board.king_square(!board.side_to_move);
 
@@ -1196,11 +1172,13 @@ impl Searcher {
             let is_quiet = !is_capture && m.move_type() != MoveType::Promotion;
             let hist = if moves_searched == 0 {
                 0
+            } else if picker.last_has_hist {
+                picker.last_hist
             } else if is_quiet {
-                let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                let pt = picker.pawn_threats(board);
                 self.quiet_history_score(board, ply, m, pt)
             } else {
-                let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                let pt = picker.pawn_threats(board);
                 self.noisy_history_score(board, m, pt)
             };
 
@@ -1273,7 +1251,7 @@ impl Searcher {
                 self.played_pieces[ply as usize] = board.piece_on[m.from()];
                 self.prev_is_capture[ply as usize] = is_capture;
                 if !is_capture {
-                    let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                    let pt = picker.pawn_threats(board);
                     self.played_threat_state[ply as usize] = ((pt.contains(m.from()) as u8) << 1) | (pt.contains(m.to()) as u8);
                 }
             }
@@ -1451,7 +1429,7 @@ impl Searcher {
 
                     let us = board.side_to_move as usize;
                     let p_idx = (board.pawn_hash as usize) & 511;
-                    let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                    let pt = picker.pawn_threats(board);
                     let m_from_th = pt.contains(m.from()) as usize;
                     let m_to_th = pt.contains(m.to()) as usize;
 
@@ -1478,7 +1456,7 @@ impl Searcher {
                     }
 
                     if noisy_count > 0 {
-                        let pawn_threats = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                        let pawn_threats = picker.pawn_threats(board);
                         for j in 0..noisy_count {
                             let nm = noisy_moves[j];
                             if nm == m || nm == Move::NULL {
@@ -1499,7 +1477,7 @@ impl Searcher {
                         }
                     }
                 } else {
-                    let pawn_threats = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                    let pawn_threats = picker.pawn_threats(board);
                     let to_threatened = pawn_threats.contains(m.to()) as usize;
 
                     if moving_pc < 12 && victim_pt < 6 {
@@ -1646,8 +1624,6 @@ impl Searcher {
         }
 
         if (ply as usize) >= MAX_PLY {
-            crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
-            crate::search::EVAL_QSEARCH.fetch_add(1, Ordering::Relaxed);
             return evaluate(board);
         }
 
@@ -1659,10 +1635,6 @@ impl Searcher {
         let mut tt_raw_eval = crate::tt::RAW_EVAL_NONE;
 
         if let Some(entry) = self.tt.probe(board.tt_hash) {
-            crate::search::QSEARCH_TT_HITS.fetch_add(1, Ordering::Relaxed);
-            if entry.raw_eval != crate::tt::RAW_EVAL_NONE {
-                crate::search::QSEARCH_TT_RAW_HITS.fetch_add(1, Ordering::Relaxed);
-            }
             tt_move = entry.best_move;
             tt_raw_eval = entry.raw_eval;
 
@@ -1676,7 +1648,6 @@ impl Searcher {
         }
 
         self.nodes += 1;
-        crate::search::QSEARCH_NODES.fetch_add(1, Ordering::Relaxed);
         if ply > self.seldepth {
             self.seldepth = ply;
         }
@@ -1689,14 +1660,11 @@ impl Searcher {
                 tt_raw_eval as i32
             } else {
                 let e = evaluate(board);
-                crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
-                crate::search::EVAL_QSEARCH.fetch_add(1, Ordering::Relaxed);
                 self.tt.store_eval(board.tt_hash, e.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16);
                 e
             };
             stand_pat = self.corrected_eval(board, ply, raw_eval);
             if stand_pat >= beta {
-                crate::search::STANDPAT_CUTOFFS.fetch_add(1, Ordering::Relaxed);
                 return stand_pat;
             }
             alpha = alpha.max(stand_pat);

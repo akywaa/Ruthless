@@ -96,7 +96,7 @@ impl Clone for Board {
     fn clone(&self) -> Self {
         let mut new_frames: HugeBox<[AccumulatorFrame; FRAME_STACK_SIZE]> = HugeBox::zeroed();
         let mut new_threat_frames: HugeBox<[ThreatFrame; FRAME_STACK_SIZE]> = HugeBox::zeroed();
-        for i in 0..FRAME_STACK_SIZE {
+        for i in 0..=self.acc_depth {
             new_frames[i] = self.acc_frames[i].clone();
             new_threat_frames[i] = self.threat_frames[i].clone();
         }
@@ -326,10 +326,12 @@ impl Board {
             let occ_after = self.occupied;
             let occ_before = self.occupancy_before(m, captured);
 
-            crate::nnue::append_changed_square_threats_both(self, changed, need_inc, &mut adds);
-            crate::nnue::collect_xray_threat_diffs_both(self, changed, occ_before, occ_after, need_inc, &mut subs, &mut adds);
+            let mut scan = crate::nnue::SharedThreatScan::new(self);
+            crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, &mut adds);
+            crate::nnue::collect_xray_threat_diffs_both(self, &scan, changed, occ_before, occ_after, need_inc, &mut subs, &mut adds);
             self.toggle_pieces_backward(m, captured);
-            crate::nnue::append_changed_square_threats_both(self, changed, need_inc, &mut subs);
+            scan.refresh_pieces(self);
+            crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, &mut subs);
             self.toggle_pieces_forward(m, captured);
         }
 
@@ -386,7 +388,7 @@ impl Board {
             anc -= 1;
         }
 
-        if self.threat_frames[anc].dirty || non_null_count >= 6 {
+        if self.threat_frames[anc].dirty || non_null_count >= 3 {
             self.refresh_threats();
             return;
         }

@@ -438,6 +438,7 @@ fn has_avx2() -> bool {
 #[allow(dead_code)]
 #[inline(always)]
 fn has_avx512_vnni() -> bool {
+    #[cfg(target_feature = "avx512vnni")] { return true; }
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static VNNI: AtomicU8 = AtomicU8::new(0);
@@ -457,6 +458,7 @@ fn has_avx512_vnni() -> bool {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn has_avx_vnni() -> bool {
+    #[cfg(target_feature = "avxvnni")] { return true; }
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static VNNI: AtomicU8 = AtomicU8::new(0);
@@ -1303,40 +1305,47 @@ pub fn collect_threats(board: &Board, view: Color, out: &mut ThreatList) {
     out.sort();
 }
 
-struct SharedThreatScan {
+pub(crate) struct SharedThreatScan {
     tables: &'static ThreatTables,
-    masks: [u8; 2],
-    kings: Bitboard,
-    by_type: [Bitboard; 6],
-    victims: [Bitboard; 6],
+    pub(crate) masks: [u8; 2],
+    pub(crate) kings: Bitboard,
+    pub(crate) by_type: [Bitboard; 6],
+    pub(crate) victims: [Bitboard; 6],
 }
 
 impl SharedThreatScan {
-    fn new(board: &Board) -> Self {
+    pub(crate) fn new(board: &Board) -> Self {
         let masks = [
             perspective_mask(board.king_square(Color::White), Color::White),
             perspective_mask(board.king_square(Color::Black), Color::Black),
         ];
-        let mut by_type = [Bitboard::EMPTY; 6];
-        for (kind, slot) in by_type.iter_mut().enumerate() {
-            for color in 0..2 {
-                *slot |= board.pieces[Piece::new(Color::from_index(color), PieceType::from_index(kind))];
-            }
-        }
-        let mut victims = [Bitboard::EMPTY; 6];
-        for (akind, targets) in PIECE_TARGET_MAP.iter().enumerate() {
-            for (vkind, &map) in targets.iter().enumerate() {
-                if map >= 0 {
-                    victims[akind] |= by_type[vkind];
-                }
-            }
-        }
-        Self {
+        let mut scan = Self {
             tables: threat_tables(),
             masks,
-            kings: by_type[PieceType::King as usize],
-            by_type,
-            victims,
+            kings: Bitboard::EMPTY,
+            by_type: [Bitboard::EMPTY; 6],
+            victims: [Bitboard::EMPTY; 6],
+        };
+        scan.refresh_pieces(board);
+        scan
+    }
+
+    #[inline(always)]
+    pub(crate) fn refresh_pieces(&mut self, board: &Board) {
+        for (kind, slot) in self.by_type.iter_mut().enumerate() {
+            let w = board.pieces[Piece::new(Color::White, PieceType::from_index(kind))];
+            let b = board.pieces[Piece::new(Color::Black, PieceType::from_index(kind))];
+            *slot = w | b;
+        }
+        self.kings = self.by_type[PieceType::King as usize];
+        for (akind, targets) in PIECE_TARGET_MAP.iter().enumerate() {
+            let mut v = Bitboard::EMPTY;
+            for (vkind, &map) in targets.iter().enumerate() {
+                if map >= 0 {
+                    v |= self.by_type[vkind];
+                }
+            }
+            self.victims[akind] = v;
         }
     }
 }
@@ -1407,8 +1416,7 @@ fn push_threat_both(scan: &SharedThreatScan, attacker: Piece, from: Square, vict
     }
 }
 
-pub fn append_changed_square_threats_both(board: &Board, changed: Bitboard, need: [bool; 2], out: &mut [ThreatList; 2]) {
-    let scan = SharedThreatScan::new(board);
+pub fn append_changed_square_threats_both(board: &Board, scan: &SharedThreatScan, changed: Bitboard, need: [bool; 2], out: &mut [ThreatList; 2]) {
     let non_kings = board.occupied & !scan.kings;
     let mut sqs = changed & non_kings;
 
@@ -1433,6 +1441,7 @@ pub fn append_changed_square_threats_both(board: &Board, changed: Bitboard, need
 
 pub fn collect_xray_threat_diffs_both(
     board: &Board,
+    scan: &SharedThreatScan,
     changed: Bitboard,
     occ_before: Bitboard,
     occ_after: Bitboard,
@@ -1445,7 +1454,6 @@ pub fn collect_xray_threat_diffs_both(
         return;
     }
 
-    let scan = SharedThreatScan::new(board);
     let non_changed = !changed;
     let queens = board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen];
     let diag_pieces = (board.pieces[Piece::WhiteBishop] | board.pieces[Piece::BlackBishop] | queens) & non_changed;
@@ -1581,7 +1589,12 @@ unsafe fn apply_threat_delta_from_avx2(dst: &mut [i16; HIDDEN_SIZE], src: &[i16;
             let mut a6 = _mm256_load_si256(s.add(6));
             let mut a7 = _mm256_load_si256(s.add(7));
 
-            for &idx in subs {
+            for (n, &idx) in subs.iter().enumerate() {
+                if let Some(&ahead) = subs.get(n + 2) {
+                    let p = weights.rows.as_ptr().add(ahead as usize * HIDDEN_SIZE + base) as *const i8;
+                    _mm_prefetch(p, _MM_HINT_T0);
+                    _mm_prefetch(p.add(64), _MM_HINT_T0);
+                }
                 let r = weights.rows.as_ptr().add(idx as usize * HIDDEN_SIZE + base);
                 let w0 = _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i));
                 let w1 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i));
@@ -1600,7 +1613,12 @@ unsafe fn apply_threat_delta_from_avx2(dst: &mut [i16; HIDDEN_SIZE], src: &[i16;
                 a6 = _mm256_sub_epi16(a6, w6);
                 a7 = _mm256_sub_epi16(a7, w7);
             }
-            for &idx in adds {
+            for (n, &idx) in adds.iter().enumerate() {
+                if let Some(&ahead) = adds.get(n + 2) {
+                    let p = weights.rows.as_ptr().add(ahead as usize * HIDDEN_SIZE + base) as *const i8;
+                    _mm_prefetch(p, _MM_HINT_T0);
+                    _mm_prefetch(p.add(64), _MM_HINT_T0);
+                }
                 let r = weights.rows.as_ptr().add(idx as usize * HIDDEN_SIZE + base);
                 let w0 = _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i));
                 let w1 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i));
@@ -2423,23 +2441,48 @@ unsafe fn l1_forward_avx512(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &[i32;
     use std::arch::x86_64::*;
     unsafe {
         let ones = _mm512_set1_epi16(1);
-        for j in 0..L1_SIZE {
-            let mut acc = _mm512_setzero_si512();
-            let row = weights[j].as_ptr() as *const __m512i;
+        let mut j = 0;
+        while j < L1_SIZE {
+            let mut a0 = _mm512_setzero_si512();
+            let mut a1 = _mm512_setzero_si512();
+            let mut a2 = _mm512_setzero_si512();
+            let mut a3 = _mm512_setzero_si512();
+            let mut a4 = _mm512_setzero_si512();
+            let mut a5 = _mm512_setzero_si512();
+            let mut a6 = _mm512_setzero_si512();
+            let mut a7 = _mm512_setzero_si512();
+
+            let r0 = weights[j].as_ptr() as *const __m512i;
+            let r1 = weights[j + 1].as_ptr() as *const __m512i;
+            let r2 = weights[j + 2].as_ptr() as *const __m512i;
+            let r3 = weights[j + 3].as_ptr() as *const __m512i;
+            let r4 = weights[j + 4].as_ptr() as *const __m512i;
+            let r5 = weights[j + 5].as_ptr() as *const __m512i;
+            let r6 = weights[j + 6].as_ptr() as *const __m512i;
+            let r7 = weights[j + 7].as_ptr() as *const __m512i;
+
             let mut i = 0;
             while i < HIDDEN_SIZE {
                 let x = _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i);
-                let w = _mm512_loadu_si512(row.add(i / 64));
-                let prod = _mm512_maddubs_epi16(x, w);
-                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(prod, ones));
+                let idx = i / 64;
+                a0 = _mm512_add_epi32(a0, _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_loadu_si512(r0.add(idx))), ones));
+                a1 = _mm512_add_epi32(a1, _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_loadu_si512(r1.add(idx))), ones));
+                a2 = _mm512_add_epi32(a2, _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_loadu_si512(r2.add(idx))), ones));
+                a3 = _mm512_add_epi32(a3, _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_loadu_si512(r3.add(idx))), ones));
+                a4 = _mm512_add_epi32(a4, _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_loadu_si512(r4.add(idx))), ones));
+                a5 = _mm512_add_epi32(a5, _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_loadu_si512(r5.add(idx))), ones));
+                a6 = _mm512_add_epi32(a6, _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_loadu_si512(r6.add(idx))), ones));
+                a7 = _mm512_add_epi32(a7, _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_loadu_si512(r7.add(idx))), ones));
                 i += 64;
             }
 
-            let output = _mm512_reduce_add_epi32(acc).wrapping_add(bias[j]) >> L1_SHIFT;
-            // clamp before squaring for crelu/screlu
-            let clamped = output.clamp(0, QUANT);
-            out[j] = (clamped << QUANT_BITS) as i16;
-            out[L1_SIZE + j] = (clamped * clamped) as i16;
+            for (lane, acc) in [a0, a1, a2, a3, a4, a5, a6, a7].into_iter().enumerate() {
+                let output = _mm512_reduce_add_epi32(acc).wrapping_add(bias[j + lane]) >> L1_SHIFT;
+                let clamped = output.clamp(0, QUANT);
+                out[j + lane] = (clamped << QUANT_BITS) as i16;
+                out[L1_SIZE + j + lane] = (clamped * clamped) as i16;
+            }
+            j += 8;
         }
     }
 }
@@ -2450,22 +2493,48 @@ unsafe fn l1_forward_avx512_vnni(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &
     use std::arch::x86_64::*;
     unsafe {
         let ones = _mm512_set1_epi16(1);
-        for j in 0..L1_SIZE {
-            let mut acc = _mm512_setzero_si512();
-            let row = weights[j].as_ptr() as *const __m512i;
+        let mut j = 0;
+        while j < L1_SIZE {
+            let mut a0 = _mm512_setzero_si512();
+            let mut a1 = _mm512_setzero_si512();
+            let mut a2 = _mm512_setzero_si512();
+            let mut a3 = _mm512_setzero_si512();
+            let mut a4 = _mm512_setzero_si512();
+            let mut a5 = _mm512_setzero_si512();
+            let mut a6 = _mm512_setzero_si512();
+            let mut a7 = _mm512_setzero_si512();
+
+            let r0 = weights[j].as_ptr() as *const __m512i;
+            let r1 = weights[j + 1].as_ptr() as *const __m512i;
+            let r2 = weights[j + 2].as_ptr() as *const __m512i;
+            let r3 = weights[j + 3].as_ptr() as *const __m512i;
+            let r4 = weights[j + 4].as_ptr() as *const __m512i;
+            let r5 = weights[j + 5].as_ptr() as *const __m512i;
+            let r6 = weights[j + 6].as_ptr() as *const __m512i;
+            let r7 = weights[j + 7].as_ptr() as *const __m512i;
+
             let mut i = 0;
             while i < HIDDEN_SIZE {
                 let x = _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i);
-                let w = _mm512_loadu_si512(row.add(i / 64));
-                let prod = _mm512_maddubs_epi16(x, w);
-                acc = _mm512_dpwssd_epi32(acc, prod, ones);
+                let idx = i / 64;
+                a0 = _mm512_dpwssd_epi32(a0, _mm512_maddubs_epi16(x, _mm512_loadu_si512(r0.add(idx))), ones);
+                a1 = _mm512_dpwssd_epi32(a1, _mm512_maddubs_epi16(x, _mm512_loadu_si512(r1.add(idx))), ones);
+                a2 = _mm512_dpwssd_epi32(a2, _mm512_maddubs_epi16(x, _mm512_loadu_si512(r2.add(idx))), ones);
+                a3 = _mm512_dpwssd_epi32(a3, _mm512_maddubs_epi16(x, _mm512_loadu_si512(r3.add(idx))), ones);
+                a4 = _mm512_dpwssd_epi32(a4, _mm512_maddubs_epi16(x, _mm512_loadu_si512(r4.add(idx))), ones);
+                a5 = _mm512_dpwssd_epi32(a5, _mm512_maddubs_epi16(x, _mm512_loadu_si512(r5.add(idx))), ones);
+                a6 = _mm512_dpwssd_epi32(a6, _mm512_maddubs_epi16(x, _mm512_loadu_si512(r6.add(idx))), ones);
+                a7 = _mm512_dpwssd_epi32(a7, _mm512_maddubs_epi16(x, _mm512_loadu_si512(r7.add(idx))), ones);
                 i += 64;
             }
 
-            let output = _mm512_reduce_add_epi32(acc).wrapping_add(bias[j]) >> L1_SHIFT;
-            let clamped = output.clamp(0, QUANT);
-            out[j] = (clamped << QUANT_BITS) as i16;
-            out[L1_SIZE + j] = (clamped * clamped) as i16;
+            for (lane, acc) in [a0, a1, a2, a3, a4, a5, a6, a7].into_iter().enumerate() {
+                let output = _mm512_reduce_add_epi32(acc).wrapping_add(bias[j + lane]) >> L1_SHIFT;
+                let clamped = output.clamp(0, QUANT);
+                out[j + lane] = (clamped << QUANT_BITS) as i16;
+                out[L1_SIZE + j + lane] = (clamped * clamped) as i16;
+            }
+            j += 8;
         }
     }
 }

@@ -388,18 +388,6 @@ fn run_bench(pool: &mut ThreadPool) {
         "8/3k4/3b3p/R1p1p2P/p1Pr4/P2P1r2/2K1R3/4B3 b - - 4 75",
     ];
 
-    crate::search::EVAL_CALLS.store(0, Ordering::Relaxed);
-    crate::search::EVAL_NEGAMAX.store(0, Ordering::Relaxed);
-    crate::search::EVAL_QSEARCH.store(0, Ordering::Relaxed);
-    crate::search::RFP_CUTOFFS.store(0, Ordering::Relaxed);
-    crate::search::STANDPAT_CUTOFFS.store(0, Ordering::Relaxed);
-    crate::search::EVAL_RFP_CUTOFF_CALLS.store(0, Ordering::Relaxed);
-    crate::search::EVAL_STANDPAT_CUTOFF_CALLS.store(0, Ordering::Relaxed);
-
-    crate::search::QSEARCH_NODES.store(0, Ordering::Relaxed);
-    crate::search::QSEARCH_TT_HITS.store(0, Ordering::Relaxed);
-    crate::search::QSEARCH_TT_RAW_HITS.store(0, Ordering::Relaxed);
-
     let mut total_nodes = 0;
     let start = std::time::Instant::now();
 
@@ -425,20 +413,4 @@ fn run_bench(pool: &mut ThreadPool) {
 
     println!();
     println!("Bench: {total_nodes} nodes {nps} nps");
-    println!("EVAL_CALLS: {}", crate::search::EVAL_CALLS.load(Ordering::Relaxed));
-    println!("EVAL_NEGAMAX: {}", crate::search::EVAL_NEGAMAX.load(Ordering::Relaxed));
-    println!("EVAL_QSEARCH: {}", crate::search::EVAL_QSEARCH.load(Ordering::Relaxed));
-    println!("RFP_CUTOFFS: {}", crate::search::RFP_CUTOFFS.load(Ordering::Relaxed));
-    println!("STANDPAT_CUTOFFS: {}", crate::search::STANDPAT_CUTOFFS.load(Ordering::Relaxed));
-    println!("EVAL_RFP_CUTOFF_CALLS: {}", crate::search::EVAL_RFP_CUTOFF_CALLS.load(Ordering::Relaxed));
-    let qn = crate::search::QSEARCH_NODES.load(Ordering::Relaxed);
-    let qh = crate::search::QSEARCH_TT_HITS.load(Ordering::Relaxed);
-    let qr = crate::search::QSEARCH_TT_RAW_HITS.load(Ordering::Relaxed);
-    println!("QSEARCH_NODES: {qn}");
-    println!("QSEARCH_TT_HITS: {qh} ({:.1}%)", 100.0 * qh as f64 / qn as f64);
-    println!("QSEARCH_TT_RAW_HITS: {qr} ({:.1}%)", 100.0 * qr as f64 / qn as f64);
-    println!(
-        "EVAL_STANDPAT_CUTOFF_CALLS: {}",
-        crate::search::EVAL_STANDPAT_CUTOFF_CALLS.load(Ordering::Relaxed)
-    );
 }

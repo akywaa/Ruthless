@@ -1,6 +1,6 @@
 use crate::alloc::HugeBox;
 use crate::bitboard::Bitboard;
-use crate::board::Board;
+use crate::board::{Board, noisy_victim_index};
 use crate::eval::evaluate;
 use crate::movegen::generate_legal_moves;
 use crate::movepick::MovePicker;
@@ -355,17 +355,9 @@ impl Searcher {
     #[inline(always)]
     fn noisy_history_score(&self, board: &Board, m: Move, pawn_threats: Bitboard) -> i32 {
         let moving_pc = board.piece_on[m.from()];
-        let victim_pt = match m.move_type() {
-            MoveType::EnPassant => PieceType::Pawn,
-            MoveType::Promotion => {
-                let cap = board.piece_on[m.to()].piece_type();
-                if cap != PieceType::None { cap } else { PieceType::Pawn }
-            }
-            _ => board.piece_on[m.to()].piece_type(),
-        };
+        let victim = noisy_victim_index(board, m);
         let to_threatened = pawn_threats.contains(m.to()) as usize;
-
-        self.noisy_history[moving_pc as usize][m.to() as usize][victim_pt as usize][to_threatened]
+        self.noisy_history[moving_pc as usize][m.to() as usize][victim][to_threatened]
     }
 
     fn update_conthist(&mut self, ply: u8, cur_piece: Piece, m: Move, bonus: i32) {
@@ -1408,11 +1400,7 @@ impl Searcher {
                 let malus = (150 * depth as i32 - 40).clamp(0, 1200);
 
                 let moving_pc = board.piece_on[m.from()] as usize;
-                let victim_pt = match m.move_type() {
-                    MoveType::EnPassant => PieceType::Pawn,
-                    MoveType::Promotion => m.promo_type(),
-                    _ => board.piece_on[m.to()].piece_type(),
-                } as usize;
+                let victim_pt = noisy_victim_index(board, m);
 
                 // compute pawn threats only if needed
                 if is_quiet {
@@ -1464,11 +1452,7 @@ impl Searcher {
                             }
 
                             let n_pc = board.piece_on[nm.from()] as usize;
-                            let n_victim_pt = match nm.move_type() {
-                                MoveType::EnPassant => PieceType::Pawn,
-                                MoveType::Promotion => nm.promo_type(),
-                                _ => board.piece_on[nm.to()].piece_type(),
-                            } as usize;
+                            let n_victim_pt = noisy_victim_index(board, nm);
 
                             if n_pc < 12 && n_victim_pt < 6 {
                                 let n_to_threatened = pawn_threats.contains(nm.to()) as usize;
@@ -1491,11 +1475,7 @@ impl Searcher {
                         }
 
                         let n_pc = board.piece_on[nm.from()] as usize;
-                        let n_victim_pt = match nm.move_type() {
-                            MoveType::EnPassant => PieceType::Pawn,
-                            MoveType::Promotion => nm.promo_type(),
-                            _ => board.piece_on[nm.to()].piece_type(),
-                        } as usize;
+                        let n_victim_pt = noisy_victim_index(board, nm);
 
                         if n_pc < 12 && n_victim_pt < 6 {
                             let n_to_threatened = pawn_threats.contains(nm.to()) as usize;
@@ -1830,11 +1810,7 @@ impl Searcher {
 
             if score >= beta {
                 let moving_pc = board.piece_on[m.from()] as usize;
-                let victim_pt = match m.move_type() {
-                    MoveType::EnPassant => PieceType::Pawn,
-                    MoveType::Promotion => m.promo_type(),
-                    _ => board.piece_on[m.to()].piece_type(),
-                } as usize;
+                let victim_pt = noisy_victim_index(board, m);
                 if moving_pc < 12 && victim_pt < 6 {
                     let pawn_threats = board.opponent_pawn_threats();
                     let to_threatened = pawn_threats.contains(m.to()) as usize;

@@ -82,24 +82,22 @@ pub struct Board {
     pub non_pawn_hash: [u64; 2],
     pub history: [u64; 1024],
     pub hist_len: usize,
-    // root index in history (2-fold after root, 3-fold before)
     pub root_ply: usize,
-    // per-ply accumulator frames for lazy evaluation
     acc_frames: HugeBox<[AccumulatorFrame; FRAME_STACK_SIZE]>,
-    // per-ply threat frames. Indexed by acc_depth (same depth as accumulator)
     threat_frames: HugeBox<[ThreatFrame; FRAME_STACK_SIZE]>,
-    // current depth in the threat/accumulator stacks. Incremented on make_move,
-    // decremented on undo_move/null_move.
+    finny: HugeBox<crate::nnue::FinnyTable>,
     acc_depth: usize,
 }
 impl Clone for Board {
     fn clone(&self) -> Self {
         let mut new_frames: HugeBox<[AccumulatorFrame; FRAME_STACK_SIZE]> = HugeBox::zeroed();
         let mut new_threat_frames: HugeBox<[ThreatFrame; FRAME_STACK_SIZE]> = HugeBox::zeroed();
+        let mut new_finny: HugeBox<crate::nnue::FinnyTable> = HugeBox::zeroed();
         for i in 0..=self.acc_depth {
             new_frames[i] = self.acc_frames[i].clone();
             new_threat_frames[i] = self.threat_frames[i].clone();
         }
+        new_finny.clone_from(&self.finny);
         Self {
             pieces: self.pieces,
             occupied_co: self.occupied_co,
@@ -119,6 +117,7 @@ impl Clone for Board {
             root_ply: self.root_ply,
             acc_frames: new_frames,
             threat_frames: new_threat_frames,
+            finny: new_finny,
             acc_depth: self.acc_depth,
         }
     }
@@ -150,6 +149,7 @@ impl Board {
             root_ply: 0,
             acc_frames: HugeBox::zeroed(),
             threat_frames: HugeBox::zeroed(),
+            finny: HugeBox::zeroed(),
             acc_depth: 0,
         }
     }
@@ -161,6 +161,7 @@ impl Board {
     }
 
     // returns the current threat frame for the current ply (immutable)
+#[allow(dead_code)]
     #[inline(always)]
     fn threat_frame_immut(&self) -> &ThreatFrame {
         &self.threat_frames[self.acc_depth]
@@ -188,6 +189,7 @@ impl Board {
 
     // returns the current accumulator for the current ply, computing it if dirty
     #[inline(always)]
+#[allow(dead_code)]
     pub fn accumulator(&mut self) -> &mut Accumulator {
         self.ensure_accumulator_ready();
         &mut self.acc_frame().accumulator
@@ -202,12 +204,33 @@ impl Board {
     pub fn refresh_accumulator(&mut self) {
         let w_ksq = self.king_square(Color::White);
         let b_ksq = self.king_square(Color::Black);
-        let piece_on = self.piece_on;
-        let occ = self.occupied;
+
+        // Update Finny entries for both sides
+        // White side
+        let w_bucket = crate::nnue::king_bucket_view(w_ksq, Color::White);
+        let w_mirrored = crate::nnue::is_mirrored_view(w_ksq, Color::White) as usize;
+
+        // Black side
+        let b_bucket = crate::nnue::king_bucket_view(b_ksq, Color::Black);
+        let b_mirrored = crate::nnue::is_mirrored_view(b_ksq, Color::Black) as usize;
+
+        // Call Finny functions first, then get frame
+        let w_vals = crate::nnue::refresh_side_with_finny(
+            &mut self.finny[0][w_bucket][w_mirrored],
+            &self.pieces,
+            w_ksq,
+            Color::White,
+        );
+        let b_vals = crate::nnue::refresh_side_with_finny(
+            &mut self.finny[1][b_bucket][b_mirrored],
+            &self.pieces,
+            b_ksq,
+            Color::Black,
+        );
 
         let frame = self.acc_frame();
-        frame.accumulator.refresh_side_occ(&piece_on, occ, w_ksq, Color::White);
-        frame.accumulator.refresh_side_occ(&piece_on, occ, b_ksq, Color::Black);
+        frame.accumulator.vals[0] = w_vals;
+        frame.accumulator.vals[1] = b_vals;
         frame.dirty = [false, false];
         frame.refresh = [false, false];
         frame.ksq = [w_ksq, b_ksq];
@@ -243,9 +266,14 @@ impl Board {
             if self.acc_frames[anc].dirty[side] {
                 let color = Color::from_index(side);
                 let ksq = self.king_square(color);
-                let piece_on = self.piece_on;
-                let occ = self.occupied;
-                self.acc_frames[d].accumulator.refresh_side_occ(&piece_on, occ, ksq, color);
+                let bucket = crate::nnue::king_bucket_view(ksq, color);
+                let mirrored = crate::nnue::is_mirrored_view(ksq, color) as usize;
+                self.acc_frames[d].accumulator.vals[side] = crate::nnue::refresh_side_with_finny(
+                    &mut self.finny[side][bucket][mirrored],
+                    &self.pieces,
+                    ksq,
+                    color,
+                );
                 self.acc_frames[d].dirty[side] = false;
             } else {
                 for k in (anc + 1)..=d {
@@ -335,6 +363,14 @@ impl Board {
             self.toggle_pieces_forward(m, captured);
         }
 
+        // Fast path: if both sides need no incremental update, just copy base and mirrored
+        if need_inc[0] && need_inc[1] && subs[0].is_empty() && adds[0].is_empty() && subs[1].is_empty() && adds[1].is_empty() {
+            self.threat_frames[dst_idx].threat_base = src_base;
+            self.threat_frames[dst_idx].threat_king_mirrored = mirrored;
+            self.threat_frames[dst_idx].dirty = false;
+            return;
+        }
+
         // prefetch removed for benchmark
         for side in 0..2 {
             if need_inc[side] {
@@ -388,7 +424,7 @@ impl Board {
             anc -= 1;
         }
 
-        if self.threat_frames[anc].dirty || non_null_count >= 3 {
+        if self.threat_frames[anc].dirty || non_null_count >= 6 {
             self.refresh_threats();
             return;
         }
@@ -435,6 +471,7 @@ impl Board {
 
     // returns the current threat accumulator for the current ply
     #[inline(always)]
+#[allow(dead_code)]
     pub fn threat(&mut self) -> &mut ThreatAccumulator {
         self.ensure_threats_ready();
         let d = self.acc_depth;
@@ -1999,5 +2036,17 @@ mod tests {
             board.undo_move(m, undo);
         }
         nodes
+    }
+}
+
+#[inline(always)]
+pub fn noisy_victim_index(board: &Board, m: Move) -> usize {
+    match m.move_type() {
+        MoveType::EnPassant => PieceType::Pawn as usize,
+        MoveType::Promotion => match board.piece_on[m.to()].piece_type() {
+            PieceType::None => PieceType::Pawn as usize,
+            pt => pt as usize,
+        },
+        _ => board.piece_on[m.to()].piece_type() as usize,
     }
 }

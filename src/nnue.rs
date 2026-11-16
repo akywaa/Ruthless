@@ -360,6 +360,7 @@ pub struct Accumulator {
 impl Accumulator {
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub fn refresh_side_occ(&mut self, piece_on: &[Piece; 64], mut occ: Bitboard, ksq: Square, color: Color) {
         let net = network();
         let side = color as usize;
@@ -475,6 +476,7 @@ fn has_avx_vnni() -> bool {
 }
 
 #[inline(always)]
+#[allow(dead_code)]
 fn add_feature_weights(vals: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
     {
@@ -684,6 +686,151 @@ pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, view: Color) ->
     let piece_idx = oriented_piece(piece, view);
 
     king_bucket(oriented_ksq) * 768 + piece_idx * 64 + final_sq
+}
+
+#[inline(always)]
+pub fn king_bucket_view(ksq: Square, view: Color) -> usize {
+    let oriented_ksq = if view == Color::White { ksq } else { Square::new((ksq as u8) ^ 56) };
+    king_bucket(oriented_ksq)
+}
+
+#[inline(always)]
+pub fn is_mirrored_view(ksq: Square, view: Color) -> bool {
+    let oriented_ksq = if view == Color::White { ksq } else { Square::new((ksq as u8) ^ 56) };
+    oriented_ksq.file() > 3
+}
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone)]
+pub struct FinnyEntry {
+    pub vals: [i16; HIDDEN_SIZE],
+    pub pieces: [Bitboard; PIECE_NB],
+    pub initialized: bool,
+}
+
+pub type FinnyTable = [[[FinnyEntry; 2]; NUM_INPUT_BUCKETS]; 2];
+
+#[inline(always)]
+pub fn refresh_side_with_finny(
+    entry: &mut FinnyEntry,
+    board_pieces: &[Bitboard; PIECE_NB],
+    ksq: Square,
+    color: Color,
+) -> [i16; HIDDEN_SIZE] {
+    let net = network();
+    if !entry.initialized {
+        entry.vals = net.feature_bias.vals;
+        entry.pieces = [Bitboard::EMPTY; PIECE_NB];
+        entry.initialized = true;
+    }
+
+    let mut adds = [0u16; 32];
+    let mut subs = [0u16; 32];
+    let mut add_count = 0usize;
+    let mut sub_count = 0usize;
+
+    for p in 0..PIECE_NB {
+        let cur = board_pieces[p];
+        let prev = entry.pieces[p];
+        if cur == prev {
+            continue;
+        }
+        let piece = Piece::new(Color::from_index(p / 6), PieceType::from_index(p % 6));
+        let mut added = cur & !prev;
+        while !added.is_empty() {
+            let sq = added.pop_lsb();
+            adds[add_count] = feature_index_side(piece, sq, ksq, color) as u16;
+            add_count += 1;
+        }
+        let mut removed = prev & !cur;
+        while !removed.is_empty() {
+            let sq = removed.pop_lsb();
+            subs[sub_count] = feature_index_side(piece, sq, ksq, color) as u16;
+            sub_count += 1;
+        }
+        entry.pieces[p] = cur;
+    }
+
+    if add_count > 0 || sub_count > 0 {
+        apply_psq_lists(&mut entry.vals, net, &adds[..add_count], &subs[..sub_count]);
+    }
+    entry.vals
+}
+
+#[inline(always)]
+fn apply_psq_lists(vals: &mut [i16; HIDDEN_SIZE], net: &'static Network, adds: &[u16], subs: &[u16]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe { apply_psq_lists_avx2(vals, net, adds, subs) };
+            return;
+        }
+    }
+    for &idx in adds {
+        let w = &net.feature_weights[idx as usize].vals;
+        for i in 0..HIDDEN_SIZE {
+            vals[i] = vals[i].wrapping_add(w[i]);
+        }
+    }
+    for &idx in subs {
+        let w = &net.feature_weights[idx as usize].vals;
+        for i in 0..HIDDEN_SIZE {
+            vals[i] = vals[i].wrapping_sub(w[i]);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_psq_lists_avx2(vals: &mut [i16; HIDDEN_SIZE], net: &'static Network, adds: &[u16], subs: &[u16]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut base = 0usize;
+        while base < HIDDEN_SIZE {
+            let v_ptr = vals.as_mut_ptr().add(base) as *mut __m256i;
+            let mut a0 = _mm256_load_si256(v_ptr);
+            let mut a1 = _mm256_load_si256(v_ptr.add(1));
+            let mut a2 = _mm256_load_si256(v_ptr.add(2));
+            let mut a3 = _mm256_load_si256(v_ptr.add(3));
+            let mut a4 = _mm256_load_si256(v_ptr.add(4));
+            let mut a5 = _mm256_load_si256(v_ptr.add(5));
+            let mut a6 = _mm256_load_si256(v_ptr.add(6));
+            let mut a7 = _mm256_load_si256(v_ptr.add(7));
+
+            for &idx in adds {
+                let w = net.feature_weights.get_unchecked(idx as usize).vals.as_ptr().add(base) as *const __m256i;
+                a0 = _mm256_add_epi16(a0, _mm256_load_si256(w));
+                a1 = _mm256_add_epi16(a1, _mm256_load_si256(w.add(1)));
+                a2 = _mm256_add_epi16(a2, _mm256_load_si256(w.add(2)));
+                a3 = _mm256_add_epi16(a3, _mm256_load_si256(w.add(3)));
+                a4 = _mm256_add_epi16(a4, _mm256_load_si256(w.add(4)));
+                a5 = _mm256_add_epi16(a5, _mm256_load_si256(w.add(5)));
+                a6 = _mm256_add_epi16(a6, _mm256_load_si256(w.add(6)));
+                a7 = _mm256_add_epi16(a7, _mm256_load_si256(w.add(7)));
+            }
+            for &idx in subs {
+                let w = net.feature_weights.get_unchecked(idx as usize).vals.as_ptr().add(base) as *const __m256i;
+                a0 = _mm256_sub_epi16(a0, _mm256_load_si256(w));
+                a1 = _mm256_sub_epi16(a1, _mm256_load_si256(w.add(1)));
+                a2 = _mm256_sub_epi16(a2, _mm256_load_si256(w.add(2)));
+                a3 = _mm256_sub_epi16(a3, _mm256_load_si256(w.add(3)));
+                a4 = _mm256_sub_epi16(a4, _mm256_load_si256(w.add(4)));
+                a5 = _mm256_sub_epi16(a5, _mm256_load_si256(w.add(5)));
+                a6 = _mm256_sub_epi16(a6, _mm256_load_si256(w.add(6)));
+                a7 = _mm256_sub_epi16(a7, _mm256_load_si256(w.add(7)));
+            }
+
+            _mm256_store_si256(v_ptr, a0);
+            _mm256_store_si256(v_ptr.add(1), a1);
+            _mm256_store_si256(v_ptr.add(2), a2);
+            _mm256_store_si256(v_ptr.add(3), a3);
+            _mm256_store_si256(v_ptr.add(4), a4);
+            _mm256_store_si256(v_ptr.add(5), a5);
+            _mm256_store_si256(v_ptr.add(6), a6);
+            _mm256_store_si256(v_ptr.add(7), a7);
+            base += 128;
+        }
+    }
 }
 
 // empty slot marker
@@ -1203,6 +1350,11 @@ impl ThreatList {
     }
 
     #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    #[inline(always)]
     pub fn as_slice(&self) -> &[u16] {
         unsafe { std::slice::from_raw_parts(self.indices.as_ptr().cast::<u16>(), self.count) }
     }
@@ -1332,10 +1484,10 @@ impl SharedThreatScan {
 
     #[inline(always)]
     pub(crate) fn refresh_pieces(&mut self, board: &Board) {
-        for (kind, slot) in self.by_type.iter_mut().enumerate() {
-            let w = board.pieces[Piece::new(Color::White, PieceType::from_index(kind))];
-            let b = board.pieces[Piece::new(Color::Black, PieceType::from_index(kind))];
-            *slot = w | b;
+        for kind in 0..6 {
+            let w = board.pieces[kind];
+            let b = board.pieces[kind + 6];
+            self.by_type[kind] = w | b;
         }
         self.kings = self.by_type[PieceType::King as usize];
         for (akind, targets) in PIECE_TARGET_MAP.iter().enumerate() {
@@ -1538,10 +1690,16 @@ fn apply_threat_rows(acc: &mut [i16; HIDDEN_SIZE], weights: &ThreatWeights, list
 
 impl ThreatAccumulator {
     // rebuilds one perspective from scratch: zero, plus every row of the list
-    pub fn refresh_side(&mut self, side: usize, list: &ThreatList, weights: &ThreatWeights) {
-        let mut acc = [0i16; HIDDEN_SIZE];
-        apply_threat_rows(&mut acc, weights, list.as_slice(), true);
-        self.vals[side] = acc;
+pub fn refresh_side(&mut self, side: usize, list: &ThreatList, weights: &ThreatWeights) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if has_avx2() {
+                unsafe { refresh_threat_side_avx2(&mut self.vals[side], weights, list.as_slice()) };
+                return;
+            }
+        }
+        self.vals[side].fill(0);
+        apply_threat_rows_scalar(&mut self.vals[side], weights, list.as_slice(), true);
     }
 
     // applies a known set of removed and added rows directly
@@ -1651,6 +1809,7 @@ unsafe fn apply_threat_delta_from_avx2(dst: &mut [i16; HIDDEN_SIZE], src: &[i16;
     }
 }
 
+#[allow(dead_code)]
 pub fn prefetch_threat_rows(weights: &ThreatWeights, list: &[u16]) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -1695,6 +1854,53 @@ unsafe fn apply_threat_rows_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &ThreatW
                 _mm256_storeu_si256(acc.as_mut_ptr().add(i) as *mut __m256i, r);
                 i += 16;
             }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn refresh_threat_side_avx2(dst: &mut [i16; HIDDEN_SIZE], weights: &ThreatWeights, list: &[u16]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut base = 0usize;
+        while base < HIDDEN_SIZE {
+            let mut a0 = _mm256_setzero_si256();
+            let mut a1 = _mm256_setzero_si256();
+            let mut a2 = _mm256_setzero_si256();
+            let mut a3 = _mm256_setzero_si256();
+            let mut a4 = _mm256_setzero_si256();
+            let mut a5 = _mm256_setzero_si256();
+            let mut a6 = _mm256_setzero_si256();
+            let mut a7 = _mm256_setzero_si256();
+
+            for (n, &idx) in list.iter().enumerate() {
+                if let Some(&ahead) = list.get(n + 4) {
+                    let p = weights.rows.as_ptr().add(ahead as usize * HIDDEN_SIZE + base) as *const i8;
+                    _mm_prefetch(p, _MM_HINT_T0);
+                    _mm_prefetch(p.add(64), _MM_HINT_T0);
+                }
+                let r = weights.rows.as_ptr().add(idx as usize * HIDDEN_SIZE + base);
+                a0 = _mm256_add_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
+                a1 = _mm256_add_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
+                a2 = _mm256_add_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
+                a3 = _mm256_add_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
+                a4 = _mm256_add_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
+                a5 = _mm256_add_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
+                a6 = _mm256_add_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
+                a7 = _mm256_add_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+            }
+
+            let d = dst.as_mut_ptr().add(base) as *mut __m256i;
+            _mm256_store_si256(d, a0);
+            _mm256_store_si256(d.add(1), a1);
+            _mm256_store_si256(d.add(2), a2);
+            _mm256_store_si256(d.add(3), a3);
+            _mm256_store_si256(d.add(4), a4);
+            _mm256_store_si256(d.add(5), a5);
+            _mm256_store_si256(d.add(6), a6);
+            _mm256_store_si256(d.add(7), a7);
+            base += 128;
         }
     }
 }
@@ -2274,6 +2480,7 @@ mod tests {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE]) {
     use std::arch::x86_64::*;
     unsafe {

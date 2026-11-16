@@ -1,7 +1,7 @@
 use std::mem::MaybeUninit;
 
 use crate::bitboard::Bitboard;
-use crate::board::Board;
+use crate::board::{Board, noisy_victim_index};
 use crate::eval::PIECE_VALUES;
 use crate::movegen::{generate_noisy_pseudo, generate_quiet_pseudo};
 use crate::search::{ContHist, MAX_PLY};
@@ -374,6 +374,7 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
                 MoveType::Promotion => m.promo_type(),
                 _ => captured.piece_type(),
             };
+            let hist_victim = noisy_victim_index(board, m);
 
             let to_threatened = pawn_threats.contains(m.to()) as usize;
 
@@ -383,7 +384,7 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
             // bounds check before indexing
             if attacker_idx < 12 && victim_idx < 6 {
                 let mvv_lva = PIECE_VALUES[victim_idx] * 12 - PIECE_VALUES[attacker.piece_type() as usize];
-                let hist = noisy_history[attacker_idx][m.to() as usize][victim_idx][to_threatened];
+                let hist = noisy_history[attacker_idx][m.to() as usize][hist_victim][to_threatened];
                 let mut score = mvv_lva + hist / 32;
 
                 if m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Queen {

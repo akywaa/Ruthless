@@ -448,27 +448,6 @@ impl Board {
         &self.threat_frames[base].threat
     }
 
-    // current threat mirror state
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn threat_king_mirrored(&self) -> &[bool; 2] {
-        &self.threat_frame_immut().threat_king_mirrored
-    }
-
-    // returns the current threat dirty flag for the current ply
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn threat_dirty(&self) -> bool {
-        self.threat_frame_immut().dirty
-    }
-
-    // sets the threat dirty flag for the current ply
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn set_threat_dirty(&mut self) {
-        self.threat_frame().dirty = true;
-    }
-
     // squares changed by move
     pub(crate) fn move_changed_squares(&self, m: Move) -> Bitboard {
         let mut changed = Bitboard::from_square(m.from()) | Bitboard::from_square(m.to());
@@ -594,30 +573,6 @@ impl Board {
                 self.put_piece_no_hash(Piece::new(moved.color(), m.promo_type()), to);
             }
         }
-    }
-
-    // occupancy after move without modifying board
-    #[allow(dead_code)]
-    pub(crate) fn occupancy_after(&self, m: Move) -> Bitboard {
-        let mut occ = self.occupied;
-        occ.clear(m.from());
-        occ.set(m.to());
-        match m.move_type() {
-            MoveType::EnPassant => occ.clear(Square::from_coords(m.to().file(), m.from().rank())),
-            MoveType::Castling => {
-                let (rook_from, rook_to) = castling_rook_squares(m.to());
-                occ.clear(rook_from);
-                occ.set(rook_to);
-            }
-            _ => {}
-        }
-        occ
-    }
-
-    pub fn refresh_accumulator_side(&mut self, color: Color) {
-        let piece_on = self.piece_on;
-        let ksq = self.king_square(color);
-        self.accumulator().refresh_side(&piece_on, ksq, color);
     }
 
     pub fn from_fen(fen: &str) -> Result<Self, String> {

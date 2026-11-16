@@ -358,39 +358,6 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
-    #[inline(always)]
-    pub fn new() -> Self {
-        let net = network();
-        Self {
-            vals: [net.feature_bias.vals, net.feature_bias.vals],
-        }
-    }
-
-    #[inline(always)]
-    pub fn add_feature_side(&mut self, piece: Piece, sq: Square, ksq: Square, color: Color) {
-        let net = network();
-        let idx = feature_index_side(piece, sq, ksq, color);
-        add_feature_weights(&mut self.vals[color as usize], &net.feature_weights[idx].vals);
-    }
-
-    #[inline(always)]
-    pub fn add_feature(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square) {
-        self.add_feature_side(piece, sq, w_ksq, Color::White);
-        self.add_feature_side(piece, sq, b_ksq, Color::Black);
-    }
-
-    pub fn refresh_side(&mut self, piece_on: &[Piece; 64], ksq: Square, color: Color) {
-        let net = network();
-        let side = color as usize;
-        self.vals[side] = net.feature_bias.vals;
-
-        for sq in 0..64 {
-            let piece = piece_on[sq];
-            if piece != Piece::None {
-                self.add_feature_side(piece, Square::new(sq as u8), ksq, color);
-            }
-        }
-    }
 
     #[inline(always)]
     pub fn refresh_side_occ(&mut self, piece_on: &[Piece; 64], mut occ: Bitboard, ksq: Square, color: Color) {
@@ -404,91 +371,6 @@ impl Accumulator {
             let idx = feature_index_side(piece, sq, ksq, color);
             add_feature_weights(&mut self.vals[side], &net.feature_weights[idx].vals);
         }
-    }
-
-    #[inline(always)]
-    pub fn apply_delta(&mut self, delta: &FeatureDelta) {
-        let net = network();
-
-        for side in 0..2 {
-            let adds = &delta.adds[side];
-            let subs = &delta.subs[side];
-            let add_count = delta.add_count[side];
-            let sub_count = delta.sub_count[side];
-            if add_count == 0 && sub_count == 0 {
-                continue;
-            }
-
-            // fast path for 1 add + 1 sub
-            if add_count == 1 && sub_count == 1 {
-                let add = &net.feature_weights[adds[0] as usize].vals;
-                let sub = &net.feature_weights[subs[0] as usize].vals;
-                apply_delta_weights_11(&mut self.vals[side], add, sub);
-                continue;
-            }
-
-            let add1 = feature_weights_or_zero(net, adds[0]);
-            let add2 = feature_weights_or_zero(net, adds[1]);
-            let sub1 = feature_weights_or_zero(net, subs[0]);
-            let sub2 = feature_weights_or_zero(net, subs[1]);
-
-            apply_delta_weights(&mut self.vals[side], add1, add2, sub1, sub2);
-        }
-    }
-
-    // reverse apply_delta
-    #[inline(always)]
-    pub fn apply_delta_inverse(&mut self, delta: &FeatureDelta) {
-        let net = network();
-
-        for side in 0..2 {
-            let adds = &delta.adds[side];
-            let subs = &delta.subs[side];
-            let add_count = delta.add_count[side];
-            let sub_count = delta.sub_count[side];
-            if add_count == 0 && sub_count == 0 {
-                continue;
-            }
-
-            if add_count == 1 && sub_count == 1 {
-                let add = &net.feature_weights[adds[0] as usize].vals;
-                let sub = &net.feature_weights[subs[0] as usize].vals;
-                apply_delta_weights_11(&mut self.vals[side], sub, add);
-                continue;
-            }
-
-            let add1 = feature_weights_or_zero(net, adds[0]);
-            let add2 = feature_weights_or_zero(net, adds[1]);
-            let sub1 = feature_weights_or_zero(net, subs[0]);
-            let sub2 = feature_weights_or_zero(net, subs[1]);
-
-            apply_delta_weights(&mut self.vals[side], sub1, sub2, add1, add2);
-        }
-    }
-
-    // applies a delta for a single perspective (side). Used by
-    // board::ensure_accumulator_ready for incremental updates.
-    #[inline(always)]
-    pub fn apply_delta_side(&mut self, side: usize, delta: &FeatureDelta) {
-        let net = network();
-        let adds = &delta.adds[side];
-        let subs = &delta.subs[side];
-        let add_count = delta.add_count[side];
-        let sub_count = delta.sub_count[side];
-        if add_count == 0 && sub_count == 0 {
-            return;
-        }
-        if add_count == 1 && sub_count == 1 {
-            let add = &net.feature_weights[adds[0] as usize].vals;
-            let sub = &net.feature_weights[subs[0] as usize].vals;
-            apply_delta_weights_11(&mut self.vals[side], add, sub);
-            return;
-        }
-        let add1 = feature_weights_or_zero(net, adds[0]);
-        let add2 = feature_weights_or_zero(net, adds[1]);
-        let sub1 = feature_weights_or_zero(net, subs[0]);
-        let sub2 = feature_weights_or_zero(net, subs[1]);
-        apply_delta_weights(&mut self.vals[side], add1, add2, sub1, sub2);
     }
 
     #[inline(always)]
@@ -625,40 +507,6 @@ fn add_feature_weights(vals: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZ
 }
 
 #[inline(always)]
-fn apply_delta_weights(
-    vals: &mut [i16; HIDDEN_SIZE],
-    add1: &[i16; HIDDEN_SIZE],
-    add2: &[i16; HIDDEN_SIZE],
-    sub1: &[i16; HIDDEN_SIZE],
-    sub2: &[i16; HIDDEN_SIZE],
-) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
-    {
-        unsafe { vec_delta_avx512(vals, add1, add2, sub1, sub2) };
-        return;
-    }
-
-    #[cfg(all(target_arch = "x86_64", not(all(target_feature = "avx512f", target_feature = "avx512bw"))))]
-    {
-        if has_avx2() {
-            unsafe { vec_delta_avx2(vals, add1, add2, sub1, sub2) };
-            return;
-        }
-        scalar_delta(vals, add1, add2, sub1, sub2);
-        return;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { vec_delta_neon(vals, add1, add2, sub1, sub2) };
-        return;
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    scalar_delta(vals, add1, add2, sub1, sub2);
-}
-
-#[inline(always)]
 fn apply_delta_weights_from(
     dst: &mut [i16; HIDDEN_SIZE],
     src: &[i16; HIDDEN_SIZE],
@@ -782,49 +630,6 @@ unsafe fn vec_delta_avx2_11_from(dst: &mut [i16; HIDDEN_SIZE], src: &[i16; HIDDE
             let v = _mm256_sub_epi16(v, _mm256_load_si256(sub_ptr.add(i)));
             _mm256_store_si256(d_ptr.add(i), v);
         }
-    }
-}
-
-#[inline(always)]
-fn scalar_delta(vals: &mut [i16; HIDDEN_SIZE], add1: &[i16; HIDDEN_SIZE], add2: &[i16; HIDDEN_SIZE], sub1: &[i16; HIDDEN_SIZE], sub2: &[i16; HIDDEN_SIZE]) {
-    for i in 0..HIDDEN_SIZE {
-        vals[i] = vals[i].wrapping_add(add1[i]).wrapping_add(add2[i]).wrapping_sub(sub1[i]).wrapping_sub(sub2[i]);
-    }
-}
-
-// fast 1-add 1-sub delta
-#[inline(always)]
-fn apply_delta_weights_11(vals: &mut [i16; HIDDEN_SIZE], add: &[i16; HIDDEN_SIZE], sub: &[i16; HIDDEN_SIZE]) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
-    {
-        unsafe { vec_delta_avx512_11(vals, add, sub) };
-        return;
-    }
-
-    #[cfg(all(target_arch = "x86_64", not(all(target_feature = "avx512f", target_feature = "avx512bw"))))]
-    {
-        if has_avx2() {
-            unsafe { vec_delta_avx2_11(vals, add, sub) };
-            return;
-        }
-        scalar_delta_11(vals, add, sub);
-        return;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { vec_delta_neon_11(vals, add, sub) };
-        return;
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    scalar_delta_11(vals, add, sub);
-}
-
-#[inline(always)]
-fn scalar_delta_11(vals: &mut [i16; HIDDEN_SIZE], add: &[i16; HIDDEN_SIZE], sub: &[i16; HIDDEN_SIZE]) {
-    for i in 0..HIDDEN_SIZE {
-        vals[i] = vals[i].wrapping_add(add[i]).wrapping_sub(sub[i]);
     }
 }
 
@@ -1415,78 +1220,6 @@ impl ThreatList {
         }
     }
 
-    // apply (self - gone) + born in one sorted pass
-    #[allow(dead_code)]
-    pub fn apply_delta(&mut self, gone: &[u16], born: &[u16]) {
-        let mut merged: [MaybeUninit<u16>; MAX_THREATS] = [MaybeUninit::uninit(); MAX_THREATS];
-        let (mut i, mut j, mut k, mut n) = (0usize, 0usize, 0usize, 0usize);
-        while i < self.count || k < born.len() {
-            let next_old = if i < self.count {
-                Some(unsafe { self.indices[i].assume_init() })
-            } else {
-                None
-            };
-            let next_born = if k < born.len() { Some(born[k]) } else { None };
-            let value = match (next_old, next_born) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-                (None, None) => break,
-            };
-            while j < gone.len() && gone[j] < value {
-                j += 1;
-            }
-            let in_gone = j < gone.len() && gone[j] == value;
-            let in_born = next_born == Some(value);
-            if in_born || !in_gone {
-                merged[n].write(value);
-                n += 1;
-            }
-            if next_old == Some(value) {
-                i += 1;
-            }
-            if in_born {
-                k += 1;
-            }
-        }
-        assert!(n <= MAX_THREATS, "too many active threat features");
-        for (dst, src) in self.indices[..n].iter_mut().zip(merged[..n].iter()) {
-            dst.write(unsafe { src.assume_init() });
-        }
-        self.count = n;
-    }
-
-    pub fn apply_delta_from(&mut self, base: &ThreatList, gone: &[u16], born: &[u16]) {
-        let base_slice = base.as_slice();
-        let (mut i, mut j, mut k, mut n) = (0usize, 0usize, 0usize, 0usize);
-        while i < base_slice.len() || k < born.len() {
-            let next_old = base_slice.get(i).copied();
-            let next_born = born.get(k).copied();
-            let value = match (next_old, next_born) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-                (None, None) => break,
-            };
-            while j < gone.len() && gone[j] < value {
-                j += 1;
-            }
-            let in_gone = j < gone.len() && gone[j] == value;
-            let in_born = next_born == Some(value);
-            if in_born || !in_gone {
-                assert!(n < MAX_THREATS, "too many active threat features");
-                self.indices[n].write(value);
-                n += 1;
-            }
-            if next_old == Some(value) {
-                i += 1;
-            }
-            if in_born {
-                k += 1;
-            }
-        }
-        self.count = n;
-    }
 }
 
 // cached board info for threat scan
@@ -1639,48 +1372,6 @@ fn emit_attacker_threats_both(board: &Board, scan: &SharedThreatScan, from: Squa
     }
 }
 
-pub fn collect_square_threats_both(board: &Board, squares: Bitboard, need: [bool; 2], out: &mut [ThreatList; 2]) {
-    if need[0] {
-        out[0].count = 0;
-    }
-    if need[1] {
-        out[1].count = 0;
-    }
-    let scan = SharedThreatScan::new(board);
-    let mut sqs = squares & board.occupied;
-    while !sqs.is_empty() {
-        let from = sqs.pop_lsb();
-        emit_attacker_threats_both(board, &scan, from, need, out);
-    }
-    if need[0] {
-        out[0].sort();
-    }
-    if need[1] {
-        out[1].sort();
-    }
-}
-
-pub fn collect_threats_both(board: &Board, need: [bool; 2], out: &mut [ThreatList; 2]) {
-    if need[0] {
-        out[0].count = 0;
-    }
-    if need[1] {
-        out[1].count = 0;
-    }
-    let scan = SharedThreatScan::new(board);
-    let mut attackers = board.occupied & !scan.kings;
-    while !attackers.is_empty() {
-        let from = attackers.pop_lsb();
-        emit_attacker_threats_both(board, &scan, from, need, out);
-    }
-    if need[0] {
-        out[0].sort();
-    }
-    if need[1] {
-        out[1].sort();
-    }
-}
-
 pub fn collect_threats_both_unsorted(board: &Board, need: [bool; 2], out: &mut [ThreatList; 2]) {
     if need[0] {
         out[0].count = 0;
@@ -1794,19 +1485,6 @@ pub fn collect_xray_threat_diffs_both(
     }
 }
 
-// collect threat features for given squares
-#[allow(dead_code)]
-pub fn collect_square_threats(board: &Board, view: Color, squares: Bitboard, out: &mut ThreatList) {
-    out.count = 0;
-    let scan = ThreatScan::new(board, view);
-    let mut squares = squares & board.occupied;
-    while !squares.is_empty() {
-        let from = squares.pop_lsb();
-        emit_attacker_threats(board, &scan, view, from, out);
-    }
-    out.sort();
-}
-
 // every piece of either color that attacks sq under the given occupancy
 fn attackers_to_square(pieces: &[Bitboard; PIECE_NB], occ: Bitboard, sq: Square) -> Bitboard {
     use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
@@ -1824,19 +1502,6 @@ fn attackers_to_square(pieces: &[Bitboard; PIECE_NB], occ: Bitboard, sq: Square)
         | king_attacks(sq) & kings
         | bishop_attacks(sq, occ) & diagonal
         | rook_attacks(sq, occ) & straight
-}
-
-// squares whose threats may change after move
-#[allow(dead_code)]
-pub fn affected_threat_squares(pieces: &[Bitboard; PIECE_NB], occ_before: Bitboard, occ_after: Bitboard, changed: Bitboard) -> Bitboard {
-    let mut squares = changed;
-    let mut rest = changed;
-    while !rest.is_empty() {
-        let sq = rest.pop_lsb();
-        squares |= attackers_to_square(pieces, occ_before, sq);
-        squares |= attackers_to_square(pieces, occ_after, sq);
-    }
-    squares
 }
 
 // applies or removes the rows of a threat index list
@@ -1869,88 +1534,6 @@ impl ThreatAccumulator {
         let mut acc = [0i16; HIDDEN_SIZE];
         apply_threat_rows(&mut acc, weights, list.as_slice(), true);
         self.vals[side] = acc;
-    }
-
-    // apply only changed threat rows
-    pub fn apply_delta_lists(&mut self, side: usize, weights: &ThreatWeights, gone: &[u16], born: &[u16]) {
-        let mut subs: [MaybeUninit<u16>; MAX_THREATS] = [MaybeUninit::uninit(); MAX_THREATS];
-        let mut adds: [MaybeUninit<u16>; MAX_THREATS] = [MaybeUninit::uninit(); MAX_THREATS];
-        let (mut i, mut j, mut ns, mut na) = (0usize, 0usize, 0usize, 0usize);
-        while i < gone.len() && j < born.len() {
-            match gone[i].cmp(&born[j]) {
-                std::cmp::Ordering::Less => {
-                    subs[ns].write(gone[i]);
-                    ns += 1;
-                    i += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    adds[na].write(born[j]);
-                    na += 1;
-                    j += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    i += 1;
-                    j += 1;
-                }
-            }
-        }
-        while i < gone.len() {
-            subs[ns].write(gone[i]);
-            ns += 1;
-            i += 1;
-        }
-        while j < born.len() {
-            adds[na].write(born[j]);
-            na += 1;
-            j += 1;
-        }
-        if ns + na > born.len() {
-            let mut acc = [0i16; HIDDEN_SIZE];
-            apply_threat_rows(&mut acc, weights, born, true);
-            self.vals[side] = acc;
-            return;
-        }
-        let subs = unsafe { std::slice::from_raw_parts(subs.as_ptr().cast::<u16>(), ns) };
-        let adds = unsafe { std::slice::from_raw_parts(adds.as_ptr().cast::<u16>(), na) };
-        self.apply_lists(side, weights, subs, adds);
-    }
-
-    // same as apply_delta_lists without full rebuild fallback
-    pub fn apply_partial_delta_lists(&mut self, side: usize, weights: &ThreatWeights, gone: &[u16], born: &[u16]) {
-        let mut subs: [MaybeUninit<u16>; MAX_THREATS] = [MaybeUninit::uninit(); MAX_THREATS];
-        let mut adds: [MaybeUninit<u16>; MAX_THREATS] = [MaybeUninit::uninit(); MAX_THREATS];
-        let (mut i, mut j, mut ns, mut na) = (0usize, 0usize, 0usize, 0usize);
-        while i < gone.len() && j < born.len() {
-            match gone[i].cmp(&born[j]) {
-                std::cmp::Ordering::Less => {
-                    subs[ns].write(gone[i]);
-                    ns += 1;
-                    i += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    adds[na].write(born[j]);
-                    na += 1;
-                    j += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    i += 1;
-                    j += 1;
-                }
-            }
-        }
-        while i < gone.len() {
-            subs[ns].write(gone[i]);
-            ns += 1;
-            i += 1;
-        }
-        while j < born.len() {
-            adds[na].write(born[j]);
-            na += 1;
-            j += 1;
-        }
-        let subs = unsafe { std::slice::from_raw_parts(subs.as_ptr().cast::<u16>(), ns) };
-        let adds = unsafe { std::slice::from_raw_parts(adds.as_ptr().cast::<u16>(), na) };
-        self.apply_lists(side, weights, subs, adds);
     }
 
     // applies a known set of removed and added rows directly
@@ -2686,52 +2269,6 @@ unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn vec_delta_avx2(
-    vals: &mut [i16; HIDDEN_SIZE],
-    add1: &[i16; HIDDEN_SIZE],
-    add2: &[i16; HIDDEN_SIZE],
-    sub1: &[i16; HIDDEN_SIZE],
-    sub2: &[i16; HIDDEN_SIZE],
-) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let d_ptr = vals.as_mut_ptr() as *mut __m256i;
-        let a1_ptr = add1.as_ptr() as *const __m256i;
-        let a2_ptr = add2.as_ptr() as *const __m256i;
-        let s1_ptr = sub1.as_ptr() as *const __m256i;
-        let s2_ptr = sub2.as_ptr() as *const __m256i;
-
-        for i in 0..(HIDDEN_SIZE / 16) {
-            let v = _mm256_loadu_si256(d_ptr.add(i));
-            let v = _mm256_add_epi16(v, _mm256_loadu_si256(a1_ptr.add(i)));
-            let v = _mm256_add_epi16(v, _mm256_loadu_si256(a2_ptr.add(i)));
-            let v = _mm256_sub_epi16(v, _mm256_loadu_si256(s1_ptr.add(i)));
-            let v = _mm256_sub_epi16(v, _mm256_loadu_si256(s2_ptr.add(i)));
-            _mm256_storeu_si256(d_ptr.add(i), v);
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn vec_delta_avx2_11(vals: &mut [i16; HIDDEN_SIZE], add: &[i16; HIDDEN_SIZE], sub: &[i16; HIDDEN_SIZE]) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let d_ptr = vals.as_mut_ptr() as *mut __m256i;
-        let a_ptr = add.as_ptr() as *const __m256i;
-        let s_ptr = sub.as_ptr() as *const __m256i;
-
-        for i in 0..(HIDDEN_SIZE / 16) {
-            let v = _mm256_loadu_si256(d_ptr.add(i));
-            let v = _mm256_add_epi16(v, _mm256_loadu_si256(a_ptr.add(i)));
-            let v = _mm256_sub_epi16(v, _mm256_loadu_si256(s_ptr.add(i)));
-            _mm256_storeu_si256(d_ptr.add(i), v);
-        }
-    }
-}
-
 // pairwise activation using mulhi
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -3036,52 +2573,6 @@ unsafe fn vec_add_avx512(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SI
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn vec_delta_avx512_11(vals: &mut [i16; HIDDEN_SIZE], add: &[i16; HIDDEN_SIZE], sub: &[i16; HIDDEN_SIZE]) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let d_ptr = vals.as_mut_ptr() as *mut __m512i;
-        let a_ptr = add.as_ptr() as *const __m512i;
-        let s_ptr = sub.as_ptr() as *const __m512i;
-
-        for i in 0..(HIDDEN_SIZE / 32) {
-            let v = _mm512_loadu_si512(d_ptr.add(i));
-            let v = _mm512_add_epi16(v, _mm512_loadu_si512(a_ptr.add(i)));
-            let v = _mm512_sub_epi16(v, _mm512_loadu_si512(s_ptr.add(i)));
-            _mm512_storeu_si512(d_ptr.add(i), v);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
-#[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn vec_delta_avx512(
-    vals: &mut [i16; HIDDEN_SIZE],
-    add1: &[i16; HIDDEN_SIZE],
-    add2: &[i16; HIDDEN_SIZE],
-    sub1: &[i16; HIDDEN_SIZE],
-    sub2: &[i16; HIDDEN_SIZE],
-) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let d_ptr = vals.as_mut_ptr() as *mut __m512i;
-        let a1_ptr = add1.as_ptr() as *const __m512i;
-        let a2_ptr = add2.as_ptr() as *const __m512i;
-        let s1_ptr = sub1.as_ptr() as *const __m512i;
-        let s2_ptr = sub2.as_ptr() as *const __m512i;
-
-        for i in 0..(HIDDEN_SIZE / 32) {
-            let v = _mm512_loadu_si512(d_ptr.add(i));
-            let v = _mm512_add_epi16(v, _mm512_loadu_si512(a1_ptr.add(i)));
-            let v = _mm512_add_epi16(v, _mm512_loadu_si512(a2_ptr.add(i)));
-            let v = _mm512_sub_epi16(v, _mm512_loadu_si512(s1_ptr.add(i)));
-            let v = _mm512_sub_epi16(v, _mm512_loadu_si512(s2_ptr.add(i)));
-            _mm512_storeu_si512(d_ptr.add(i), v);
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
-#[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn evaluate_avx512(acc: &Accumulator, us: usize, them: usize, bucket: usize, net: &'static Network) -> i32 {
     use std::arch::x86_64::*;
 
@@ -3130,50 +2621,6 @@ unsafe fn vec_add_neon(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
             let va = vld1q_s16(a_ptr.add(i));
             let vw = vld1q_s16(w_ptr.add(i));
             vst1q_s16(a_ptr.add(i), vaddq_s16(va, vw));
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn vec_delta_neon_11(vals: &mut [i16; HIDDEN_SIZE], add: &[i16; HIDDEN_SIZE], sub: &[i16; HIDDEN_SIZE]) {
-    use std::arch::aarch64::*;
-    unsafe {
-        let d_ptr = vals.as_mut_ptr();
-        let a_ptr = add.as_ptr();
-        let s_ptr = sub.as_ptr();
-
-        for i in (0..HIDDEN_SIZE).step_by(8) {
-            let mut v = vld1q_s16(d_ptr.add(i));
-            v = vaddq_s16(v, vld1q_s16(a_ptr.add(i)));
-            v = vsubq_s16(v, vld1q_s16(s_ptr.add(i)));
-            vst1q_s16(d_ptr.add(i), v);
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn vec_delta_neon(
-    vals: &mut [i16; HIDDEN_SIZE],
-    add1: &[i16; HIDDEN_SIZE],
-    add2: &[i16; HIDDEN_SIZE],
-    sub1: &[i16; HIDDEN_SIZE],
-    sub2: &[i16; HIDDEN_SIZE],
-) {
-    use std::arch::aarch64::*;
-    unsafe {
-        let d_ptr = vals.as_mut_ptr();
-        let a1_ptr = add1.as_ptr();
-        let a2_ptr = add2.as_ptr();
-        let s1_ptr = sub1.as_ptr();
-        let s2_ptr = sub2.as_ptr();
-
-        for i in (0..HIDDEN_SIZE).step_by(8) {
-            let mut v = vld1q_s16(d_ptr.add(i));
-            v = vaddq_s16(v, vld1q_s16(a1_ptr.add(i)));
-            v = vaddq_s16(v, vld1q_s16(a2_ptr.add(i)));
-            v = vsubq_s16(v, vld1q_s16(s1_ptr.add(i)));
-            v = vsubq_s16(v, vld1q_s16(s2_ptr.add(i)));
-            vst1q_s16(d_ptr.add(i), v);
         }
     }
 }

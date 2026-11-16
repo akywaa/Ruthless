@@ -95,6 +95,18 @@ pub enum Piece {
     None = 12,
 }
 
+const PIECE_COLORS: [Color; 13] = [
+    Color::White, Color::White, Color::White, Color::White, Color::White, Color::White,
+    Color::Black, Color::Black, Color::Black, Color::Black, Color::Black, Color::Black,
+    Color::White,
+];
+
+const PIECE_TYPES: [PieceType; 13] = [
+    PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen, PieceType::King,
+    PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen, PieceType::King,
+    PieceType::None,
+];
+
 impl Piece {
     #[inline(always)]
     pub const fn new(color: Color, piece_type: PieceType) -> Self {
@@ -103,21 +115,18 @@ impl Piece {
     }
 
     #[inline(always)]
+    pub const fn from_index(idx: usize) -> Self {
+        if idx < 12 { unsafe { std::mem::transmute(idx as u8) } } else { Self::None }
+    }
+
+    #[inline(always)]
     pub const fn color(self) -> Color {
-        if (self as usize) == 12 {
-            Color::White
-        } else {
-            Color::from_index((self as usize) / 6)
-        }
+        PIECE_COLORS[self as usize]
     }
 
     #[inline(always)]
     pub const fn piece_type(self) -> PieceType {
-        if (self as usize) == 12 {
-            PieceType::None
-        } else {
-            PieceType::from_index((self as usize) % 6)
-        }
+        PIECE_TYPES[self as usize]
     }
 }
 

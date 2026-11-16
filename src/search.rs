@@ -81,6 +81,7 @@ pub struct Searcher {
     pub tt: Arc<TranspositionTable>,
     pub nodes: u64,
     pub stop: Arc<AtomicBool>,
+    pub stopped: bool,
     pub thread_id: usize,
     pub num_threads: usize,
     pub shared_nodes: Arc<AtomicU64>,
@@ -103,7 +104,7 @@ pub struct Searcher {
     pub corr_limit: i32,
     killers: [[Move; 2]; MAX_PLY],
     history: HugeBox<MainHistory>,
-    pawn_history: HugeBox<[[[i32; 64]; 12]; 512]>,
+    pawn_history: HugeBox<[[[i16; 64]; 12]; 512]>,
     noisy_history: HugeBox<[[[[i32; 2]; 6]; 64]; 12]>,
     counter_moves: [[Move; 64]; 64],
     conthist: HugeBox<ContHist>,
@@ -182,6 +183,7 @@ impl Searcher {
             tt,
             nodes: 0,
             stop,
+            stopped: false,
             thread_id,
             num_threads,
             shared_nodes,
@@ -348,7 +350,7 @@ impl Searcher {
         let to_th = pawn_threats.contains(m.to()) as usize;
 
         self.history[us][from_th][to_th][m.from() as usize][m.to() as usize]
-            + self.pawn_history[p_idx][piece as usize][m.to() as usize]
+            + self.pawn_history[p_idx][piece as usize][m.to() as usize] as i32
             + self.get_conthist(board, ply, m)
     }
 
@@ -398,6 +400,7 @@ impl Searcher {
         }
 
         self.nodes = 0;
+        self.stopped = false;
         self.nodes_at_last_check = 0;
         self.start_time = Instant::now();
         self.tt.new_search();
@@ -450,7 +453,7 @@ impl Searcher {
 
                 loop {
                     score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false, root_in_check);
-                    if self.stop.load(Ordering::Relaxed) {
+                    if self.stopped {
                         break;
                     }
 
@@ -485,7 +488,7 @@ impl Searcher {
                 score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false, root_in_check);
             }
 
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stopped {
                 break;
             }
 
@@ -580,6 +583,7 @@ impl Searcher {
 
                 if past_soft || past_hard {
                     self.stop.store(true, Ordering::Relaxed);
+                    self.stopped = true;
                     break;
                 }
             }
@@ -594,6 +598,7 @@ impl Searcher {
     pub fn search_helper(&mut self, board: &mut Board, max_depth: u8, soft_time: Option<u128>) {
         board.root_ply = board.hist_len;
         self.nodes = 0;
+        self.stopped = false;
         self.rfp_base = crate::search::RFP_BASE.load(Ordering::Relaxed);
         self.rfp_improving = crate::search::RFP_IMPROVING.load(Ordering::Relaxed);
         self.futility_base = crate::search::FUTILITY_BASE.load(Ordering::Relaxed);
@@ -616,7 +621,7 @@ impl Searcher {
 
         for depth in start_depth..=target_depth {
             self.root_moves.clear();
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stopped {
                 break;
             }
 
@@ -630,7 +635,7 @@ impl Searcher {
 
                 loop {
                     score = self.negamax(board, depth, 0, alpha, beta, true, Move::NULL, false, root_in_check);
-                    if self.stop.load(Ordering::Relaxed) {
+                    if self.stopped {
                         break;
                     }
 
@@ -665,7 +670,7 @@ impl Searcher {
                 score = self.negamax(board, depth, 0, -INFINITY, INFINITY, true, Move::NULL, false, root_in_check);
             }
 
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stopped {
                 break;
             }
 
@@ -706,9 +711,14 @@ impl Searcher {
     }
 
     fn check_time(&mut self) {
+        if self.stop.load(Ordering::Relaxed) {
+            self.stopped = true;
+            return;
+        }
         if let Some(limit) = self.node_limit {
             if self.nodes >= limit {
                 self.stop.store(true, Ordering::Relaxed);
+                self.stopped = true;
                 return;
             }
         }
@@ -718,6 +728,7 @@ impl Searcher {
             if let Some(limit) = self.node_limit {
                 if total_nodes >= limit {
                     self.stop.store(true, Ordering::Relaxed);
+                    self.stopped = true;
                     return;
                 }
             }
@@ -726,6 +737,7 @@ impl Searcher {
             if let Some(hard_limit) = self.hard_time_ms {
                 if elapsed >= hard_limit {
                     self.stop.store(true, Ordering::Relaxed);
+                    self.stopped = true;
                 }
             }
         }
@@ -743,7 +755,7 @@ impl Searcher {
         cut_node: bool,
         in_check: bool,
     ) -> i32 {
-        if self.stop.load(Ordering::Relaxed) {
+        if self.stopped {
             return 0;
         }
 
@@ -788,7 +800,7 @@ impl Searcher {
         }
 
         self.check_time();
-        if self.stop.load(Ordering::Relaxed) {
+        if self.stopped {
             return 0;
         }
 
@@ -1089,7 +1101,7 @@ impl Searcher {
 
             let score = self.negamax(board, singular_depth, ply, singular_beta - 1, singular_beta, false, tt_move, cut_node, in_check);
 
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stopped {
                 return 0;
             }
 
@@ -1378,13 +1390,13 @@ impl Searcher {
             }
             moves_searched += 1;
 
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stopped {
                 return 0;
             }
 
             if score > best_score {
                 best_score = score;
-                if ply == 0 && !self.stop.load(Ordering::Relaxed) {
+                if ply == 0 && !self.stopped {
                     self.root_best_move_pending = m;
                 }
             }
@@ -1423,7 +1435,7 @@ impl Searcher {
 
                     update_history(&mut self.history[us][m_from_th][m_to_th][m.from() as usize][m.to() as usize], bonus);
                     if moving_pc < 12 {
-                        update_history(&mut self.pawn_history[p_idx][moving_pc][m.to() as usize], bonus);
+                        update_history_i16(&mut self.pawn_history[p_idx][moving_pc][m.to() as usize], bonus);
                     }
                     self.update_conthist(ply, board.piece_on[m.from()], m, bonus);
 
@@ -1438,7 +1450,7 @@ impl Searcher {
                             let q_from_th = pt.contains(qm.from()) as usize;
                             let q_to_th = pt.contains(qm.to()) as usize;
                             update_history(&mut self.history[us][q_from_th][q_to_th][qm.from() as usize][qm.to() as usize], -malus);
-                            update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -malus);
+                            update_history_i16(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -malus);
                             self.update_conthist(ply, board.piece_on[qm.from()], qm, -malus);
                         }
                     }
@@ -1522,7 +1534,7 @@ impl Searcher {
             }
         }
 
-        if excluded_move == Move::NULL && !self.stop.load(Ordering::Relaxed) {
+        if excluded_move == Move::NULL && !self.stopped {
             self.tt.store(
                 board.tt_hash,
                 score_to_tt(best_score, ply),
@@ -1594,7 +1606,7 @@ impl Searcher {
 
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u8, qply: u8, in_check: bool) -> i32 {
         self.check_time();
-        if self.stop.load(Ordering::Relaxed) {
+        if self.stopped {
             return 0;
         }
 
@@ -1711,7 +1723,7 @@ impl Searcher {
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1, child_check);
                 board.undo_move(m, undo);
 
-                if self.stop.load(Ordering::Relaxed) {
+                if self.stopped {
                     return 0;
                 }
 
@@ -1799,7 +1811,7 @@ impl Searcher {
             let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1, child_check);
             board.undo_move(m, undo);
 
-            if self.stop.load(Ordering::Relaxed) {
+            if self.stopped {
                 return 0;
             }
 
@@ -1827,7 +1839,7 @@ impl Searcher {
         }
 
         // store finished qsearch node in tt
-        if !self.stop.load(Ordering::Relaxed) && qply == 0 {
+        if !self.stopped && qply == 0 {
             let flag = if best_score >= beta {
                 TTFlag::LowerBound
             } else if best_score > alpha_orig {

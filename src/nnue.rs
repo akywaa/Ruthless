@@ -65,16 +65,32 @@ pub struct Network {
 
 static NETWORK_BYTES: &[u8] = include_bytes!("../resources/ruthless.bin");
 
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::OnceLock;
+
 #[repr(C, align(64))]
 struct ZeroWeights([i16; HIDDEN_SIZE]);
 
 static ZERO_WEIGHTS: ZeroWeights = ZeroWeights([0; HIDDEN_SIZE]);
 
-static NETWORK_ALIGNED: std::sync::OnceLock<&'static Network> = std::sync::OnceLock::new();
+static NETWORK_PTR: AtomicPtr<Network> = AtomicPtr::new(std::ptr::null_mut());
+static NETWORK_INIT: OnceLock<&'static Network> = OnceLock::new();
 
 #[inline(always)]
 pub fn network() -> &'static Network {
-    *NETWORK_ALIGNED.get_or_init(init_network)
+    let ptr = NETWORK_PTR.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        return unsafe { &*ptr };
+    }
+    init_network_cold()
+}
+
+#[cold]
+#[inline(never)]
+fn init_network_cold() -> &'static Network {
+    let net = NETWORK_INIT.get_or_init(init_network);
+    NETWORK_PTR.store(*net as *const Network as *mut Network, Ordering::Release);
+    net
 }
 
 // copies one 512-lane weight row out of the little-endian network image
@@ -700,62 +716,7 @@ pub fn is_mirrored_view(ksq: Square, view: Color) -> bool {
     oriented_ksq.file() > 3
 }
 
-#[repr(C, align(64))]
-#[derive(Copy, Clone)]
-pub struct FinnyEntry {
-    pub vals: [i16; HIDDEN_SIZE],
-    pub pieces: [Bitboard; PIECE_NB],
-    pub initialized: bool,
-}
 
-pub type FinnyTable = [[[FinnyEntry; 2]; NUM_INPUT_BUCKETS]; 2];
-
-#[inline(always)]
-pub fn refresh_side_with_finny(
-    entry: &mut FinnyEntry,
-    board_pieces: &[Bitboard; PIECE_NB],
-    ksq: Square,
-    color: Color,
-) -> [i16; HIDDEN_SIZE] {
-    let net = network();
-    if !entry.initialized {
-        entry.vals = net.feature_bias.vals;
-        entry.pieces = [Bitboard::EMPTY; PIECE_NB];
-        entry.initialized = true;
-    }
-
-    let mut adds = [0u16; 32];
-    let mut subs = [0u16; 32];
-    let mut add_count = 0usize;
-    let mut sub_count = 0usize;
-
-    for p in 0..PIECE_NB {
-        let cur = board_pieces[p];
-        let prev = entry.pieces[p];
-        if cur == prev {
-            continue;
-        }
-        let piece = Piece::new(Color::from_index(p / 6), PieceType::from_index(p % 6));
-        let mut added = cur & !prev;
-        while !added.is_empty() {
-            let sq = added.pop_lsb();
-            adds[add_count] = feature_index_side(piece, sq, ksq, color) as u16;
-            add_count += 1;
-        }
-        let mut removed = prev & !cur;
-        while !removed.is_empty() {
-            let sq = removed.pop_lsb();
-            subs[sub_count] = feature_index_side(piece, sq, ksq, color) as u16;
-            sub_count += 1;
-        }
-        entry.pieces[p] = cur;
-    }
-
-    if add_count > 0 || sub_count > 0 {
-        apply_psq_lists(&mut entry.vals, net, &adds[..add_count], &subs[..sub_count]);
-    }
-    entry.vals
-}
 
 #[inline(always)]
 fn apply_psq_lists(vals: &mut [i16; HIDDEN_SIZE], net: &'static Network, adds: &[u16], subs: &[u16]) {
@@ -831,6 +792,65 @@ unsafe fn apply_psq_lists_avx2(vals: &mut [i16; HIDDEN_SIZE], net: &'static Netw
             base += 128;
         }
     }
+}
+
+// FinnyTable for incremental accumulator updates
+#[repr(C, align(64))]
+#[derive(Copy, Clone)]
+pub struct FinnyEntry {
+    pub vals: [i16; HIDDEN_SIZE],
+    pub pieces: [Bitboard; PIECE_NB],
+    pub initialized: bool,
+}
+
+pub type FinnyTable = [[[FinnyEntry; 2]; NUM_INPUT_BUCKETS]; 2];
+
+#[inline(always)]
+pub fn refresh_side_with_finny(
+    entry: &mut FinnyEntry,
+    board_pieces: &[Bitboard; PIECE_NB],
+    ksq: Square,
+    color: Color,
+    dst: &mut [i16; HIDDEN_SIZE],
+) {
+    let net = network();
+    if !entry.initialized {
+        entry.vals = net.feature_bias.vals;
+        entry.pieces = [Bitboard::EMPTY; PIECE_NB];
+        entry.initialized = true;
+    }
+
+    let mut adds = [0u16; 32];
+    let mut subs = [0u16; 32];
+    let mut add_count = 0usize;
+    let mut sub_count = 0usize;
+
+    for p in 0..PIECE_NB {
+        let cur = board_pieces[p];
+        let prev = entry.pieces[p];
+        if cur == prev {
+            continue;
+        }
+        let piece = Piece::from_index(p);
+        let mut added = cur & !prev;
+        while !added.is_empty() {
+            let sq = added.pop_lsb();
+            adds[add_count] = feature_index_side(piece, sq, ksq, color) as u16;
+            add_count += 1;
+        }
+        let mut removed = prev & !cur;
+        while !removed.is_empty() {
+            let sq = removed.pop_lsb();
+            subs[sub_count] = feature_index_side(piece, sq, ksq, color) as u16;
+            sub_count += 1;
+        }
+        entry.pieces[p] = cur;
+    }
+
+    if add_count > 0 || sub_count > 0 {
+        apply_psq_lists(&mut entry.vals, net, &adds[..add_count], &subs[..sub_count]);
+    }
+    *dst = entry.vals;
 }
 
 // empty slot marker
@@ -1212,13 +1232,32 @@ struct ThreatTables {
     attack: [[[[[u16; 2]; 6]; 2]; 6]; 2],
     // precomputed empty-board attacks for popcnt indexing, 6 KB vs 48 KB
     pseudo_attacks: [[[Bitboard; 64]; 6]; 2],
+
+    // flat tables for fast threat_index_fast: [side][attacker_piece][victim_piece]
+    // side: 0=white, 1=black; piece index 0..11 (Piece enum, excluding None)
+    attack_by_piece: [[[[u16; 2]; 12]; 12]; 2],
+    offsets_by_piece: [[[u16; 64]; 12]; 2],
+    pseudo_by_piece: [[[Bitboard; 64]; 12]; 2],
 }
 
-static THREAT_TABLES: std::sync::OnceLock<ThreatTables> = std::sync::OnceLock::new();
+static THREAT_TABLES_PTR: AtomicPtr<ThreatTables> = AtomicPtr::new(std::ptr::null_mut());
+static THREAT_TABLES_INIT: OnceLock<ThreatTables> = OnceLock::new();
 
 #[inline(always)]
 fn threat_tables() -> &'static ThreatTables {
-    THREAT_TABLES.get_or_init(init_threat_tables)
+    let ptr = THREAT_TABLES_PTR.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        return unsafe { &*ptr };
+    }
+    init_threat_tables_cold()
+}
+
+#[cold]
+#[inline(never)]
+fn init_threat_tables_cold() -> &'static ThreatTables {
+    let tables = THREAT_TABLES_INIT.get_or_init(init_threat_tables);
+    THREAT_TABLES_PTR.store(tables as *const ThreatTables as *mut ThreatTables, Ordering::Release);
+    tables
 }
 
 // piece attacks in feature space
@@ -1300,6 +1339,22 @@ fn init_threat_tables() -> ThreatTables {
                 }
             }
         }
+}
+
+// Populate flat tables for fast threat_index_fast
+    for side in 0..2 {
+        let view = Color::from_index(side);
+        for ap in 0..12 {
+            let oa = oriented_piece(Piece::from_index(ap), view);
+            let (acolor, akind) = (oa / 6, oa % 6);
+            tables.offsets_by_piece[side][ap] = tables.offsets[acolor][akind];
+            tables.pseudo_by_piece[side][ap] = tables.pseudo_attacks[acolor][akind];
+            for vp in 0..12 {
+                let ov = oriented_piece(Piece::from_index(vp), view);
+                let (vcolor, vkind) = (ov / 6, ov % 6);
+                tables.attack_by_piece[side][ap][vp] = tables.attack[acolor][akind][vcolor][vkind];
+            }
+        }
     }
 
     tables
@@ -1307,6 +1362,7 @@ fn init_threat_tables() -> ThreatTables {
 
 // compute threat feature index
 #[inline(always)]
+#[allow(dead_code)]
 fn threat_index(tables: &'static ThreatTables, mask: u8, attacker: usize, from: Square, victim: usize, to: Square) -> Option<u16> {
     const PIECE_COLOR: [usize; 12] = [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
     const PIECE_KIND: [usize; 12] = [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5];
@@ -1326,6 +1382,34 @@ fn threat_index(tables: &'static ThreatTables, mask: u8, attacker: usize, from: 
     let index = base + tables.offsets[acolor][akind][from] + u16::from((attacks.0 & below_mask).count_ones() as u16);
     debug_assert!((index as usize) < TOTAL_THREATS);
     Some(index)
+}
+
+// fast threat index using flat tables
+#[inline(always)]
+fn threat_index_fast(
+    tables: &'static ThreatTables,
+    side: usize,
+    mask: u8,
+    attacker: Piece,
+    from: Square,
+    victim: Piece,
+    to: Square,
+) -> Option<u16> {
+    let a = attacker as usize;
+    let v = victim as usize;
+    debug_assert!(a < 12 && v < 12);
+    let from_lbl = (from as u8 ^ mask) as usize;
+    let to_lbl = (to as u8 ^ mask) as usize;
+    let base = unsafe {
+        *tables.attack_by_piece.get_unchecked(side).get_unchecked(a).get_unchecked(v).get_unchecked(usize::from(from_lbl < to_lbl))
+    };
+    if base == THREAT_SENTINEL {
+        return None;
+    }
+    let attacks = unsafe { *tables.pseudo_by_piece.get_unchecked(side).get_unchecked(a).get_unchecked(from_lbl) };
+    let offset = unsafe { *tables.offsets_by_piece.get_unchecked(side).get_unchecked(a).get_unchecked(from_lbl) };
+    let below_mask = (1u64 << to_lbl) - 1;
+    Some(base + offset + (attacks.0 & below_mask).count_ones() as u16)
 }
 
 // sorted active threat indices (uninit buffer to skip zeroing)
@@ -1424,7 +1508,7 @@ fn emit_attacker_threats(board: &Board, scan: &ThreatScan, view: Color, from: Sq
     let attacker = board.piece_on[from];
     let akind = attacker.piece_type() as usize;
     let from_label = (from as u8 ^ scan.mask) as usize;
-    let attacker_idx = oriented_piece(attacker, view);
+    // let attacker_idx = oriented_piece(attacker, view); // no longer needed
 
     // index same-type pairs once (except pawn defenses)
     let mut same_type = scan.by_type[akind];
@@ -1439,7 +1523,7 @@ fn emit_attacker_threats(board: &Board, scan: &ThreatScan, view: Color, from: Sq
             continue;
         }
         let victim = board.piece_on[to];
-        if let Some(index) = threat_index(scan.tables, scan.mask, attacker_idx, from, oriented_piece(victim, view), to) {
+        if let Some(index) = threat_index_fast(scan.tables, view as usize, scan.mask, attacker, from, victim, to) {
             out.push(index);
         }
     }
@@ -1525,8 +1609,8 @@ fn emit_attacker_threats_both(board: &Board, scan: &SharedThreatScan, from: Squa
             if is_same && (to as u8 ^ mask) as usize > from_label {
                 continue;
             }
-            let view = Color::from_index(side);
-            if let Some(index) = threat_index(scan.tables, mask, oriented_piece(attacker, view), from, oriented_piece(victim, view), to) {
+            // let view = Color::from_index(side); // no longer needed
+            if let Some(index) = threat_index_fast(scan.tables, side, mask, attacker, from, victim, to) {
                 out[side].push(index);
             }
         }
@@ -1554,15 +1638,8 @@ fn push_threat_both(scan: &SharedThreatScan, attacker: Piece, from: Square, vict
         if !need[side] {
             continue;
         }
-        let view = Color::from_index(side);
-        if let Some(index) = threat_index(
-            scan.tables,
-            scan.masks[side],
-            oriented_piece(attacker, view),
-            from,
-            oriented_piece(victim, view),
-            to,
-        ) {
+        // let view = Color::from_index(side); // no longer needed
+        if let Some(index) = threat_index_fast(scan.tables, side, scan.masks[side], attacker, from, victim, to) {
             out[side].push(index);
         }
     }
@@ -1825,10 +1902,25 @@ pub fn prefetch_threat_rows(weights: &ThreatWeights, list: &[u16]) {
 
 // get threat weights if using multilayer net
 #[allow(dead_code)]
+static THREAT_WEIGHTS_PTR: AtomicPtr<Option<&'static ThreatWeights>> = AtomicPtr::new(std::ptr::null_mut());
+static THREAT_WEIGHTS_INIT: OnceLock<Option<&'static ThreatWeights>> = OnceLock::new();
+
+#[allow(dead_code)]
 #[inline(always)]
 pub fn threat_weights() -> Option<&'static ThreatWeights> {
-    static CACHE: std::sync::OnceLock<Option<&'static ThreatWeights>> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| network().multilayer.as_deref().and_then(|net| net.threat_weights.as_deref()))
+    let ptr = THREAT_WEIGHTS_PTR.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        return unsafe { *ptr };
+    }
+    init_threat_weights_cold()
+}
+
+#[cold]
+#[inline(never)]
+fn init_threat_weights_cold() -> Option<&'static ThreatWeights> {
+    let weights = THREAT_WEIGHTS_INIT.get_or_init(|| network().multilayer.as_deref().and_then(|net| net.threat_weights.as_deref()));
+    THREAT_WEIGHTS_PTR.store(weights as *const Option<&'static ThreatWeights> as *mut Option<&'static ThreatWeights>, Ordering::Release);
+    *weights
 }
 
 #[cfg(target_arch = "x86_64")]

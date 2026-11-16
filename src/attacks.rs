@@ -1,5 +1,6 @@
 use crate::bitboard::Bitboard;
 use crate::types::{Color, SQUARE_NB, Square};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
 pub struct Magic {
@@ -122,14 +123,24 @@ const fn init_between() -> [[Bitboard; SQUARE_NB]; SQUARE_NB] {
 }
 
 // still behind OnceLock because the tables need runtime allocation for slider magics
-static SLIDER_TABLES: OnceLock<SliderTables> = OnceLock::new();
+static SLIDER_TABLES_PTR: AtomicPtr<SliderTables> = AtomicPtr::new(std::ptr::null_mut());
+static SLIDER_TABLES_INIT: OnceLock<SliderTables> = OnceLock::new();
 
 #[inline(always)]
 pub fn slider_tables() -> &'static SliderTables {
-    if let Some(t) = SLIDER_TABLES.get() {
-        return t;
+    let ptr = SLIDER_TABLES_PTR.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        return unsafe { &*ptr };
     }
-    SLIDER_TABLES.get_or_init(SliderTables::init)
+    init_slider_tables_cold()
+}
+
+#[cold]
+#[inline(never)]
+fn init_slider_tables_cold() -> &'static SliderTables {
+    let tables = SLIDER_TABLES_INIT.get_or_init(SliderTables::init);
+    SLIDER_TABLES_PTR.store(tables as *const SliderTables as *mut SliderTables, Ordering::Release);
+    tables
 }
 
 #[inline(always)]
@@ -153,9 +164,9 @@ pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let m = &tables.bishop_magics[sq as usize];
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     if tables.use_pext {
-        return tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)];
+        return unsafe { *tables.slider_pext.get_unchecked(m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)) };
     }
-    tables.slider_magic[m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)]
+    unsafe { *tables.slider_magic.get_unchecked(m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)) }
 }
 
 #[inline(always)]
@@ -164,9 +175,9 @@ pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
     let m = &tables.rook_magics[sq as usize];
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     if tables.use_pext {
-        return tables.slider_pext[m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)];
+        return unsafe { *tables.slider_pext.get_unchecked(m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)) };
     }
-    tables.slider_magic[m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)]
+    unsafe { *tables.slider_magic.get_unchecked(m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)) }
 }
 
 #[inline(always)]

@@ -204,38 +204,34 @@ impl Board {
     pub fn refresh_accumulator(&mut self) {
         let w_ksq = self.king_square(Color::White);
         let b_ksq = self.king_square(Color::Black);
+        let pieces = self.pieces;
+        let d = self.acc_depth;
 
-        // Update Finny entries for both sides
-        // White side
         let w_bucket = crate::nnue::king_bucket_view(w_ksq, Color::White);
-        let w_mirrored = crate::nnue::is_mirrored_view(w_ksq, Color::White) as usize;
-
-        // Black side
+        let w_mirrored = crate::nnue::is_mirrored_view(w_ksq, Color::White);
         let b_bucket = crate::nnue::king_bucket_view(b_ksq, Color::Black);
-        let b_mirrored = crate::nnue::is_mirrored_view(b_ksq, Color::Black) as usize;
+        let b_mirrored = crate::nnue::is_mirrored_view(b_ksq, Color::Black);
 
-        // Call Finny functions first, then get frame
-        let w_vals = crate::nnue::refresh_side_with_finny(
-            &mut self.finny[0][w_bucket][w_mirrored],
-            &self.pieces,
+        crate::nnue::refresh_side_with_finny(
+            &mut self.finny[0][w_bucket][w_mirrored as usize],
+            &pieces,
             w_ksq,
             Color::White,
+            &mut self.acc_frames[d].accumulator.vals[0],
         );
-        let b_vals = crate::nnue::refresh_side_with_finny(
-            &mut self.finny[1][b_bucket][b_mirrored],
-            &self.pieces,
+        crate::nnue::refresh_side_with_finny(
+            &mut self.finny[1][b_bucket][b_mirrored as usize],
+            &pieces,
             b_ksq,
             Color::Black,
+            &mut self.acc_frames[d].accumulator.vals[1],
         );
 
         let frame = self.acc_frame();
-        frame.accumulator.vals[0] = w_vals;
-        frame.accumulator.vals[1] = b_vals;
         frame.dirty = [false, false];
         frame.refresh = [false, false];
         frame.ksq = [w_ksq, b_ksq];
 
-        let d = self.acc_depth;
         let threat_frame = self.threat_frame();
         threat_frame.threat = ThreatAccumulator::new();
         threat_frame.threat_base = d;
@@ -267,12 +263,14 @@ impl Board {
                 let color = Color::from_index(side);
                 let ksq = self.king_square(color);
                 let bucket = crate::nnue::king_bucket_view(ksq, color);
-                let mirrored = crate::nnue::is_mirrored_view(ksq, color) as usize;
-                self.acc_frames[d].accumulator.vals[side] = crate::nnue::refresh_side_with_finny(
-                    &mut self.finny[side][bucket][mirrored],
-                    &self.pieces,
+                let mirrored = crate::nnue::is_mirrored_view(ksq, color);
+                let pieces = self.pieces;
+                crate::nnue::refresh_side_with_finny(
+                    &mut self.finny[side][bucket][mirrored as usize],
+                    &pieces,
                     ksq,
                     color,
+                    &mut self.acc_frames[d].accumulator.vals[side],
                 );
                 self.acc_frames[d].dirty[side] = false;
             } else {

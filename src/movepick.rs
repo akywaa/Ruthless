@@ -28,9 +28,8 @@ pub struct MovePicker {
     killer_idx: usize,
     counter_move: Move,
     moves: MoveList,
-    // filled lazily when scoring
-    scores: [MaybeUninit<i32>; 256],
-    raw_hist: [MaybeUninit<i32>; 256],
+    // filled lazily when scoring - combined score and raw history
+    score_hist: [MaybeUninit<(i32, i32)>; 256],
     cur_idx: usize,
     // bad captures buffer
     bad_noisy: [MaybeUninit<(Move, i32)>; 64],
@@ -53,7 +52,7 @@ pub struct MovePicker {
 }
 
 impl MovePicker {
-    pub fn new(tt_move: Move, killers: [Move; 2], counter_move: Move, in_check: bool) -> Self {
+pub fn new(tt_move: Move, killers: [Move; 2], counter_move: Move, in_check: bool) -> Self {
         Self {
             stage: if tt_move != Move::NULL { Stage::TTMove } else { Stage::GenerateNoisy },
             tt_move,
@@ -61,8 +60,7 @@ impl MovePicker {
             killer_idx: 0,
             counter_move,
             moves: MoveList::new(),
-            scores: [MaybeUninit::uninit(); 256],
-            raw_hist: [MaybeUninit::uninit(); 256],
+            score_hist: [MaybeUninit::uninit(); 256],
             cur_idx: 0,
             bad_noisy: [MaybeUninit::uninit(); 64],
             bad_noisy_count: 0,
@@ -73,7 +71,7 @@ impl MovePicker {
             pinned: Bitboard::EMPTY,
             king_info_ready: false,
             check_squares: None,
-            last_see_ge_zero: true,
+            last_see_ge_zero: false,
             last_good_noisy: false,
             last_hist: 0,
             last_has_hist: false,
@@ -81,7 +79,6 @@ impl MovePicker {
         }
     }
 
-    // check if move gives direct check
     #[inline(always)]
     pub fn gives_check(&mut self, board: &Board, m: Move) -> bool {
         if self.check_squares.is_none() {
@@ -92,20 +89,19 @@ impl MovePicker {
     }
 
     #[inline(always)]
-pub fn pawn_threats(&mut self, board: &Board) -> Bitboard {
-    *self.pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats())
-}
+    pub fn pawn_threats(&mut self, board: &Board) -> Bitboard {
+        *self.pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats())
+    }
 
-pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
-    Self {
+    pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
+        Self {
             stage: if tt_move != Move::NULL { Stage::TTMove } else { Stage::GenerateNoisy },
             tt_move,
             killers: [Move::NULL; 2],
             killer_idx: 0,
             counter_move: Move::NULL,
             moves: MoveList::new(),
-            scores: [MaybeUninit::uninit(); 256],
-            raw_hist: [MaybeUninit::uninit(); 256],
+            score_hist: [MaybeUninit::uninit(); 256],
             cur_idx: 0,
             bad_noisy: [MaybeUninit::uninit(); 64],
             bad_noisy_count: 0,
@@ -116,7 +112,7 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
             pinned: Bitboard::EMPTY,
             king_info_ready: false,
             check_squares: None,
-            last_see_ge_zero: true,
+            last_see_ge_zero: false,
             last_good_noisy: false,
             last_hist: 0,
             last_has_hist: false,
@@ -193,7 +189,7 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
         &mut self,
         board: &Board,
         history: &crate::search::MainHistory,
-        pawn_history: &[[[i32; 64]; 12]; 512],
+        pawn_history: &[[[i16; 64]; 12]; 512],
         conthist: &ContHist,
         noisy_history: &[[[[i32; 2]; 6]; 64]; 12],
         ply: u8,
@@ -337,23 +333,22 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
     }
 
     fn pick_best(&mut self) -> (Move, i32) {
-        let mut best_score = unsafe { self.scores[self.cur_idx].assume_init() };
+        let mut best_score = unsafe { self.score_hist[self.cur_idx].assume_init().0 };
         let mut best_idx = self.cur_idx;
 
         for i in (self.cur_idx + 1)..self.moves.count {
-            let s = unsafe { self.scores[i].assume_init() };
+            let s = unsafe { self.score_hist[i].assume_init().0 };
             if s > best_score {
                 best_score = s;
                 best_idx = i;
             }
         }
 
-        self.scores.swap(self.cur_idx, best_idx);
+        self.score_hist.swap(self.cur_idx, best_idx);
         self.moves.swap(self.cur_idx, best_idx);
-        self.raw_hist.swap(self.cur_idx, best_idx);
 
         let m = self.moves.get(self.cur_idx);
-        let hist = unsafe { self.raw_hist[self.cur_idx].assume_init() };
+        let hist = unsafe { self.score_hist[self.cur_idx].assume_init().1 };
         self.cur_idx += 1;
         (m, hist)
     }
@@ -394,11 +389,9 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
                     score += 2000;
                 }
 
-                self.scores[i].write(score);
-                self.raw_hist[i].write(hist);
+                self.score_hist[i].write((score, hist));
             } else {
-                self.scores[i].write(0);
-                self.raw_hist[i].write(0);
+                self.score_hist[i].write((0, 0));
             }
         }
     }
@@ -407,7 +400,7 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
         &mut self,
         board: &Board,
         history: &crate::search::MainHistory,
-        pawn_history: &[[[i32; 64]; 12]; 512],
+        pawn_history: &[[[i16; 64]; 12]; 512],
         conthist: &ContHist,
         ply: u8,
         played_pieces: &[Piece; MAX_PLY],
@@ -423,6 +416,28 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
         let offsets = [1usize, 2, 4, 6];
         let ply_idx = ply as usize;
 
+        // Precompute conthist slices for each layer (fully evaluated outside the loop)
+        let mut cont_slices: [&[[i16; 64]; 12]; 4] = [&conthist[0][0][0]; 4];
+        let mut cont_len = 0usize;
+        for (layer, &offset) in offsets.iter().enumerate() {
+            if ply_idx >= offset {
+                let prev_idx = ply_idx - offset;
+                let prev_piece = played_pieces[prev_idx];
+                let prev_move = played_moves[prev_idx];
+                if prev_piece != Piece::None && prev_move != Move::NULL {
+                    cont_slices[cont_len] = &conthist[layer][prev_piece as usize][prev_move.to() as usize];
+                    cont_len += 1;
+                }
+            }
+        }
+
+        // Precompute check squares
+        let check_squares = if self.moves.count == 0 {
+            None
+        } else {
+            Some(*self.check_squares.get_or_insert_with(|| board.check_squares()))
+        };
+
         for i in 0..self.moves.count {
             let m = self.moves.get(i);
             let from = m.from();
@@ -432,25 +447,20 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
             let from_threat = pawn_threats.contains(from) as usize;
             let to_threat = pawn_threats.contains(to) as usize;
 
-            let mut hist = history[us as usize][from_threat][to_threat][from as usize][to as usize] + pawn_history[p_idx][piece as usize][to as usize];
+            let mut hist = history[us as usize][from_threat][to_threat][from as usize][to as usize] + pawn_history[p_idx][piece as usize][to as usize] as i32;
 
-            for (layer, &offset) in offsets.iter().enumerate() {
-                if ply_idx >= offset {
-                    let prev_idx = ply_idx - offset;
-                    let prev_piece = played_pieces[prev_idx];
-                    let prev_move = played_moves[prev_idx];
-                    if prev_piece != Piece::None && prev_move != Move::NULL && (piece as usize) < 12 {
-                        hist += conthist[layer][prev_piece as usize][prev_move.to() as usize][piece as usize][to as usize] as i32;
-                    }
-                }
+            for layer in 0..cont_len {
+                hist += unsafe { *cont_slices[layer].get_unchecked(piece as usize).get_unchecked(to as usize) } as i32;
             }
 
             let mut score = hist;
 
             let is_threatened_to = to_threat == 1;
 
-            if self.gives_check(board, m) && !is_threatened_to {
-                score += 2000;
+            if let Some(ref cs) = check_squares {
+                if board.gives_check_with(m, cs) && !is_threatened_to {
+                    score += 2000;
+                }
             }
 
             if from_threat == 1 && !is_threatened_to {
@@ -461,8 +471,7 @@ pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
                 score -= if pt != PieceType::Pawn { 2500 } else { 1000 };
             }
 
-            self.scores[i].write(score);
-            self.raw_hist[i].write(hist);
+            self.score_hist[i].write((score, hist));
         }
     }
 

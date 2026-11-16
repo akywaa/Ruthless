@@ -1,4 +1,5 @@
 use crate::types::{PIECE_NB, Piece, SQUARE_NB, Square};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, queen_attacks, rook_attacks};
 use crate::bitboard::Bitboard;
@@ -110,11 +111,24 @@ pub struct CuckooTable {
     pub sq_b: [Square; 8192],
 }
 
-static CUCKOO: OnceLock<CuckooTable> = OnceLock::new();
+static CUCKOO_PTR: AtomicPtr<CuckooTable> = AtomicPtr::new(std::ptr::null_mut());
+static CUCKOO_INIT: OnceLock<CuckooTable> = OnceLock::new();
 
 #[inline(always)]
 pub fn cuckoo() -> &'static CuckooTable {
-    CUCKOO.get_or_init(init_cuckoo)
+    let ptr = CUCKOO_PTR.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        return unsafe { &*ptr };
+    }
+    init_cuckoo_cold()
+}
+
+#[cold]
+#[inline(never)]
+fn init_cuckoo_cold() -> &'static CuckooTable {
+    let table = CUCKOO_INIT.get_or_init(init_cuckoo);
+    CUCKOO_PTR.store(table as *const CuckooTable as *mut CuckooTable, Ordering::Release);
+    table
 }
 
 #[inline(always)]

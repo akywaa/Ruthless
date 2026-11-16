@@ -3,14 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::board::Board;
 use crate::types::Color;
 
-/// Reserve subtracted from the clock before allocating time, so GUI/network
-/// latency cannot make the engine flag. Settable through the UCI
-/// `Move Overhead` option.
-///
-/// Trimmed from 25ms to 15ms after measuring a 50-game match: the reserve is
-/// subtracted on every move, so at 10+0.1 it quietly gives away ~10% of the
-/// clock over a 65-move game (Ruthless spent 89.9% of its budget, the opponent
-/// 96.7%). 15ms still covers a local pipe round trip with a wide margin.
+// move overhead in ms
 pub static MOVE_OVERHEAD_MS: AtomicU64 = AtomicU64::new(15);
 
 #[inline(always)]
@@ -30,17 +23,16 @@ pub struct TimeControl {
     pub binc: u128,
     pub movestogo: Option<u128>,
     pub movetime: Option<u128>,
-    /// `go nodes`: stop after this many nodes instead of by the clock.
+    // go nodes: stop after this many nodes instead of by the clock
     pub nodes: Option<u64>,
 }
 
 pub struct TimeLimits {
     pub soft_limit: Option<u128>,
     pub hard_limit: Option<u128>,
-    /// True for `go movetime`, where the whole budget should be used instead of
-    /// being scaled down by search-stability heuristics.
+    // true for fixed movetime
     pub fixed: bool,
-    /// Node budget from `go nodes`, checked in every node.
+    // node limit from go nodes
     pub node_limit: Option<u64>,
 }
 
@@ -78,7 +70,7 @@ impl TimeManager {
             let usable_time = time.saturating_sub(overhead) as f64;
             let inc = my_inc as f64;
 
-            // Cyclic time control (e.g. 40 moves in X minutes)
+            // cyclic time control (e.g. 40 moves in X minutes)
             if let Some(moves) = tc.movestogo {
                 let moves = moves.clamp(2, 50) as f64;
                 let base = (usable_time / moves) + 0.8 * inc;
@@ -94,28 +86,22 @@ impl TimeManager {
                 };
             }
 
-            // Sudden death (Fischer clock): use exponential scaling to estimate remaining moves.
-            // Early game: we expect ~55 moves remaining.
-            // Endgame: curve flattens out around 20 moves to ensure we don't flag on short increments.
+            // estimate remaining moves for fischer clock
             let move_num = board.fullmove_number as f64;
             let remaining_moves = 20.0 + 35.0 * f64::exp(-0.035 * move_num);
 
-            // The increment is spent in full instead of at 75%: with a Fischer
-            // clock the whole increment is available again next move, so holding
-            // a quarter of it back only leaves time unused at the end of the
-            // game. Together with the smaller move overhead this lifts the share
-            // of the clock actually spent from ~90% to ~96%.
+            // use full increment on fischer clock
             let base_time = (usable_time / remaining_moves) + inc;
 
-            // Do not allocate less than a fraction of our increment if we have one
+            // don't allocate less than a fraction of our increment if we have one
             let min_time = (inc * 0.8).max(10.0);
 
-            // Cap soft limit to prevent blowing too much bank on a single complicated position
+            // cap soft limit to prevent blowing too much bank on a single complicated position
             let max_soft = usable_time * 0.35;
 
             let soft = base_time.max(min_time).min(max_soft).max(5.0) as u128;
 
-            // Hard limit is significantly larger to allow search.rs to extend time for PV node drops
+            // hard limit is significantly larger to allow search.rs to extend time for PV node drops
             let hard = (base_time * 3.5).min(usable_time * 0.8).max(soft as f64) as u128;
 
             TimeLimits {

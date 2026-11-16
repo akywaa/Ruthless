@@ -1,7 +1,7 @@
 use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::numa::bind_thread;
-use crate::search::{Searcher, MATE_SCORE};
+use crate::search::{MATE_SCORE, Searcher};
 use crate::time::TimeLimits;
 use crate::tt::TranspositionTable;
 use crate::types::Move;
@@ -59,13 +59,7 @@ impl ThreadPool {
         let shared_nodes = Arc::new(AtomicU64::new(0));
         let active_helpers = Arc::new(AtomicU64::new(0));
 
-        let main_searcher = Searcher::new(
-            Arc::clone(&tt),
-            Arc::clone(&stop_signal),
-            0,
-            num_threads,
-            Arc::clone(&shared_nodes),
-        );
+        let main_searcher = Searcher::new(Arc::clone(&tt), Arc::clone(&stop_signal), 0, num_threads, Arc::clone(&shared_nodes));
 
         let mut pool = Self {
             tt,
@@ -81,7 +75,7 @@ impl ThreadPool {
             handles: Vec::new(),
             stop_signal,
             active_helpers,
-            num_threads: 1, // Resized correctly below
+            num_threads: 1, // resized correctly below
             clear_pending: false,
             results: Arc::new(Mutex::new(vec![None])),
         };
@@ -92,12 +86,12 @@ impl ThreadPool {
 
     pub fn set_hash(&mut self, mb: usize) {
         let old_threads = self.num_threads;
-        self.set_threads(1); // Kill helpers to safely drop old TT
+        self.set_threads(1); // kill helpers to safely drop old TT
 
         self.tt = Arc::new(TranspositionTable::new(mb));
         self.main_searcher.tt = Arc::clone(&self.tt);
 
-        self.set_threads(old_threads); // Respawn and bind to new TT
+        self.set_threads(old_threads); // respawn and bind to new TT
     }
 
     pub fn set_threads(&mut self, new_num: usize) {
@@ -106,7 +100,7 @@ impl ThreadPool {
             return;
         }
 
-        // Send Exit signal to stop existing threads gracefully
+        // send Exit signal to stop existing threads gracefully
         {
             let (lock, cvar) = &*self.shared_state;
             let mut state = lock.lock().unwrap();
@@ -119,9 +113,7 @@ impl ThreadPool {
             let _ = handle.join();
         }
 
-        // A helper that was armed for a search but woke up on the Exit command
-        // above returned without decrementing, so clear the counter here instead
-        // of letting the next search wait for it forever.
+        // clear counter in case armed helpers exited before decrementing
         self.active_helpers.store(0, Ordering::Release);
 
         self.num_threads = target_num;
@@ -130,14 +122,13 @@ impl ThreadPool {
         let results = Arc::new(Mutex::new(vec![None; target_num]));
         self.results = Arc::clone(&results);
 
-        // Reset to Idle so freshly spawned helpers wait for a real command
-        // instead of inheriting the stale Exit above.
+        // reset to idle before spawning
         {
             let (lock, _cvar) = &*self.shared_state;
             lock.lock().unwrap().command = Command::Idle;
         }
 
-        // Spawn new helpers
+        // spawn new helpers
         for id in 1..target_num {
             let state_clone = Arc::clone(&self.shared_state);
             let tt_clone = Arc::clone(&self.tt);
@@ -149,18 +140,12 @@ impl ThreadPool {
 
             let handle = thread::spawn(move || {
                 bind_thread(id);
-                let mut helper = Searcher::new(
-                    tt_clone,
-                    stop_clone,
-                    id,
-                    total_threads,
-                    nodes_clone,
-                );
+                let mut helper = Searcher::new(tt_clone, stop_clone, id, total_threads, nodes_clone);
 
                 let mut last_gen = 0;
                 loop {
                     let mut state = state_clone.0.lock().unwrap();
-                    // Wake up only if generation changed and we are no longer idle
+                    // wake up only if generation changed and we are no longer idle
                     while state.generation == last_gen || matches!(state.command, Command::Idle) {
                         if matches!(state.command, Command::Exit) {
                             return;
@@ -220,9 +205,7 @@ impl ThreadPool {
     }
 
     pub fn start_search(&mut self, board: &mut Board, depth: u8, limits: TimeLimits) -> Move {
-        // Wait for helpers from the previous search to fully stop. Otherwise they
-        // would keep searching the stale position and pollute the TT with moves
-        // from the previous ply.
+        // wait for helpers from prev search
         while self.active_helpers.load(Ordering::Acquire) != 0 {
             std::thread::yield_now();
         }
@@ -249,13 +232,9 @@ impl ThreadPool {
             clear_histories,
         };
 
-        // Wake up sleeping helpers instantly. The helper counter is armed here,
-        // before the wake-up: bumping it inside the helper left a window in
-        // which the main thread saw zero, and returned from its own search (and
-        // read the result slots) while the helpers had not started yet.
+        // arm helper counter before waking them up
         if self.num_threads > 1 {
-            self.active_helpers
-                .store((self.num_threads - 1) as u64, Ordering::Release);
+            self.active_helpers.store((self.num_threads - 1) as u64, Ordering::Release);
             let (lock, cvar) = &*self.shared_state;
             let mut state = lock.lock().unwrap();
             state.command = Command::Search(params);
@@ -265,23 +244,21 @@ impl ThreadPool {
 
         self.main_searcher.fixed_time = limits.fixed;
         self.main_searcher.node_limit = limits.node_limit;
-        let best_move =
-            self.main_searcher.search(board, depth, limits.soft_limit, limits.hard_limit);
+        let best_move = self.main_searcher.search(board, depth, limits.soft_limit, limits.hard_limit);
 
         self.stop_signal.store(true, Ordering::Relaxed);
 
-        // Single-threaded searches need none of the helper bookkeeping.
+        // single-threaded: skip helper bookkeeping
         if self.num_threads == 1 {
             return best_move;
         }
 
-        // Helpers publish their last completed iteration before leaving the
-        // search loop, so wait for them before reading the result slots.
+        // wait for helpers to publish results
         while self.active_helpers.load(Ordering::Acquire) != 0 {
             std::thread::yield_now();
         }
 
-        // Put helpers back to sleep
+        // put helpers back to sleep
         if self.num_threads > 1 {
             let (lock, cvar) = &*self.shared_state;
             let mut state = lock.lock().unwrap();
@@ -319,18 +296,10 @@ impl ThreadPool {
 
         let selected = Self::choose_best(main_result, helpers);
         if selected.best_move != best_move || selected.depth > main_depth {
-            let total_nodes = self.shared_nodes.load(Ordering::Relaxed)
-                + (self.main_searcher.nodes & 1023);
+            let total_nodes = self.shared_nodes.load(Ordering::Relaxed) + (self.main_searcher.nodes & 1023);
             let elapsed = search_start.elapsed().as_millis().max(1);
             let nps = (total_nodes as u128 * 1000) / elapsed;
-            print_search_result(
-                &selected,
-                total_nodes,
-                nps,
-                elapsed,
-                self.main_searcher.seldepth,
-                self.tt.hashfull(),
-            );
+            print_search_result(&selected, total_nodes, nps, elapsed, self.main_searcher.seldepth, self.tt.hashfull());
         }
 
         selected.best_move
@@ -349,14 +318,13 @@ impl ThreadPool {
         let mate_threshold = MATE_SCORE - 100;
         if let Some(best) = candidates
             .iter()
-            .filter(|result| result.score.abs() > mate_threshold)
-            .max_by_key(|result| result.score)
+            .filter(|result| result.score > mate_threshold)
+            .max_by_key(|result| (result.score, result.depth))
         {
             return best.clone();
         }
 
-        // Stockfish-style vote: scores are shifted so the worst result has a
-        // small positive weight, then every thread votes for its best move.
+        // vote for best move across threads
         let min_score = candidates.iter().map(|result| result.score).min().unwrap();
         let mut votes: Vec<(Move, i64)> = Vec::with_capacity(candidates.len());
 
@@ -372,30 +340,14 @@ impl ThreadPool {
         let max_votes = votes.iter().map(|(_, total)| *total).max().unwrap();
         candidates
             .into_iter()
-            .filter(|result| {
-                votes
-                    .iter()
-                    .any(|(m, total)| *m == result.best_move && *total == max_votes)
-            })
+            .filter(|result| votes.iter().any(|(m, total)| *m == result.best_move && *total == max_votes))
             .max_by_key(|result| (result.depth, result.pv.len()))
             .unwrap_or(main)
     }
 }
 
-fn print_search_result(
-    result: &SearchResult,
-    nodes: u64,
-    nps: u128,
-    time: u128,
-    seldepth: u8,
-    hashfull: usize,
-) {
-    let pv = result
-        .pv
-        .iter()
-        .map(|m| m.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
+fn print_search_result(result: &SearchResult, nodes: u64, nps: u128, time: u128, seldepth: u8, hashfull: usize) {
+    let pv = result.pv.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" ");
 
     if result.score.abs() > MATE_SCORE - 100 {
         let mate_dist = (MATE_SCORE - result.score.abs() + 1) / 2;
@@ -464,7 +416,7 @@ mod tests {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        // Release the lock before joining: the workers need it to observe Exit.
+        // drop lock before joining workers
         {
             let (lock, cvar) = &*self.shared_state;
             let mut state = lock.lock().unwrap();

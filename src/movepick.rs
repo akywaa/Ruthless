@@ -4,8 +4,8 @@ use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
 use crate::movegen::{generate_noisy_pseudo, generate_quiet_pseudo};
-use crate::see::see;
 use crate::search::{ContHist, MAX_PLY};
+use crate::see::see;
 use crate::types::{Move, MoveList, MoveType, Piece, PieceType};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -28,35 +28,28 @@ pub struct MovePicker {
     killer_idx: usize,
     counter_move: Move,
     moves: MoveList,
-    /// Written lazily for `cur_idx..moves.count` by the scoring pass, so the
-    /// constructor does not have to zero a kilobyte on every node.
+    // filled lazily when scoring
     scores: [MaybeUninit<i32>; 256],
     cur_idx: usize,
-    /// At most 64 pieces can deliver a losing capture, so this buffer is much
-    /// smaller than a full MoveList and is never touched in qsearch.
-    bad_noisy: [Move; 64],
+    // bad captures buffer
+    bad_noisy: [MaybeUninit<Move>; 64],
     bad_noisy_count: usize,
     qsearch: bool,
+    in_check: bool,
     checkers: Bitboard,
     pinned: Bitboard,
     king_info_ready: bool,
-    /// Opponent threats in the node's position, computed at most once and
-    /// shared by move scoring and the search's history updates.
-    threats: Option<Bitboard>,
-    /// Check squares for this node, computed at most once and shared by every
-    /// move scored here and by the search's pruning decisions.
+    // cached check squares
     check_squares: Option<[Bitboard; 6]>,
-    /// Whether the move returned by the last `next()` call is a capture with
-    /// SEE >= 0. Cached here so the search does not have to run SEE a second
-    /// time on the same move.
+    // cached see >= 0 for last move
     pub last_see_ge_zero: bool,
-    /// Whether the last returned move came from the good-noisy stage, where SEE
-    /// was already proven to be >= 0.
+    // true if last move came from good noisy
     pub last_good_noisy: bool,
+    delta_threshold: i32,
 }
 
 impl MovePicker {
-    pub fn new(tt_move: Move, killers: [Move; 2], counter_move: Move) -> Self {
+    pub fn new(tt_move: Move, killers: [Move; 2], counter_move: Move, in_check: bool) -> Self {
         Self {
             stage: if tt_move != Move::NULL { Stage::TTMove } else { Stage::GenerateNoisy },
             tt_move,
@@ -66,35 +59,21 @@ impl MovePicker {
             moves: MoveList::new(),
             scores: [MaybeUninit::uninit(); 256],
             cur_idx: 0,
-            bad_noisy: [Move::NULL; 64],
+            bad_noisy: [MaybeUninit::uninit(); 64],
             bad_noisy_count: 0,
             qsearch: false,
+            in_check,
             checkers: Bitboard::EMPTY,
             pinned: Bitboard::EMPTY,
             king_info_ready: false,
-            threats: None,
             check_squares: None,
             last_see_ge_zero: true,
             last_good_noisy: false,
+            delta_threshold: i32::MIN,
         }
     }
 
-    /// Opponent threats for the position this picker was created for.
-    #[inline(always)]
-    pub fn threats(&mut self, board: &Board) -> Bitboard {
-        match self.threats {
-            Some(t) => t,
-            None => {
-                let t = board.opponent_threats();
-                self.threats = Some(t);
-                t
-            }
-        }
-    }
-
-    /// Whether `m` gives a direct check, using per-node precomputed squares.
-    /// The squares are kept by reference so the 6-bitboard table is not copied
-    /// out of the picker on every call.
+    // check if move gives direct check
     #[inline(always)]
     pub fn gives_check(&mut self, board: &Board, m: Move) -> bool {
         if self.check_squares.is_none() {
@@ -104,7 +83,7 @@ impl MovePicker {
         board.gives_check_with(m, squares)
     }
 
-    pub fn new_qsearch(tt_move: Move) -> Self {
+    pub fn new_qsearch(tt_move: Move, in_check: bool) -> Self {
         Self {
             stage: if tt_move != Move::NULL { Stage::TTMove } else { Stage::GenerateNoisy },
             tt_move,
@@ -114,23 +93,28 @@ impl MovePicker {
             moves: MoveList::new(),
             scores: [MaybeUninit::uninit(); 256],
             cur_idx: 0,
-            bad_noisy: [Move::NULL; 64],
+            bad_noisy: [MaybeUninit::uninit(); 64],
             bad_noisy_count: 0,
             qsearch: true,
+            in_check,
             checkers: Bitboard::EMPTY,
             pinned: Bitboard::EMPTY,
             king_info_ready: false,
-            threats: None,
             check_squares: None,
             last_see_ge_zero: true,
             last_good_noisy: false,
+            delta_threshold: i32::MIN,
         }
     }
 
     #[inline(always)]
     fn ensure_king_info(&mut self, board: &Board) {
         if !self.king_info_ready {
-            self.checkers = board.checkers();
+            if self.in_check {
+                self.checkers = board.checkers();
+            } else {
+                self.checkers = Bitboard::EMPTY;
+            }
             self.pinned = board.pinned_pieces(board.side_to_move);
             self.king_info_ready = true;
         }
@@ -140,6 +124,52 @@ impl MovePicker {
     fn is_legal(&mut self, board: &Board, m: Move) -> bool {
         self.ensure_king_info(board);
         board.is_legal_with(m, self.checkers, self.pinned)
+    }
+
+    #[inline(always)]
+    fn aligned_with_king(from: crate::types::Square, ksq: crate::types::Square) -> bool {
+        from.rank() == ksq.rank()
+            || from.file() == ksq.file()
+            || (from.rank() as i32 - ksq.rank() as i32).abs() == (from.file() as i32 - ksq.file() as i32).abs()
+    }
+
+    #[inline(always)]
+    fn is_legal_tt(&mut self, board: &Board, m: Move) -> bool {
+        let from = m.from();
+        let piece = board.piece_on[from];
+        if piece == Piece::None {
+            return false;
+        }
+        if piece.piece_type() == PieceType::King || m.move_type() == MoveType::EnPassant {
+            self.ensure_king_info(board);
+            return board.is_legal_with(m, self.checkers, self.pinned);
+        }
+
+        if !self.king_info_ready {
+            if self.in_check {
+                self.checkers = board.checkers();
+            } else {
+                self.checkers = Bitboard::EMPTY;
+            }
+        }
+        let checkers = self.checkers;
+        if checkers.count() > 1 {
+            return false;
+        }
+        if self.king_info_ready {
+            return board.is_legal_with(m, checkers, self.pinned);
+        }
+        let ksq = board.king_square(board.side_to_move);
+        if Self::aligned_with_king(from, ksq) {
+            self.ensure_king_info(board);
+            return board.is_legal_with(m, self.checkers, self.pinned);
+        }
+        board.is_legal_with(m, checkers, Bitboard::EMPTY)
+    }
+
+    #[inline(always)]
+    pub fn set_delta_threshold(&mut self, threshold: i32) {
+        self.delta_threshold = threshold;
     }
 
     pub fn next(
@@ -159,16 +189,10 @@ impl MovePicker {
                 Stage::TTMove => {
                     self.stage = Stage::GenerateNoisy;
                     let m = self.tt_move;
-                    let is_noisy = board.piece_on[m.to()] != Piece::None
-                        || m.move_type() == MoveType::Promotion
-                        || m.move_type() == MoveType::EnPassant;
+                    let is_noisy = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::Promotion || m.move_type() == MoveType::EnPassant;
 
-                    if (!self.qsearch || is_noisy)
-                        && self.is_pseudo_legal_any(board, m)
-                        && self.is_legal(board, m)
-                    {
-                        // SEE is not evaluated for the TT move; assume a good
-                        // capture so LMR stays conservative.
+                    if (!self.qsearch || is_noisy) && self.is_pseudo_legal_any(board, m) && self.is_legal_tt(board, m) {
+                        // assume good see for tt move
                         self.last_see_ge_zero = true;
                         return Some(m);
                     }
@@ -187,18 +211,22 @@ impl MovePicker {
                             continue;
                         }
 
-                        // Underpromotions are a full-depth concern; searching all
-                        // four in the quiescence tree only costs nodes.
-                        if self.qsearch
-                            && m.move_type() == MoveType::Promotion
-                            && m.promo_type() != PieceType::Queen
-                        {
+                        // skip underpromotions in qsearch
+                        if self.qsearch && m.move_type() == MoveType::Promotion && m.promo_type() != PieceType::Queen {
                             continue;
                         }
 
-                        // Fixed SEE 0 split. A history-dependent threshold was
-                        // proposed but not applied: bad captures are already
-                        // pruned by capture history in the search loop.
+                        if self.qsearch && m.move_type() != MoveType::Promotion {
+                            let cap_pt = match m.move_type() {
+                                MoveType::EnPassant => PieceType::Pawn,
+                                _ => board.piece_on[m.to()].piece_type(),
+                            };
+                            if cap_pt == PieceType::None || crate::eval::PIECE_VALUES[cap_pt as usize] < self.delta_threshold {
+                                continue;
+                            }
+                        }
+
+                        // split captures at see 0
                         if see(board, m, 0) {
                             if self.is_legal(board, m) {
                                 self.last_see_ge_zero = true;
@@ -206,7 +234,7 @@ impl MovePicker {
                                 return Some(m);
                             }
                         } else if !self.qsearch && self.bad_noisy_count < self.bad_noisy.len() {
-                            self.bad_noisy[self.bad_noisy_count] = m;
+                            self.bad_noisy[self.bad_noisy_count].write(m);
                             self.bad_noisy_count += 1;
                         }
                     }
@@ -250,15 +278,7 @@ impl MovePicker {
                 Stage::GenerateQuiets => {
                     self.moves.count = 0;
                     generate_quiet_pseudo(board, &mut self.moves);
-                    self.score_quiets(
-                        board,
-                        history,
-                        pawn_history,
-                        conthist,
-                        ply,
-                        played_pieces,
-                        played_moves,
-                    );
+                    self.score_quiets(board, history, pawn_history, conthist, ply, played_pieces, played_moves);
                     self.cur_idx = 0;
                     self.stage = Stage::Quiets;
                 }
@@ -278,7 +298,7 @@ impl MovePicker {
                 }
                 Stage::BadNoisy => {
                     while self.cur_idx < self.bad_noisy_count {
-                        let m = self.bad_noisy[self.cur_idx];
+                        let m = unsafe { self.bad_noisy[self.cur_idx].assume_init() };
                         self.cur_idx += 1;
                         if m != self.tt_move && self.is_legal(board, m) {
                             self.last_see_ge_zero = false;
@@ -313,13 +333,11 @@ impl MovePicker {
     }
 
     fn score_noisy(&mut self, board: &Board, noisy_history: &[[[[i32; 2]; 6]; 64]; 12]) {
-        // Nothing to score means nothing to look up: the threat map is only an
-        // input of the per-move scores below, and the caller still gets it from
-        // the cache on demand.
-        if self.moves.count == 0 {
-            return;
-        }
-        let threats = self.threats(board);
+        let pawn_threats = if self.moves.count == 0 {
+            Bitboard::EMPTY
+        } else {
+            board.opponent_pawn_threats()
+        };
 
         for i in 0..self.moves.count {
             let m = self.moves.get(i);
@@ -331,13 +349,12 @@ impl MovePicker {
                 _ => captured.piece_type(),
             };
 
-            let to_threatened = threats.contains(m.to()) as usize;
+            let to_threatened = pawn_threats.contains(m.to()) as usize;
 
             let attacker_idx = attacker as usize;
             let victim_idx = victim_pt as usize;
 
-            // Guard against broken moves (Piece::None attacker/victim) that
-            // would index out of bounds in PIECE_VALUES and noisy_history.
+            // bounds check before indexing
             if attacker_idx < 12 && victim_idx < 6 {
                 let mvv_lva = PIECE_VALUES[victim_idx] * 12 - PIECE_VALUES[attacker.piece_type() as usize];
                 let hist = noisy_history[attacker_idx][m.to() as usize][victim_idx][to_threatened];
@@ -382,20 +399,15 @@ impl MovePicker {
             let from_threat = pawn_threats.contains(from) as usize;
             let to_threat = pawn_threats.contains(to) as usize;
 
-            let mut score = history[us as usize][from_threat][to_threat][from as usize][to as usize]
-                + pawn_history[p_idx][piece as usize][to as usize];
+            let mut score = history[us as usize][from_threat][to_threat][from as usize][to as usize] + pawn_history[p_idx][piece as usize][to as usize];
 
             for (layer, &offset) in offsets.iter().enumerate() {
                 if ply_idx >= offset {
                     let prev_idx = ply_idx - offset;
                     let prev_piece = played_pieces[prev_idx];
                     let prev_move = played_moves[prev_idx];
-                    if prev_piece != Piece::None
-                        && prev_move != Move::NULL
-                        && (piece as usize) < 12
-                    {
-                        score += conthist[layer][prev_piece as usize][prev_move.to() as usize]
-                            [piece as usize][to as usize] as i32;
+                    if prev_piece != Piece::None && prev_move != Move::NULL && (piece as usize) < 12 {
+                        score += conthist[layer][prev_piece as usize][prev_move.to() as usize][piece as usize][to as usize] as i32;
                     }
                 }
             }
@@ -420,9 +432,7 @@ impl MovePicker {
 
     #[inline(always)]
     fn is_pseudo_legal(&self, board: &Board, m: Move) -> bool {
-        m.move_type() != MoveType::EnPassant
-            && board.piece_on[m.to()] == Piece::None
-            && board.is_pseudo_legal(m)
+        m.move_type() != MoveType::EnPassant && board.piece_on[m.to()] == Piece::None && board.is_pseudo_legal(m)
     }
 
     #[inline(always)]

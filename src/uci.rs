@@ -2,6 +2,7 @@ use crate::board::Board;
 use crate::movegen::generate_legal_moves;
 use crate::threadpool::ThreadPool;
 use crate::time::{TimeControl, TimeLimits, TimeManager};
+use crate::tt::DEFAULT_HASH_MB;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -10,7 +11,7 @@ use std::thread;
 
 pub fn uci_loop() {
     let mut board = Board::default();
-    let pool = Arc::new(Mutex::new(ThreadPool::new(32, 1)));
+    let pool = Arc::new(Mutex::new(ThreadPool::new(DEFAULT_HASH_MB, 1)));
     let mut stop = pool.lock().unwrap().new_search_stop();
     let mut pending_stop: Option<Arc<AtomicBool>> = None;
     let stdin = io::stdin();
@@ -21,13 +22,9 @@ pub fn uci_loop() {
     let _search_thread = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
-            while let Ok((mut search_board, depth, tc, wait_for_stop, thread_release)) = go_rx.recv()
-            {
+            while let Ok((mut search_board, depth, tc, wait_for_stop, thread_release)) = go_rx.recv() {
                 let limits = TimeManager::allocate(&search_board, &tc);
-                let best_move = search_pool
-                    .lock()
-                    .unwrap()
-                    .start_search(&mut search_board, depth, limits);
+                let best_move = search_pool.lock().unwrap().start_search(&mut search_board, depth, limits);
 
                 while wait_for_stop && !thread_release.load(Ordering::Relaxed) {
                     thread::sleep(std::time::Duration::from_millis(1));
@@ -53,7 +50,7 @@ pub fn uci_loop() {
             "uci" => {
                 println!("id name Ruthless 0.2");
                 println!("id author Ruthless Team");
-                println!("option name Hash type spin default 32 min 1 max 1048576");
+                println!("option name Hash type spin default {} min 1 max 1048576", DEFAULT_HASH_MB);
                 println!("option name Threads type spin default 1 min 1 max 256");
                 println!("option name RfpBase type spin default 80 min 10 max 200");
                 println!("option name RfpImproving type spin default 20 min 0 max 100");
@@ -63,11 +60,14 @@ pub fn uci_loop() {
                 println!("option name NmpEvalDiv type spin default 200 min 50 max 500");
                 println!("option name CorrWeight type spin default 153 min 20 max 400");
                 println!("option name CorrLimit type spin default 13 min 2 max 60");
-                println!("option name LmrBase type spin default 0 min -100 max 200");
-                println!("option name LmrDivisor type spin default 240 min 100 max 400");
+                println!("option name LmrBase type spin default {} min -100 max 200", crate::search::DEFAULT_LMR_BASE);
+                println!(
+                    "option name LmrDivisor type spin default {} min 100 max 400",
+                    crate::search::DEFAULT_LMR_DIVISOR
+                );
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name NumaBind type check default false");
-                println!("option name Move Overhead type spin default 25 min 0 max 5000");
+                println!("option name Move Overhead type spin default 15 min 0 max 5000");
                 println!("uciok");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
@@ -76,7 +76,40 @@ pub fn uci_loop() {
                 handle_setoption(&tokens[1..], &mut pool.lock().unwrap());
             }
             "eval" => {
-                println!("nnue eval: {} cp", crate::eval::evaluate(&board));
+                let (raw, scaled) = crate::eval::evaluate_debug(&mut board);
+                println!("info string raw {} scaled {} cp", raw, scaled);
+                println!("nnue eval: {} cp", scaled);
+            }
+            "threats" => {
+                let mut list = crate::nnue::ThreatList::new();
+                crate::nnue::collect_threats(&board, crate::types::Color::White, &mut list);
+                println!("white: {:?}", list.as_slice());
+                crate::nnue::collect_threats(&board, crate::types::Color::Black, &mut list);
+                println!("black: {:?}", list.as_slice());
+
+                let w_ksq = board.king_square(crate::types::Color::White);
+                let b_ksq = board.king_square(crate::types::Color::Black);
+                let mut white_features = Vec::new();
+                let mut black_features = Vec::new();
+                for sq in 0..64u8 {
+                    let piece = board.piece_on[sq as usize];
+                    if piece != crate::types::Piece::None {
+                        white_features.push(crate::nnue::feature_index_side(
+                            piece,
+                            crate::types::Square::new(sq),
+                            w_ksq,
+                            crate::types::Color::White,
+                        ));
+                        black_features.push(crate::nnue::feature_index_side(
+                            piece,
+                            crate::types::Square::new(sq),
+                            b_ksq,
+                            crate::types::Color::Black,
+                        ));
+                    }
+                }
+                println!("white features: {:?}", white_features);
+                println!("black features: {:?}", black_features);
             }
             "isready" => {
                 println!("readyok");
@@ -165,28 +198,44 @@ fn handle_setoption(tokens: &[&str], pool: &mut ThreadPool) {
             }
         }
         "rfpbase" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::RFP_BASE.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::RFP_BASE.store(v, Ordering::Relaxed);
+            }
         }
         "rfpimproving" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::RFP_IMPROVING.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::RFP_IMPROVING.store(v, Ordering::Relaxed);
+            }
         }
         "futilitybase" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::FUTILITY_BASE.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::FUTILITY_BASE.store(v, Ordering::Relaxed);
+            }
         }
         "futilitymargin" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::FUTILITY_MARGIN.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::FUTILITY_MARGIN.store(v, Ordering::Relaxed);
+            }
         }
         "nmpbase" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::NMP_BASE.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::NMP_BASE.store(v, Ordering::Relaxed);
+            }
         }
         "nmpevaldiv" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::NMP_EVAL_DIV.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::NMP_EVAL_DIV.store(v, Ordering::Relaxed);
+            }
         }
         "corrweight" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::CORR_WEIGHT.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::CORR_WEIGHT.store(v, Ordering::Relaxed);
+            }
         }
         "corrlimit" => {
-            if let Ok(v) = value.parse::<i32>() { crate::search::CORR_LIMIT.store(v, Ordering::Relaxed); }
+            if let Ok(v) = value.parse::<i32>() {
+                crate::search::CORR_LIMIT.store(v, Ordering::Relaxed);
+            }
         }
         "lmrbase" => {
             if let Ok(v) = value.parse::<i32>() {
@@ -252,6 +301,13 @@ fn handle_position(board: &mut Board, tokens: &[&str]) {
             }
         }
     }
+
+    if board.hist_len > 512 {
+        let keep = (board.halfmove_clock as usize).min(board.hist_len);
+        let start = board.hist_len - keep;
+        board.history.copy_within(start..board.hist_len, 0);
+        board.hist_len = keep;
+    }
 }
 
 fn parse_go(tokens: &[&str]) -> (u8, TimeControl, bool) {
@@ -267,8 +323,7 @@ fn parse_go(tokens: &[&str]) -> (u8, TimeControl, bool) {
             }
             "depth" => {
                 if let Some(val) = tokens.get(i + 1).and_then(|s| s.parse::<u8>().ok()) {
-                    // Beyond MAX_PLY there is nothing to search and depth + 1 in
-                    // the in-check extension would overflow.
+                    // clamp depth to MAX_PLY
                     depth = val.min(crate::search::MAX_PLY as u8);
                 }
                 i += 1;
@@ -312,7 +367,7 @@ fn parse_go(tokens: &[&str]) -> (u8, TimeControl, bool) {
 }
 
 pub fn run_bench_cli() {
-    let mut pool = ThreadPool::new(32, 1);
+    let mut pool = ThreadPool::new(DEFAULT_HASH_MB, 1);
     run_bench(&mut pool);
 }
 
@@ -333,6 +388,18 @@ fn run_bench(pool: &mut ThreadPool) {
         "8/3k4/3b3p/R1p1p2P/p1Pr4/P2P1r2/2K1R3/4B3 b - - 4 75",
     ];
 
+    crate::search::EVAL_CALLS.store(0, Ordering::Relaxed);
+    crate::search::EVAL_NEGAMAX.store(0, Ordering::Relaxed);
+    crate::search::EVAL_QSEARCH.store(0, Ordering::Relaxed);
+    crate::search::RFP_CUTOFFS.store(0, Ordering::Relaxed);
+    crate::search::STANDPAT_CUTOFFS.store(0, Ordering::Relaxed);
+    crate::search::EVAL_RFP_CUTOFF_CALLS.store(0, Ordering::Relaxed);
+    crate::search::EVAL_STANDPAT_CUTOFF_CALLS.store(0, Ordering::Relaxed);
+
+    crate::search::QSEARCH_NODES.store(0, Ordering::Relaxed);
+    crate::search::QSEARCH_TT_HITS.store(0, Ordering::Relaxed);
+    crate::search::QSEARCH_TT_RAW_HITS.store(0, Ordering::Relaxed);
+
     let mut total_nodes = 0;
     let start = std::time::Instant::now();
 
@@ -349,8 +416,7 @@ fn run_bench(pool: &mut ThreadPool) {
                     node_limit: None,
                 },
             );
-            total_nodes += pool.shared_nodes.load(Ordering::Relaxed)
-                + (pool.main_searcher.nodes & 1023);
+            total_nodes += pool.shared_nodes.load(Ordering::Relaxed) + (pool.main_searcher.nodes & 1023);
         }
     }
 
@@ -359,4 +425,20 @@ fn run_bench(pool: &mut ThreadPool) {
 
     println!();
     println!("Bench: {total_nodes} nodes {nps} nps");
+    println!("EVAL_CALLS: {}", crate::search::EVAL_CALLS.load(Ordering::Relaxed));
+    println!("EVAL_NEGAMAX: {}", crate::search::EVAL_NEGAMAX.load(Ordering::Relaxed));
+    println!("EVAL_QSEARCH: {}", crate::search::EVAL_QSEARCH.load(Ordering::Relaxed));
+    println!("RFP_CUTOFFS: {}", crate::search::RFP_CUTOFFS.load(Ordering::Relaxed));
+    println!("STANDPAT_CUTOFFS: {}", crate::search::STANDPAT_CUTOFFS.load(Ordering::Relaxed));
+    println!("EVAL_RFP_CUTOFF_CALLS: {}", crate::search::EVAL_RFP_CUTOFF_CALLS.load(Ordering::Relaxed));
+    let qn = crate::search::QSEARCH_NODES.load(Ordering::Relaxed);
+    let qh = crate::search::QSEARCH_TT_HITS.load(Ordering::Relaxed);
+    let qr = crate::search::QSEARCH_TT_RAW_HITS.load(Ordering::Relaxed);
+    println!("QSEARCH_NODES: {qn}");
+    println!("QSEARCH_TT_HITS: {qh} ({:.1}%)", 100.0 * qh as f64 / qn as f64);
+    println!("QSEARCH_TT_RAW_HITS: {qr} ({:.1}%)", 100.0 * qr as f64 / qn as f64);
+    println!(
+        "EVAL_STANDPAT_CUTOFF_CALLS: {}",
+        crate::search::EVAL_STANDPAT_CUTOFF_CALLS.load(Ordering::Relaxed)
+    );
 }

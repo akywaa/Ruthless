@@ -5,7 +5,7 @@ A UCI chess engine written in Rust. It uses an NNUE evaluation and a fairly stan
 ## Features
 
 - Bitboards, magic or PEXT slider attacks (picked at startup)
-- NNUE: 10 king-bucketed inputs, 512 hidden units, 8 output buckets, SCReLU. AVX2, AVX-512 and NEON paths
+- NNUE: 16hm king-bucketed inputs + 60,144 threat features, 512 hidden units, pairwise -> 32 (CReLU/SCReLU) -> 16 -> 1 head (8 output buckets). AVX2, AVX-VNNI and AVX-512 paths
 - PVS with null move pruning, LMR, futility pruning, razoring, ProbCut, singular extensions
 - Quiescence search, SEE, check extensions
 - Quiet, noisy, continuation and correction histories
@@ -56,11 +56,12 @@ You can also talk to it directly:
 
 `Ruthless bench` runs a fixed-depth benchmark.
 
-Options: `Hash`, `Threads`, `SyzygyPath`, `NumaBind`, plus a handful of search
-parameters (`RfpBase`, `NmpBase`, `LmrDivisor`, ...) that I use for tuning.
+Options: `Hash`, `Threads`, `SyzygyPath`, `NumaBind`, `Move Overhead`, plus a
+handful of search parameters (`RfpBase`, `NmpBase`, `LmrDivisor`, ...) that I
+use for tuning.
 
 ## License
 
 MIT
 
-<sub>net trained on [master-binpacks_relabel](https://huggingface.co/datasets/vondele/master-binpacks_relabel/tree/main) (maybe switch to my own datagen later).</sub>
+<sub>net trained on [master-binpacks_relabel](https://huggingface.co/datasets/vondele/master-binpacks_relabel/tree/main) (maybe switch to my own datagen later). inspired by Reckless.</sub>

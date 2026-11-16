@@ -1,10 +1,7 @@
 use crate::attacks::{king_attacks, pawn_attacks};
 use crate::bitboard::Bitboard;
 use crate::board::Board;
-use crate::setwise::{
-    extract_moves, generate_bishop_moves, generate_knight_moves, generate_queen_moves,
-    generate_rook_moves,
-};
+use crate::setwise::{extract_moves, generate_bishop_moves, generate_knight_moves, generate_queen_moves, generate_rook_moves};
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType, Square};
 
 pub fn generate_legal_moves(board: &Board) -> MoveList {
@@ -63,99 +60,148 @@ pub fn generate_quiet_pseudo(board: &Board, list: &mut MoveList) {
     generate_castling_moves(board, us, all_occ, list);
 }
 
-fn generate_pawn_captures_pseudo(
-    board: &Board,
-    us: Color,
-    their_occ: Bitboard,
-    list: &mut MoveList,
-) {
-    let pawns = board.pieces[Piece::new(us, PieceType::Pawn)];
+const FILE_A: u64 = 0x0101010101010101;
+const FILE_H: u64 = 0x8080808080808080;
+const RANK_1: u64 = 0xFF;
+const RANK_8: u64 = 0xFF00000000000000;
+const RANK_2: u64 = 0x000000000000FF00;
+const RANK_7: u64 = 0x00FF000000000000;
+
+fn generate_pawn_captures_pseudo(board: &Board, us: Color, their_occ: Bitboard, list: &mut MoveList) {
+    let pawns = board.pieces[Piece::new(us, PieceType::Pawn)].0;
     let promo_rank: u8 = match us {
         Color::White => 7,
         Color::Black => 0,
     };
 
-    let mut p = pawns;
-    while !p.is_empty() {
-        let from = p.pop_lsb();
-        let mut attacks = pawn_attacks(us, from) & their_occ;
-        while !attacks.is_empty() {
-            let cap_to = attacks.pop_lsb();
-            if cap_to.rank() == promo_rank {
+    if board.ep_square.is_valid() {
+        let ep = board.ep_square;
+        let mut ep_pawns = Bitboard(pawn_attacks(!us, ep).0 & pawns);
+        while !ep_pawns.is_empty() {
+            let from = ep_pawns.pop_lsb();
+            list.push(Move::new(from, ep, PieceType::None, MoveType::EnPassant));
+        }
+    }
+
+    // ep handled per color below
+
+    match us {
+        Color::White => {
+            for shift in [7u8, 9u8] {
+                let file_mask = if shift == 7 { !FILE_A } else { !FILE_H };
+                let mut bb = Bitboard(((pawns & file_mask) << shift) & their_occ.0);
+                while !bb.is_empty() {
+                    let to = bb.pop_lsb();
+                    let from = Square::new(to as u8 - shift);
+                    if to.rank() == promo_rank {
+                        for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
+                            list.push(Move::new(from, to, pt, MoveType::Promotion));
+                        }
+                    } else {
+                        list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+                    }
+                }
+            }
+        }
+        Color::Black => {
+            for shift in [7u8, 9u8] {
+                let file_mask = if shift == 7 { !FILE_H } else { !FILE_A };
+                let mut bb = Bitboard(((pawns & file_mask) >> shift) & their_occ.0);
+                while !bb.is_empty() {
+                    let to = bb.pop_lsb();
+                    let from = Square::new(to as u8 + shift);
+                    if to.rank() == promo_rank {
+                        for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
+                            list.push(Move::new(from, to, pt, MoveType::Promotion));
+                        }
+                    } else {
+                        list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn generate_pawn_pushes_pseudo(board: &Board, us: Color, empty: Bitboard, list: &mut MoveList) {
+    let pawns = board.pieces[Piece::new(us, PieceType::Pawn)].0;
+    let start_rank_mask: u64 = match us { Color::White => RANK_2, Color::Black => RANK_7 };
+
+    match us {
+        Color::White => {
+            // single pushes (normal, non-promoting)
+            let single = Bitboard((pawns << 8) & empty.0);
+            let mut normal = Bitboard(single.0 & !RANK_8);
+            while !normal.is_empty() {
+                let to = normal.pop_lsb();
+                let from = Square::new(to as u8 - 8);
+                list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+            }
+            // double pushes
+            let double = Bitboard(((pawns & start_rank_mask) << 16) & empty.0 & (empty.0 << 8));
+            let mut bb = double;
+            while !bb.is_empty() {
+                let to = bb.pop_lsb();
+                let from = Square::new(to as u8 - 16);
+                list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+            }
+        }
+        Color::Black => {
+            let single = Bitboard((pawns >> 8) & empty.0);
+            let mut normal = Bitboard(single.0 & !RANK_1);
+            while !normal.is_empty() {
+                let to = normal.pop_lsb();
+                let from = Square::new(to as u8 + 8);
+                list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+            }
+            let double = Bitboard(((pawns & start_rank_mask) >> 16) & empty.0 & (empty.0 >> 8));
+            let mut bb = double;
+            while !bb.is_empty() {
+                let to = bb.pop_lsb();
+                let from = Square::new(to as u8 + 16);
+                list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+            }
+        }
+    }
+}
+
+fn generate_pawn_promotions_pseudo(board: &Board, us: Color, empty: Bitboard, list: &mut MoveList) {
+    let pawns = board.pieces[Piece::new(us, PieceType::Pawn)].0;
+    match us {
+        Color::White => {
+            let single = Bitboard((pawns << 8) & empty.0 & RANK_8);
+            let mut bb = single;
+            while !bb.is_empty() {
+                let to = bb.pop_lsb();
+                let from = Square::new(to as u8 - 8);
                 for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
-                    list.push(Move::new(from, cap_to, pt, MoveType::Promotion));
-                }
-            } else {
-                list.push(Move::new(from, cap_to, PieceType::None, MoveType::Normal));
-            }
-        }
-
-        if board.ep_square.is_valid() {
-            let ep_attacks = pawn_attacks(us, from) & Bitboard::from_square(board.ep_square);
-            if !ep_attacks.is_empty() {
-                list.push(Move::new(from, board.ep_square, PieceType::None, MoveType::EnPassant));
-            }
-        }
-    }
-}
-
-fn generate_pawn_pushes_pseudo(
-    board: &Board,
-    us: Color,
-    empty: Bitboard,
-    list: &mut MoveList,
-) {
-    let pawns = board.pieces[Piece::new(us, PieceType::Pawn)];
-    let (push_offset, start_rank, promo_rank): (i8, u8, u8) = match us {
-        Color::White => (8, 1, 7),
-        Color::Black => (-8, 6, 0),
-    };
-
-    let mut p = pawns;
-    while !p.is_empty() {
-        let from = p.pop_lsb();
-        let to_idx = (from as i8 + push_offset) as u8;
-        let to = Square::new(to_idx);
-
-        if empty.contains(to) && to.rank() != promo_rank {
-            list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
-
-            if from.rank() == start_rank {
-                let double_to = Square::new((from as i8 + push_offset * 2) as u8);
-                if empty.contains(double_to) {
-                    list.push(Move::new(from, double_to, PieceType::None, MoveType::Normal));
+                    list.push(Move::new(from, to, pt, MoveType::Promotion));
                 }
             }
         }
-    }
-}
-
-fn generate_pawn_promotions_pseudo(
-    board: &Board,
-    us: Color,
-    empty: Bitboard,
-    list: &mut MoveList,
-) {
-    let pawns = board.pieces[Piece::new(us, PieceType::Pawn)];
-    let (push_offset, promo_rank): (i8, u8) = match us {
-        Color::White => (8, 7),
-        Color::Black => (-8, 0),
-    };
-
-    let mut p = pawns;
-    while !p.is_empty() {
-        let from = p.pop_lsb();
-        let to = Square::new((from as i8 + push_offset) as u8);
-
-        if empty.contains(to) && to.rank() == promo_rank {
-            for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
-                list.push(Move::new(from, to, pt, MoveType::Promotion));
+        Color::Black => {
+            let single = Bitboard((pawns >> 8) & empty.0 & RANK_1);
+            let mut bb = single;
+            while !bb.is_empty() {
+                let to = bb.pop_lsb();
+                let from = Square::new(to as u8 + 8);
+                for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
+                    list.push(Move::new(from, to, pt, MoveType::Promotion));
+                }
             }
         }
     }
 }
 
 fn generate_castling_moves(board: &Board, us: Color, all_occ: Bitboard, list: &mut MoveList) {
+    let rights_mask = if us == Color::White {
+        Board::CASTLE_WK | Board::CASTLE_WQ
+    } else {
+        Board::CASTLE_BK | Board::CASTLE_BQ
+    };
+    if (board.castling_rights & rights_mask) == 0 {
+        return;
+    }
     if board.is_square_attacked(board.king_square(us), !us) {
         return;
     }

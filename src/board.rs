@@ -1,7 +1,9 @@
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks, between};
+use crate::alloc::HugeBox;
+use crate::attacks::{between, bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
 use crate::bitboard::Bitboard;
-use crate::nnue::{Accumulator, FeatureDelta, ThreatAccumulator, ThreatList, HIDDEN_SIZE};
-use crate::types::{Color, Move, MoveType, Piece, PieceType, Square, COLOR_NB, PIECE_NB, SQUARE_NB, ACC_STACK_SIZE};
+use crate::nnue::{Accumulator, FeatureDelta, ThreatAccumulator, ThreatList};
+use crate::search::MAX_PLY;
+use crate::types::{COLOR_NB, Color, Move, MoveType, PIECE_NB, Piece, PieceType, SQUARE_NB, Square};
 use crate::zobrist::{castling_key, ep_key, fiftymove_key, piece_key, side_key};
 
 pub const STARTING_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -24,12 +26,46 @@ pub struct UndoState {
     pub halfmove_clock: u8,
     pub captured: Piece,
     pub hash: u64,
+    pub pawn_hash: u64,
     pub non_pawn_hash: [u64; 2],
-    /// Feature changes of the move, replayed backwards by `undo_move`.
-    pub delta: FeatureDelta,
 }
 
+// stack size for per-ply frames. MAX_PLY + 4 for safety margin
+const FRAME_STACK_SIZE: usize = MAX_PLY + 4;
+
+// per-ply accumulator state for lazy evaluation
+#[repr(C, align(64))]
 #[derive(Clone)]
+struct AccumulatorFrame {
+    pub accumulator: Accumulator,
+    pub delta: FeatureDelta,
+    pub dirty: [bool; 2],
+    pub refresh: [bool; 2],
+    pub ksq: [Square; 2],
+}
+// per-ply threat state: accumulators, lists, and mirror state for one ply
+#[repr(C, align(64))]
+#[derive(Clone)]
+struct ThreatFrame {
+    pub threat: ThreatAccumulator,
+    // index of frame with actual threat data
+    pub threat_base: usize,
+    pub threat_king_mirrored: [bool; 2],
+    pub dirty: bool,
+    pub last_move: Move,
+    pub last_captured: Piece,
+}
+// the rook squares of a castle, keyed by the king's destination
+fn castling_rook_squares(king_to: Square) -> (Square, Square) {
+    match king_to {
+        Square::G1 => (Square::H1, Square::F1),
+        Square::C1 => (Square::A1, Square::D1),
+        Square::G8 => (Square::H8, Square::F8),
+        Square::C8 => (Square::A8, Square::D8),
+        _ => unreachable!(),
+    }
+}
+
 pub struct Board {
     pub pieces: [Bitboard; PIECE_NB],
     pub occupied_co: [Bitboard; COLOR_NB],
@@ -44,22 +80,48 @@ pub struct Board {
     pub tt_hash: u64,
     pub pawn_hash: u64,
     pub non_pawn_hash: [u64; 2],
-    pub history: Vec<u64>,
-    // Index in `history` of the search root. Repetitions at or after it are
-    // twofold draws, repetitions before it need a third occurrence.
+    pub history: [u64; 1024],
+    pub hist_len: usize,
+    // root index in history (2-fold after root, 3-fold before)
     pub root_ply: usize,
-    pub accumulator: Accumulator,
-    /// Threat inputs are accumulated separately from the piece-square rows:
-    /// they depend on which pieces attack which, not on where the pieces are
-    /// relative to the king, so a move only touches the rows of threats it
-    /// creates or destroys. `threat_lists` holds the exact feature set that was
-    /// summed into `threat`, which is what makes that diff exact.
-    pub threat: ThreatAccumulator,
-    pub threat_lists: [ThreatList; 2],
-    /// Parent half-accumulator saved only for moves that refresh one side from
-    /// scratch (a king crossing a bucket or the centre mirror). Indexed by ply.
-    pub acc_backup: Box<[[i16; HIDDEN_SIZE]; ACC_STACK_SIZE]>,
-    pub acc_depth: usize,
+    // per-ply accumulator frames for lazy evaluation
+    acc_frames: HugeBox<[AccumulatorFrame; FRAME_STACK_SIZE]>,
+    // per-ply threat frames. Indexed by acc_depth (same depth as accumulator)
+    threat_frames: HugeBox<[ThreatFrame; FRAME_STACK_SIZE]>,
+    // current depth in the threat/accumulator stacks. Incremented on make_move,
+    // decremented on undo_move/null_move.
+    acc_depth: usize,
+}
+impl Clone for Board {
+    fn clone(&self) -> Self {
+        let mut new_frames: HugeBox<[AccumulatorFrame; FRAME_STACK_SIZE]> = HugeBox::zeroed();
+        let mut new_threat_frames: HugeBox<[ThreatFrame; FRAME_STACK_SIZE]> = HugeBox::zeroed();
+        for i in 0..FRAME_STACK_SIZE {
+            new_frames[i] = self.acc_frames[i].clone();
+            new_threat_frames[i] = self.threat_frames[i].clone();
+        }
+        Self {
+            pieces: self.pieces,
+            occupied_co: self.occupied_co,
+            occupied: self.occupied,
+            piece_on: self.piece_on,
+            side_to_move: self.side_to_move,
+            castling_rights: self.castling_rights,
+            ep_square: self.ep_square,
+            halfmove_clock: self.halfmove_clock,
+            fullmove_number: self.fullmove_number,
+            hash: self.hash,
+            tt_hash: self.tt_hash,
+            pawn_hash: self.pawn_hash,
+            non_pawn_hash: self.non_pawn_hash,
+            history: self.history,
+            hist_len: self.hist_len,
+            root_ply: self.root_ply,
+            acc_frames: new_frames,
+            threat_frames: new_threat_frames,
+            acc_depth: self.acc_depth,
+        }
+    }
 }
 
 impl Board {
@@ -83,100 +145,479 @@ impl Board {
             tt_hash: 0,
             pawn_hash: 0,
             non_pawn_hash: [0; 2],
-            history: Vec::with_capacity(256),
+            history: [0; 1024],
+            hist_len: 0,
             root_ply: 0,
-            accumulator: Accumulator::new(),
-            threat: ThreatAccumulator::new(),
-            threat_lists: [ThreatList::new(); 2],
-            acc_backup: vec![[0i16; HIDDEN_SIZE]; ACC_STACK_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
+            acc_frames: HugeBox::zeroed(),
+            threat_frames: HugeBox::zeroed(),
             acc_depth: 0,
         }
     }
 
-    /// The accumulator is updated in place, so there is no per-ply stack to
-    /// reset. Only the backup cursor has to return to the root.
+    // returns the current threat frame for the current ply
+    #[inline(always)]
+    fn threat_frame(&mut self) -> &mut ThreatFrame {
+        &mut self.threat_frames[self.acc_depth]
+    }
+
+    // returns the current threat frame for the current ply (immutable)
+    #[inline(always)]
+    fn threat_frame_immut(&self) -> &ThreatFrame {
+        &self.threat_frames[self.acc_depth]
+    }
+
+    // returns the current accumulator frame for the current ply
+    #[inline(always)]
+    fn acc_frame(&mut self) -> &mut AccumulatorFrame {
+        &mut self.acc_frames[self.acc_depth]
+    }
+
+    // returns the current accumulator frame for the current ply (immutable)
+    #[inline(always)]
+    fn acc_frame_immut(&self) -> &AccumulatorFrame {
+        &self.acc_frames[self.acc_depth]
+    }
+
+    // reset accumulator stack to root
     pub fn reset_accumulator_stack(&mut self) {
         self.acc_depth = 0;
+        self.acc_frames[0].dirty = [true, true];
+        self.acc_frames[0].refresh = [false, false];
+        self.threat_frames[0].dirty = true;
+    }
+
+    // returns the current accumulator for the current ply, computing it if dirty
+    #[inline(always)]
+    pub fn accumulator(&mut self) -> &mut Accumulator {
+        self.ensure_accumulator_ready();
+        &mut self.acc_frame().accumulator
+    }
+
+    // returns the current accumulator for the current ply (immutable)
+    #[inline(always)]
+    pub fn accumulator_immut(&self) -> &Accumulator {
+        &self.acc_frame_immut().accumulator
     }
 
     pub fn refresh_accumulator(&mut self) {
-        self.accumulator = Accumulator::new();
         let w_ksq = self.king_square(Color::White);
         let b_ksq = self.king_square(Color::Black);
-        for sq in 0..64 {
-            let piece = self.piece_on[sq];
-            if piece != Piece::None {
-                self.accumulator
-                    .add_feature(piece, Square::new(sq as u8), w_ksq, b_ksq);
-            }
-        }
+        let piece_on = self.piece_on;
+        let occ = self.occupied;
+
+        let frame = self.acc_frame();
+        frame.accumulator.refresh_side_occ(&piece_on, occ, w_ksq, Color::White);
+        frame.accumulator.refresh_side_occ(&piece_on, occ, b_ksq, Color::Black);
+        frame.dirty = [false, false];
+        frame.refresh = [false, false];
+        frame.ksq = [w_ksq, b_ksq];
+
+        let d = self.acc_depth;
+        let threat_frame = self.threat_frame();
+        threat_frame.threat = ThreatAccumulator::new();
+        threat_frame.threat_base = d;
+        threat_frame.dirty = true;
+        threat_frame.threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
+        threat_frame.last_move = Move::NULL;
+        threat_frame.last_captured = Piece::None;
         self.refresh_threats();
     }
 
-    /// Rebuilds the threat inputs from scratch. Only the reference path and
-    /// position setup use this; moves update the same state incrementally.
+    #[inline(always)]
+    pub fn ensure_accumulator_ready(&mut self) {
+        let d = self.acc_depth;
+        if !self.acc_frames[d].dirty[0] && !self.acc_frames[d].dirty[1] {
+            return;
+        }
+
+        for side in 0..2 {
+            if !self.acc_frames[d].dirty[side] {
+                continue;
+            }
+
+            let mut anc = d;
+            while anc > 0 && self.acc_frames[anc].dirty[side] && !self.acc_frames[anc].refresh[side] {
+                anc -= 1;
+            }
+
+            if self.acc_frames[anc].dirty[side] {
+                let color = Color::from_index(side);
+                let ksq = self.king_square(color);
+                let piece_on = self.piece_on;
+                let occ = self.occupied;
+                self.acc_frames[d].accumulator.refresh_side_occ(&piece_on, occ, ksq, color);
+                self.acc_frames[d].dirty[side] = false;
+            } else {
+                for k in (anc + 1)..=d {
+                    let delta = self.acc_frames[k].delta;
+                    let (left, right) = self.acc_frames.split_at_mut(k);
+                    right[0].accumulator.apply_delta_from_side(&left[k - 1].accumulator, side, &delta);
+                    right[0].dirty[side] = false;
+                }
+            }
+        }
+    }
+
+    // full rebuild of threat accumulator
     pub fn refresh_threats(&mut self) {
-        let Some(heimdall) = crate::nnue::network().heimdall.as_deref() else {
-            // The legacy network has no threat inputs; leaving the accumulator
-            // zeroed keeps both formats on one board representation.
-            self.threat = ThreatAccumulator::new();
-            self.threat_lists = [ThreatList::new(); 2];
+        let Some(ml) = crate::nnue::network().multilayer.as_deref() else {
+            // compute king mirrored state before getting mutable frame
+            let w_ksq = self.king_square(Color::White);
+            let b_ksq = self.king_square(Color::Black);
+            let threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
+            let d = self.acc_depth;
+            let frame = self.threat_frame();
+            frame.threat = ThreatAccumulator::new();
+            frame.threat_base = d;
+            frame.dirty = false;
+            frame.threat_king_mirrored = threat_king_mirrored;
+            frame.last_move = Move::NULL;
+            frame.last_captured = Piece::None;
             return;
         };
-        let Some(weights) = heimdall.threat_weights.as_deref() else {
+        let Some(weights) = ml.threat_weights.as_deref() else {
+            // compute king mirrored state before getting mutable frame
+            let w_ksq = self.king_square(Color::White);
+            let b_ksq = self.king_square(Color::Black);
+            let threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
+            let frame = self.threat_frame();
+            frame.dirty = false;
+            frame.threat_king_mirrored = threat_king_mirrored;
+            frame.last_move = Move::NULL;
+            frame.last_captured = Piece::None;
             return;
         };
 
+        // collect threat lists for both sides before mutably borrowing the frame
+        let mut lists = [ThreatList::new(), ThreatList::new()];
+        let mut mirrored = [false; 2];
         for side in 0..2 {
-            let mut list = ThreatList::new();
-            crate::nnue::collect_threats(self, Color::from_index(side), &mut list);
-            self.threat.refresh_side(side, &list, weights);
-            self.threat_lists[side] = list;
+            let ksq = self.king_square(Color::from_index(side));
+            mirrored[side] = ksq.file() >= 4;
+        }
+        crate::nnue::collect_threats_both_unsorted(self, [true, true], &mut lists);
+
+        let d = self.acc_depth;
+        let frame = self.threat_frame();
+        frame.threat_base = d;
+
+        for side in 0..2 {
+            frame.threat.refresh_side(side, &lists[side], weights);
+            frame.threat_king_mirrored[side] = mirrored[side];
+        }
+        frame.dirty = false;
+        frame.last_move = Move::NULL;
+        frame.last_captured = Piece::None;
+    }
+
+    #[inline(always)]
+    fn update_threat_frame_step(&mut self, src_idx: usize, dst_idx: usize, m: Move, captured: Piece, weights: &crate::nnue::ThreatWeights) {
+        self.threat_frames[dst_idx].threat_base = dst_idx;
+        let src_base = self.threat_frames[src_idx].threat_base;
+        let mirrored = [self.king_square(Color::White).file() >= 4, self.king_square(Color::Black).file() >= 4];
+        let prev_mirrored = self.threat_frames[src_idx].threat_king_mirrored;
+        let need_inc = [mirrored[0] == prev_mirrored[0], mirrored[1] == prev_mirrored[1]];
+
+        let mut subs = [ThreatList::new(), ThreatList::new()];
+        let mut adds = [ThreatList::new(), ThreatList::new()];
+
+        if need_inc[0] || need_inc[1] {
+            let changed = self.move_changed_squares(m);
+            let occ_after = self.occupied;
+            let occ_before = self.occupancy_before(m, captured);
+
+            crate::nnue::append_changed_square_threats_both(self, changed, need_inc, &mut adds);
+            crate::nnue::collect_xray_threat_diffs_both(self, changed, occ_before, occ_after, need_inc, &mut subs, &mut adds);
+            self.toggle_pieces_backward(m, captured);
+            crate::nnue::append_changed_square_threats_both(self, changed, need_inc, &mut subs);
+            self.toggle_pieces_forward(m, captured);
+        }
+
+        // prefetch removed for benchmark
+        for side in 0..2 {
+            if need_inc[side] {
+                let (left, right) = self.threat_frames.split_at_mut(dst_idx);
+                right[0]
+                    .threat
+                    .apply_lists_from(&left[src_base].threat, side, weights, subs[side].as_slice(), adds[side].as_slice());
+            } else {
+                let mut full = ThreatList::new();
+                crate::nnue::collect_threats(self, Color::from_index(side), &mut full);
+                self.threat_frames[dst_idx].threat.refresh_side(side, &full, weights);
+            }
+            self.threat_frames[dst_idx].threat_king_mirrored[side] = mirrored[side];
+        }
+        self.threat_frames[dst_idx].dirty = false;
+    }
+
+    #[inline(always)]
+    pub fn ensure_threats_ready(&mut self) {
+        let d = self.acc_depth;
+        if !self.threat_frames[d].dirty {
+            return;
+        }
+
+        let Some(ml) = crate::nnue::network().multilayer.as_deref() else {
+            let w_ksq = self.king_square(Color::White);
+            let b_ksq = self.king_square(Color::Black);
+            let frame = &mut self.threat_frames[d];
+            frame.threat = ThreatAccumulator::new();
+            frame.threat_base = d;
+            frame.dirty = false;
+            frame.threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
+            return;
+        };
+        let Some(weights) = ml.threat_weights.as_deref() else {
+            let w_ksq = self.king_square(Color::White);
+            let b_ksq = self.king_square(Color::Black);
+            let frame = &mut self.threat_frames[d];
+            frame.threat_base = d;
+            frame.dirty = false;
+            frame.threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
+            return;
+        };
+
+        let mut anc = d;
+        let mut non_null_count = 0usize;
+        while anc > 0 && self.threat_frames[anc].dirty {
+            if self.threat_frames[anc].last_move != Move::NULL {
+                non_null_count += 1;
+            }
+            anc -= 1;
+        }
+
+        if self.threat_frames[anc].dirty || non_null_count >= 6 {
+            self.refresh_threats();
+            return;
+        }
+
+        if non_null_count == 0 {
+            let prev_base = self.threat_frames[anc].threat_base;
+            let prev_mirrored = self.threat_frames[anc].threat_king_mirrored;
+            let frame = &mut self.threat_frames[d];
+            frame.threat_base = prev_base;
+            frame.threat_king_mirrored = prev_mirrored;
+            frame.dirty = false;
+            return;
+        }
+
+        if d == anc + 1 {
+            let m = self.threat_frames[d].last_move;
+            let cap = self.threat_frames[d].last_captured;
+            self.update_threat_frame_step(anc, d, m, cap, weights);
+            return;
+        }
+
+        for k in ((anc + 1)..=d).rev() {
+            let m = self.threat_frames[k].last_move;
+            if m != Move::NULL {
+                let cap = self.threat_frames[k].last_captured;
+                self.toggle_pieces_backward(m, cap);
+            }
+        }
+
+        for k in (anc + 1)..=d {
+            let m = self.threat_frames[k].last_move;
+            if m == Move::NULL {
+                let (left, right) = self.threat_frames.split_at_mut(k);
+                right[0].threat_base = left[k - 1].threat_base;
+                right[0].threat_king_mirrored = left[k - 1].threat_king_mirrored;
+                right[0].dirty = false;
+            } else {
+                let cap = self.threat_frames[k].last_captured;
+                self.toggle_pieces_forward(m, cap);
+                self.update_threat_frame_step(k - 1, k, m, cap, weights);
+            }
         }
     }
 
-    /// Advances the threat inputs to the current position. Only the threat rows
-    /// that appeared or disappeared are touched, which is what keeps a move from
-    /// costing a full 60144-feature rebuild. Slider discoveries, en passant and
-    /// castling need no special cases: the collector derives the active set from
-    /// the board, and the diff against the stored set is exact by construction.
-    pub fn sync_threats_with(&mut self, weights: &crate::nnue::ThreatWeights) {
-        for side in 0..2 {
-            let mut next = ThreatList::new();
-            crate::nnue::collect_threats(self, Color::from_index(side), &mut next);
-            self.threat.apply_diff(
-                side,
-                weights,
-                self.threat_lists[side].as_slice(),
-                next.as_slice(),
-            );
-            self.threat_lists[side] = next;
+    // returns the current threat accumulator for the current ply
+    #[inline(always)]
+    pub fn threat(&mut self) -> &mut ThreatAccumulator {
+        self.ensure_threats_ready();
+        let d = self.acc_depth;
+        let base = self.threat_frames[d].threat_base;
+        &mut self.threat_frames[base].threat
+    }
+
+    // returns the current threat accumulator for the current ply (immutable)
+    #[inline(always)]
+    pub fn threat_immut(&self) -> &ThreatAccumulator {
+        let d = self.acc_depth;
+        let base = self.threat_frames[d].threat_base;
+        &self.threat_frames[base].threat
+    }
+
+    // current threat mirror state
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn threat_king_mirrored(&self) -> &[bool; 2] {
+        &self.threat_frame_immut().threat_king_mirrored
+    }
+
+    // returns the current threat dirty flag for the current ply
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn threat_dirty(&self) -> bool {
+        self.threat_frame_immut().dirty
+    }
+
+    // sets the threat dirty flag for the current ply
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn set_threat_dirty(&mut self) {
+        self.threat_frame().dirty = true;
+    }
+
+    // squares changed by move
+    pub(crate) fn move_changed_squares(&self, m: Move) -> Bitboard {
+        let mut changed = Bitboard::from_square(m.from()) | Bitboard::from_square(m.to());
+        match m.move_type() {
+            MoveType::EnPassant => {
+                changed |= Bitboard::from_square(Square::from_coords(m.to().file(), m.from().rank()));
+            }
+            MoveType::Castling => {
+                let (rook_from, rook_to) = castling_rook_squares(m.to());
+                changed |= Bitboard::from_square(rook_from) | Bitboard::from_square(rook_to);
+            }
+            _ => {}
+        }
+        changed
+    }
+
+    #[inline(always)]
+    pub(crate) fn occupancy_before(&self, m: Move, captured: Piece) -> Bitboard {
+        let mut occ = self.occupied;
+        if captured == Piece::None {
+            occ.clear(m.to());
+        }
+        occ.set(m.from());
+        match m.move_type() {
+            MoveType::EnPassant => {
+                occ.set(Square::from_coords(m.to().file(), m.from().rank()));
+            }
+            MoveType::Castling => {
+                let (rook_from, rook_to) = castling_rook_squares(m.to());
+                occ.clear(rook_to);
+                occ.set(rook_from);
+            }
+            _ => {}
+        }
+        occ
+    }
+
+    #[inline(always)]
+    fn put_piece_no_hash(&mut self, piece: Piece, sq: Square) {
+        self.pieces[piece].set(sq);
+        self.occupied_co[piece.color()].set(sq);
+        self.occupied.set(sq);
+        self.piece_on[sq] = piece;
+    }
+
+    #[inline(always)]
+    fn remove_piece_no_hash(&mut self, sq: Square) -> Piece {
+        let piece = self.piece_on[sq];
+        if piece != Piece::None {
+            self.pieces[piece].clear(sq);
+            self.occupied_co[piece.color()].clear(sq);
+            self.occupied.clear(sq);
+            self.piece_on[sq] = Piece::None;
+        }
+        piece
+    }
+
+    #[inline(always)]
+    fn toggle_pieces_backward(&mut self, m: Move, captured: Piece) {
+        let from = m.from();
+        let to = m.to();
+        match m.move_type() {
+            MoveType::Normal => {
+                let moved = self.remove_piece_no_hash(to);
+                self.put_piece_no_hash(moved, from);
+                if captured != Piece::None {
+                    self.put_piece_no_hash(captured, to);
+                }
+            }
+            MoveType::Castling => {
+                let moved = self.remove_piece_no_hash(to);
+                self.put_piece_no_hash(moved, from);
+                let (rook_from, rook_to) = castling_rook_squares(to);
+                let rook = self.remove_piece_no_hash(rook_to);
+                self.put_piece_no_hash(rook, rook_from);
+            }
+            MoveType::EnPassant => {
+                let moved = self.remove_piece_no_hash(to);
+                self.put_piece_no_hash(moved, from);
+                let cap_sq = Square::from_coords(to.file(), from.rank());
+                self.put_piece_no_hash(Piece::new(!moved.color(), PieceType::Pawn), cap_sq);
+            }
+            MoveType::Promotion => {
+                let promo = self.remove_piece_no_hash(to);
+                self.put_piece_no_hash(Piece::new(promo.color(), PieceType::Pawn), from);
+                if captured != Piece::None {
+                    self.put_piece_no_hash(captured, to);
+                }
+            }
         }
     }
 
-    /// Rebuilds the parent's threat inputs from the child's feature sets, which
-    /// is the exact reverse of [`Board::sync_threats_with`].
-    pub fn restore_threats_with(
-        &mut self,
-        weights: &crate::nnue::ThreatWeights,
-        child: &[ThreatList; 2],
-    ) {
-        for (side, child_list) in child.iter().enumerate() {
-            let mut parent = ThreatList::new();
-            crate::nnue::collect_threats(self, Color::from_index(side), &mut parent);
-            self.threat
-                .apply_diff(side, weights, child_list.as_slice(), parent.as_slice());
-            self.threat_lists[side] = parent;
+    #[inline(always)]
+    fn toggle_pieces_forward(&mut self, m: Move, captured: Piece) {
+        let from = m.from();
+        let to = m.to();
+        match m.move_type() {
+            MoveType::Normal => {
+                let moved = self.remove_piece_no_hash(from);
+                if captured != Piece::None {
+                    self.remove_piece_no_hash(to);
+                }
+                self.put_piece_no_hash(moved, to);
+            }
+            MoveType::Castling => {
+                let moved = self.remove_piece_no_hash(from);
+                self.put_piece_no_hash(moved, to);
+                let (rook_from, rook_to) = castling_rook_squares(to);
+                let rook = self.remove_piece_no_hash(rook_from);
+                self.put_piece_no_hash(rook, rook_to);
+            }
+            MoveType::EnPassant => {
+                let moved = self.remove_piece_no_hash(from);
+                let cap_sq = Square::from_coords(to.file(), from.rank());
+                self.remove_piece_no_hash(cap_sq);
+                self.put_piece_no_hash(moved, to);
+            }
+            MoveType::Promotion => {
+                let moved = self.remove_piece_no_hash(from);
+                if captured != Piece::None {
+                    self.remove_piece_no_hash(to);
+                }
+                self.put_piece_no_hash(Piece::new(moved.color(), m.promo_type()), to);
+            }
         }
+    }
+
+    // occupancy after move without modifying board
+    #[allow(dead_code)]
+    pub(crate) fn occupancy_after(&self, m: Move) -> Bitboard {
+        let mut occ = self.occupied;
+        occ.clear(m.from());
+        occ.set(m.to());
+        match m.move_type() {
+            MoveType::EnPassant => occ.clear(Square::from_coords(m.to().file(), m.from().rank())),
+            MoveType::Castling => {
+                let (rook_from, rook_to) = castling_rook_squares(m.to());
+                occ.clear(rook_from);
+                occ.set(rook_to);
+            }
+            _ => {}
+        }
+        occ
     }
 
     pub fn refresh_accumulator_side(&mut self, color: Color) {
         let piece_on = self.piece_on;
         let ksq = self.king_square(color);
-        self.accumulator.refresh_side(&piece_on, ksq, color);
+        self.accumulator().refresh_side(&piece_on, ksq, color);
     }
 
     pub fn from_fen(fen: &str) -> Result<Self, String> {
@@ -253,9 +694,7 @@ impl Board {
             }
         }
 
-        // A FEN may claim castling rights whose king or rook is not on its
-        // home square. Keeping such a right would later place a Piece::None on
-        // the board during castling, which indexes out of bounds.
+        // drop castling rights if king/rook not on home square
         let mut rights = board.castling_rights;
         if board.piece_on[Square::E1] != Piece::WhiteKing {
             rights &= !(Self::CASTLE_WK | Self::CASTLE_WQ);
@@ -302,8 +741,7 @@ impl Board {
         }
 
         if parts.len() > 4 {
-            // The clock is stored in a u8 and is only meaningful up to the
-            // fifty-move limit, so anything larger is clamped.
+            // clamp halfmove clock to u8
             board.halfmove_clock = parts[4].parse::<u32>().unwrap_or(0).min(255) as u8;
         }
 
@@ -311,18 +749,12 @@ impl Board {
             board.fullmove_number = parts[5].parse::<u16>().unwrap_or(1).max(1);
         }
 
-        if board.pieces[Piece::WhiteKing].count() != 1
-            || board.pieces[Piece::BlackKing].count() != 1
-        {
+        if board.pieces[Piece::WhiteKing].count() != 1 || board.pieces[Piece::BlackKing].count() != 1 {
             return Err("FEN must contain exactly one king per side".to_string());
         }
 
-        // The side that just moved may not be left in check: otherwise the
-        // search could capture a king and king_square would return Square::None.
-        if board.is_square_attacked(
-            board.king_square(!board.side_to_move),
-            board.side_to_move,
-        ) {
+        // side not to move can't be in check
+        if board.is_square_attacked(board.king_square(!board.side_to_move), board.side_to_move) {
             return Err("FEN has the side not to move in check".to_string());
         }
 
@@ -429,14 +861,12 @@ impl Board {
             return true;
         }
 
-        let opp_bishops_queens = self.pieces[Piece::new(by_color, PieceType::Bishop)]
-            | self.pieces[Piece::new(by_color, PieceType::Queen)];
+        let opp_bishops_queens = self.pieces[Piece::new(by_color, PieceType::Bishop)] | self.pieces[Piece::new(by_color, PieceType::Queen)];
         if !(bishop_attacks(sq, self.occupied) & opp_bishops_queens).is_empty() {
             return true;
         }
 
-        let opp_rooks_queens = self.pieces[Piece::new(by_color, PieceType::Rook)]
-            | self.pieces[Piece::new(by_color, PieceType::Queen)];
+        let opp_rooks_queens = self.pieces[Piece::new(by_color, PieceType::Rook)] | self.pieces[Piece::new(by_color, PieceType::Queen)];
         if !(rook_attacks(sq, self.occupied) & opp_rooks_queens).is_empty() {
             return true;
         }
@@ -457,10 +887,8 @@ impl Board {
         let them = !self.side_to_move;
         let pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
         let knights = self.pieces[Piece::new(them, PieceType::Knight)];
-        let bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
-            | self.pieces[Piece::new(them, PieceType::Queen)];
-        let rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
-            | self.pieces[Piece::new(them, PieceType::Queen)];
+        let bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
+        let rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
         let king = self.pieces[Piece::new(them, PieceType::King)];
         (pawn_attacks(self.side_to_move, ksq) & pawns)
             | (knight_attacks(ksq) & knights)
@@ -472,12 +900,9 @@ impl Board {
     pub fn pinned_pieces(&self, color: Color) -> Bitboard {
         let ksq = self.king_square(color);
         let them = !color;
-        let bq = self.pieces[Piece::new(them, PieceType::Bishop)]
-            | self.pieces[Piece::new(them, PieceType::Queen)];
-        let rq = self.pieces[Piece::new(them, PieceType::Rook)]
-            | self.pieces[Piece::new(them, PieceType::Queen)];
-        let mut sliders = (bishop_attacks(ksq, Bitboard::EMPTY) & bq)
-            | (rook_attacks(ksq, Bitboard::EMPTY) & rq);
+        let bq = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
+        let rq = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
+        let mut sliders = (bishop_attacks(ksq, Bitboard::EMPTY) & bq) | (rook_attacks(ksq, Bitboard::EMPTY) & rq);
         let mut pinned = Bitboard::EMPTY;
         while !sliders.is_empty() {
             let sq = sliders.pop_lsb();
@@ -520,8 +945,7 @@ impl Board {
                             Color::Black => (-8i8, 6u8, 0u8),
                         };
 
-                        // A pawn reaching the last rank must be encoded as a
-                        // promotion, never as a normal push.
+                        // last rank pawn move must be promotion
                         if to.rank() == promo_rank {
                             return false;
                         }
@@ -628,8 +1052,7 @@ impl Board {
                 Square::C8 => (Square::A8, Square::D8),
                 _ => return false,
             };
-            let rook_occ =
-                (occ ^ Bitboard::from_square(rook_from)) | Bitboard::from_square(rook_to);
+            let rook_occ = (occ ^ Bitboard::from_square(rook_from)) | Bitboard::from_square(rook_to);
             return rook_attacks(rook_to, rook_occ).contains(ksq);
         }
 
@@ -649,9 +1072,7 @@ impl Board {
         }
     }
 
-    /// Squares from which one of our pieces of a given type would check the
-    /// enemy king, indexed by `PieceType`. Preparing it once per node turns the
-    /// per-move test into a single bitboard lookup instead of two slider lookups.
+    // squares that give check per piece type
     #[inline(always)]
     pub fn check_squares(&self) -> [Bitboard; 6] {
         let us = self.side_to_move;
@@ -668,20 +1089,14 @@ impl Board {
         squares
     }
 
-    /// `gives_direct_check` evaluated against a table from `check_squares`.
-    /// Castling is the exception: the rook gives the check there, not the king.
+    // fast direct check using check_squares
     #[inline(always)]
     pub fn gives_check_with(&self, m: Move, check_squares: &[Bitboard; 6]) -> bool {
-        if m.move_type() == MoveType::Castling {
+        if m.move_type() == MoveType::Castling || m.move_type() == MoveType::Promotion {
             return self.gives_direct_check(m);
         }
 
-        let pt = if m.move_type() == MoveType::Promotion {
-            m.promo_type()
-        } else {
-            self.piece_on[m.from()].piece_type()
-        };
-
+        let pt = self.piece_on[m.from()].piece_type();
         pt != PieceType::None && check_squares[pt as usize].contains(m.to())
     }
 
@@ -690,9 +1105,7 @@ impl Board {
         self.is_legal_with(m, self.checkers(), self.pinned_pieces(us))
     }
 
-    /// Legality check with king-attack information computed by the caller for
-    /// the current side to move. Callers that test many moves in the same
-    /// position should compute both masks once instead of per move.
+    // legality check reusing checkers and pinned masks
     #[inline(always)]
     pub fn is_legal_with(&self, m: Move, checkers: Bitboard, pinned: Bitboard) -> bool {
         let us = self.side_to_move;
@@ -714,8 +1127,7 @@ impl Board {
             }
         } else if num_checkers == 1 && moving_piece.piece_type() != PieceType::King {
             let checker_sq = checkers.lsb();
-            let ep_takes_checker = m.move_type() == MoveType::EnPassant
-                && Square::from_coords(to.file(), from.rank()) == checker_sq;
+            let ep_takes_checker = m.move_type() == MoveType::EnPassant && Square::from_coords(to.file(), from.rank()) == checker_sq;
             if !ep_takes_checker && !((between(ksq, checker_sq) | checkers).contains(to)) {
                 return false;
             }
@@ -727,10 +1139,8 @@ impl Board {
             occ.set(to);
             let opp_pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
             let opp_knights = self.pieces[Piece::new(them, PieceType::Knight)];
-            let opp_bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
-                | self.pieces[Piece::new(them, PieceType::Queen)];
-            let opp_rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
-                | self.pieces[Piece::new(them, PieceType::Queen)];
+            let opp_bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
+            let opp_rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
             let opp_king = self.pieces[Piece::new(them, PieceType::King)];
             return (pawn_attacks(us, to) & opp_pawns).is_empty()
                 && (knight_attacks(to) & opp_knights).is_empty()
@@ -750,13 +1160,10 @@ impl Board {
             occ.clear(cap_sq);
             occ.set(to);
 
-            let opp_bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
-                | self.pieces[Piece::new(them, PieceType::Queen)];
-            let opp_rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
-                | self.pieces[Piece::new(them, PieceType::Queen)];
+            let opp_bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
+            let opp_rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
 
-            return (bishop_attacks(ksq, occ) & opp_bishops_queens).is_empty()
-                && (rook_attacks(ksq, occ) & opp_rooks_queens).is_empty();
+            return (bishop_attacks(ksq, occ) & opp_bishops_queens).is_empty() && (rook_attacks(ksq, occ) & opp_rooks_queens).is_empty();
         }
 
         if pinned.contains(from) {
@@ -830,10 +1237,30 @@ impl Board {
         self.is_repetition()
             || (self.halfmove_clock >= 100
                 && (!self.in_check() || crate::movegen::generate_legal_moves(self).count > 0))
-            // Material draws need at most four pieces on the board (K vs K,
-            // K+N vs K, K+B vs K, same-coloured bishops), so the expensive
-            // pawn/rook/queen scan is skipped in every other position.
+            // material draw needs <= 4 pieces
             || (self.occupied.count() <= 4 && self.draw_by_material())
+    }
+
+    // pieces that can give discovered check
+    #[inline(always)]
+    pub fn discovered_check_candidates(&self) -> Bitboard {
+        let us = self.side_to_move;
+        let them = !us;
+        let ksq = self.king_square(them);
+        let mut candidates = Bitboard::EMPTY;
+
+        let mut snipers = (bishop_attacks(ksq, Bitboard::EMPTY) & (self.pieces[Piece::new(us, PieceType::Bishop)] | self.pieces[Piece::new(us, PieceType::Queen)]))
+            | (rook_attacks(ksq, Bitboard::EMPTY) & (self.pieces[Piece::new(us, PieceType::Rook)] | self.pieces[Piece::new(us, PieceType::Queen)]));
+
+        while !snipers.is_empty() {
+            let sniper = snipers.pop_lsb();
+            let blockers = between(sniper, ksq) & self.occupied;
+            if blockers.count() == 1 {
+                candidates |= blockers & self.occupied_co[us];
+            }
+        }
+
+        candidates
     }
 
     #[inline(always)]
@@ -841,17 +1268,12 @@ impl Board {
         let them = !self.side_to_move;
         let pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
         match them {
-            Color::White => {
-                (pawns & !Bitboard(0x8080808080808080u64)) << 9
-                    | (pawns & !Bitboard(0x0101010101010101u64)) << 7
-            }
-            Color::Black => {
-                (pawns & !Bitboard(0x8080808080808080u64)) >> 7
-                    | (pawns & !Bitboard(0x0101010101010101u64)) >> 9
-            }
+            Color::White => (pawns & !Bitboard(0x8080808080808080u64)) << 9 | (pawns & !Bitboard(0x0101010101010101u64)) << 7,
+            Color::Black => (pawns & !Bitboard(0x8080808080808080u64)) >> 7 | (pawns & !Bitboard(0x0101010101010101u64)) >> 9,
         }
     }
 
+    #[allow(dead_code)]
     pub fn opponent_threats(&self) -> Bitboard {
         let them = !self.side_to_move;
         let mut threats = self.opponent_pawn_threats();
@@ -862,14 +1284,12 @@ impl Board {
         }
 
         let occ = self.occupied;
-        let mut bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)]
-            | self.pieces[Piece::new(them, PieceType::Queen)];
+        let mut bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
         while !bishops_queens.is_empty() {
             threats |= bishop_attacks(bishops_queens.pop_lsb(), occ);
         }
 
-        let mut rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)]
-            | self.pieces[Piece::new(them, PieceType::Queen)];
+        let mut rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
         while !rooks_queens.is_empty() {
             threats |= rook_attacks(rooks_queens.pop_lsb(), occ);
         }
@@ -882,7 +1302,7 @@ impl Board {
 
     #[inline(always)]
     pub fn is_repetition(&self) -> bool {
-        let count = self.history.len();
+        let count = self.hist_len;
         if count < 4 || self.halfmove_clock < 4 {
             return false;
         }
@@ -893,9 +1313,7 @@ impl Board {
         while i <= max_steps {
             let idx = count - i;
             if self.history[idx] == self.hash {
-                // A repetition strictly inside the search tree is a draw at
-                // once; one that also existed before the root needs a third
-                // occurrence before the fifty-move rule is satisfied.
+                // 2-fold in tree, 3-fold before root
                 if idx >= self.root_ply || earlier_reps > 0 {
                     return true;
                 }
@@ -908,7 +1326,7 @@ impl Board {
     }
 
     pub fn upcoming_repetition(&self) -> bool {
-        let count = self.history.len();
+        let count = self.hist_len;
         let max_steps = (self.halfmove_clock as usize).min(count);
         if max_steps < 3 {
             return false;
@@ -916,15 +1334,14 @@ impl Board {
 
         let current_key = self.hash;
         let mut index = count - 1;
-        // Hoisted: `cuckoo()` goes through a OnceLock, which has no business
-        // running inside the repetition loop.
+        // hoist cuckoo lookup out of loop
         let cuckoo = crate::zobrist::cuckoo();
 
         let mut compared_ply = 3;
         while compared_ply <= max_steps {
             index -= 2;
 
-            // Exact xor difference between the current and an older position.
+            // exact xor difference between the current and an older position
             let diff = current_key ^ self.history[index];
             let mut c_idx = crate::zobrist::h1(diff);
 
@@ -946,12 +1363,10 @@ impl Board {
                     (sq2, sq1)
                 };
 
-                // Build a pseudo-legal move and strictly verify it (king safety).
+                // build a pseudo-legal move and strictly verify it (king safety)
                 let m = crate::types::Move::new(from, to, crate::types::PieceType::None, crate::types::MoveType::Normal);
                 if self.is_pseudo_legal(m) && self.is_legal(m) {
-                    // A repeat inside the search tree is a draw immediately;
-                    // one that predates the root is only a draw once the older
-                    // position has itself occurred before.
+                    // draw immediately in tree, needs prior repeat if before root
                     if index >= self.root_ply {
                         return true;
                     }
@@ -979,13 +1394,30 @@ impl Board {
             halfmove_clock: self.halfmove_clock,
             captured: Piece::None,
             hash: self.hash,
+            pawn_hash: self.pawn_hash,
             non_pawn_hash: self.non_pawn_hash,
-            delta: FeatureDelta::new(),
         };
+        self.history[self.hist_len] = self.hash;
+        self.hist_len += 1;
 
-        self.history.push(self.hash);
-        // A null move changes no piece, so the accumulator stays as it is.
-        self.acc_depth += 1;
+        // write metadata to next ply frames (no clone needed)
+        let next_d = self.acc_depth + 1;
+        let cur_ksq = self.acc_frames[self.acc_depth].ksq;
+        {
+            let af = &mut self.acc_frames[next_d];
+            af.delta = FeatureDelta::new();
+            af.dirty = [true, true];
+            af.refresh = [false, false];
+            af.ksq = cur_ksq;
+        }
+        {
+            let tf = &mut self.threat_frames[next_d];
+            tf.dirty = true;
+            tf.threat_base = next_d;
+            tf.last_move = Move::NULL;
+            tf.last_captured = Piece::None;
+        }
+        self.acc_depth = next_d;
 
         if self.ep_square.is_valid() {
             self.hash ^= ep_key(self.ep_square.file());
@@ -1001,13 +1433,14 @@ impl Board {
     }
 
     pub fn undo_null_move(&mut self, undo: UndoState) {
-        self.history.pop();
+        self.hist_len -= 1;
         self.acc_depth -= 1;
         self.side_to_move = !self.side_to_move;
         self.castling_rights = undo.castling_rights;
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
+        self.pawn_hash = undo.pawn_hash;
         self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
     }
@@ -1023,18 +1456,35 @@ impl Board {
         let w_ksq = self.king_square(Color::White);
         let b_ksq = self.king_square(Color::Black);
 
-        let mut undo = UndoState {
+        let undo = UndoState {
             castling_rights: self.castling_rights,
             ep_square: self.ep_square,
             halfmove_clock: self.halfmove_clock,
             captured: self.piece_on[to],
             hash: self.hash,
+            pawn_hash: self.pawn_hash,
             non_pawn_hash: self.non_pawn_hash,
-            delta: FeatureDelta::new(),
         };
 
-        self.history.push(self.hash);
-
+        // write metadata to next ply frames (no clone needed)
+        let next_d = self.acc_depth + 1;
+        // use current king squares as initial values, will be updated after king move check
+        let cur_ksq = self.acc_frames[self.acc_depth].ksq;
+        {
+            let af = &mut self.acc_frames[next_d];
+            af.dirty = [true, true];
+            af.refresh = [false, false];
+            af.ksq = cur_ksq;
+        }
+        {
+            let tf = &mut self.threat_frames[next_d];
+            tf.dirty = true;
+            tf.threat_base = next_d;
+            tf.last_move = m;
+            tf.last_captured = undo.captured;
+        }
+        self.history[self.hist_len] = self.hash;
+        self.hist_len += 1;
         if self.ep_square.is_valid() {
             self.hash ^= ep_key(self.ep_square.file());
             self.ep_square = Square::None;
@@ -1047,12 +1497,8 @@ impl Board {
 
         self.remove_piece(from);
 
-        // A king move only changes the input indices when the king crosses a
-        // bucket boundary or the center mirror. Otherwise both sides update
-        // incrementally; castling always needs a full refresh of our side.
-        let refresh_us = is_king_move
-            && (move_type == MoveType::Castling
-                || crate::nnue::needs_accumulator_refresh(from, to, us));
+        // refresh on castling or king bucket/mirror cross
+        let refresh_us = is_king_move && (move_type == MoveType::Castling || crate::nnue::needs_accumulator_refresh(from, to, us));
 
         let (acc_w_ksq, acc_b_ksq) = if is_king_move {
             match us {
@@ -1063,8 +1509,11 @@ impl Board {
             (w_ksq, b_ksq)
         };
 
-        // Our own view is refreshed from scratch later, so only the opponent's
-        // features have to be tracked in that case.
+        // update the accumulator frame with correct king squares and refresh flag
+        self.acc_frames[next_d].ksq = [acc_w_ksq, acc_b_ksq];
+        self.acc_frames[next_d].refresh[us as usize] = refresh_us;
+
+        // skip our side if doing full refresh
         let skip = if refresh_us { Some(us) } else { None };
         let mut delta = FeatureDelta::new();
 
@@ -1081,9 +1530,7 @@ impl Board {
                 }
                 self.put_piece(moving_piece, to);
 
-                if moving_piece.piece_type() == PieceType::Pawn
-                    && ((from as i8) - (to as i8)).abs() == 16
-                {
+                if moving_piece.piece_type() == PieceType::Pawn && ((from as i8) - (to as i8)).abs() == 16 {
                     let ep = Square::new(((from as u8) + (to as u8)) / 2);
                     let enemy_pawns = self.pieces[Piece::new(them, PieceType::Pawn)];
                     if !(pawn_attacks(us, ep) & enemy_pawns).is_empty() {
@@ -1095,13 +1542,7 @@ impl Board {
             MoveType::Castling => {
                 self.put_piece(moving_piece, to);
 
-                let (rook_from, rook_to) = match to {
-                    Square::G1 => (Square::H1, Square::F1),
-                    Square::C1 => (Square::A1, Square::D1),
-                    Square::G8 => (Square::H8, Square::F8),
-                    Square::C8 => (Square::A8, Square::D8),
-                    _ => unreachable!(),
-                };
+                let (rook_from, rook_to) = castling_rook_squares(to);
                 let rook = self.remove_piece(rook_from);
                 self.put_piece(rook, rook_to);
 
@@ -1126,18 +1567,8 @@ impl Board {
             }
         }
 
-        // A refresh overwrites our side without tracking its old features, so
-        // save that half for undo. Every other move is reverted exactly by
-        // applying the delta backwards.
-        if refresh_us {
-            self.acc_backup[self.acc_depth].copy_from_slice(&self.accumulator.vals[us as usize]);
-        }
-        undo.delta = delta;
-        self.accumulator.apply_delta(&delta);
-        if refresh_us {
-            self.refresh_accumulator_side(us);
-        }
-        self.acc_depth += 1;
+        self.acc_frames[next_d].delta = delta;
+        self.acc_depth = next_d;
 
         let new_castling = self.castling_rights & CASTLING_RIGHTS_MASK[from as usize] & CASTLING_RIGHTS_MASK[to as usize];
         if new_castling != self.castling_rights {
@@ -1153,20 +1584,11 @@ impl Board {
         self.hash ^= side_key();
         self.refresh_tt_hash();
 
-        if let Some(weights) = crate::nnue::threat_weights() {
-            self.sync_threats_with(weights);
-        }
-
         undo
     }
 
     pub fn undo_move(&mut self, m: Move, undo: UndoState) {
-        // The board still holds the child position, so its threat feature sets
-        // are the state the accumulator was brought up to. Keep them to invert
-        // the diff once the pieces are back.
-        let child_threats = crate::nnue::threat_weights().map(|weights| (weights, self.threat_lists));
-
-        self.history.pop();
+        self.hist_len -= 1;
         self.acc_depth -= 1;
         self.side_to_move = !self.side_to_move;
         let us = self.side_to_move;
@@ -1175,48 +1597,34 @@ impl Board {
         let to = m.to();
         let move_type = m.move_type();
 
-        let refresh_us = self.piece_on[to].piece_type() == PieceType::King
-            && (move_type == MoveType::Castling
-                || crate::nnue::needs_accumulator_refresh(from, to, us));
-        if refresh_us {
-            self.accumulator.vals[us as usize] = self.acc_backup[self.acc_depth];
-        }
-        self.accumulator.apply_delta_inverse(&undo.delta);
-
         if us == Color::Black {
             self.fullmove_number = self.fullmove_number.saturating_sub(1);
         }
 
-        let moved_piece = self.remove_piece(to);
+        let moved_piece = self.remove_piece_no_hash(to);
 
         match move_type {
             MoveType::Normal => {
-                self.put_piece(moved_piece, from);
+                self.put_piece_no_hash(moved_piece, from);
                 if undo.captured != Piece::None {
-                    self.put_piece(undo.captured, to);
+                    self.put_piece_no_hash(undo.captured, to);
                 }
             }
             MoveType::Castling => {
-                self.put_piece(moved_piece, from);
-                let (rook_from, rook_to) = match to {
-                    Square::G1 => (Square::H1, Square::F1),
-                    Square::C1 => (Square::A1, Square::D1),
-                    Square::G8 => (Square::H8, Square::F8),
-                    Square::C8 => (Square::A8, Square::D8),
-                    _ => unreachable!(),
-                };
-                let rook = self.remove_piece(rook_to);
-                self.put_piece(rook, rook_from);
+                self.put_piece_no_hash(moved_piece, from);
+                let (rook_from, rook_to) = castling_rook_squares(to);
+                let rook = self.remove_piece_no_hash(rook_to);
+                self.put_piece_no_hash(rook, rook_from);
             }
             MoveType::EnPassant => {
-                self.put_piece(moved_piece, from);
+                self.put_piece_no_hash(moved_piece, from);
                 let cap_sq = Square::from_coords(to.file(), from.rank());
-                self.put_piece(Piece::new(!us, PieceType::Pawn), cap_sq);
+                self.put_piece_no_hash(Piece::new(!us, PieceType::Pawn), cap_sq);
             }
             MoveType::Promotion => {
-                self.put_piece(Piece::new(us, PieceType::Pawn), from);
+                self.put_piece_no_hash(Piece::new(us, PieceType::Pawn), from);
                 if undo.captured != Piece::None {
-                    self.put_piece(undo.captured, to);
+                    self.put_piece_no_hash(undo.captured, to);
                 }
             }
         }
@@ -1225,12 +1633,10 @@ impl Board {
         self.ep_square = undo.ep_square;
         self.halfmove_clock = undo.halfmove_clock;
         self.hash = undo.hash;
+        self.pawn_hash = undo.pawn_hash;
         self.refresh_tt_hash();
         self.non_pawn_hash = undo.non_pawn_hash;
-
-        if let Some((weights, child)) = child_threats {
-            self.restore_threats_with(weights, &child);
-        }
+        // threat frame and accumulator frame are already restored by decrementing acc_depth
     }
 }
 
@@ -1243,8 +1649,8 @@ impl Default for Board {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::movegen::{generate_legal_moves, generate_noisy_pseudo, generate_quiet_pseudo};
     use crate::eval::evaluate;
+    use crate::movegen::{generate_legal_moves, generate_noisy_pseudo, generate_quiet_pseudo};
 
     fn pseudo_legal(board: &Board) -> crate::types::MoveList {
         let mut list = crate::types::MoveList::new();
@@ -1271,10 +1677,7 @@ mod tests {
         let mut board = Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
         play(&mut board, "e2e4");
         assert!(!board.ep_square.is_valid());
-        assert_eq!(
-            board.hash,
-            Board::from_fen("4k3/8/8/8/4P3/8/8/4K3 b - - 0 1").unwrap().hash
-        );
+        assert_eq!(board.hash, Board::from_fen("4k3/8/8/8/4P3/8/8/4K3 b - - 0 1").unwrap().hash);
 
         let mut board = Board::from_fen("4k3/8/8/8/3p4/8/4P3/4K3 w - - 0 1").unwrap();
         play(&mut board, "e2e4");
@@ -1294,7 +1697,7 @@ mod tests {
         let quiet_push = Move::new(Square::A2, Square::A1, PieceType::None, MoveType::Normal);
         assert!(!board.is_pseudo_legal(quiet_push));
 
-        // A castling-typed move must actually start from the king square.
+        // a castling-typed move must actually start from the king square
         let board = Board::from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1").unwrap();
         let fake = Move::new(Square::H1, Square::G1, PieceType::None, MoveType::Castling);
         assert!(!board.is_pseudo_legal(fake));
@@ -1302,24 +1705,24 @@ mod tests {
 
     #[test]
     fn fen_drops_castling_rights_without_pieces() {
-        // No rook on a1 and no rook on h1: neither white right may survive.
+        // no rook on a1 and no rook on h1: neither white right may survive
         let board = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w KQkq - 0 1").unwrap();
         assert_eq!(board.castling_rights, 0);
 
-        // Kingside right is real (rook on h1), queenside is not (no rook on a1).
+        // kingside right is real (rook on h1), queenside isn't (no rook on a1)
         let board = Board::from_fen("4k3/8/8/8/8/8/8/4K2R w KQ - 0 1").unwrap();
         assert_eq!(board.castling_rights, Board::CASTLE_WK);
 
-        // King off its home square invalidates both rights for that side.
+        // king off its home square invalidates both rights for that side
         let board = Board::from_fen("4k3/8/8/8/8/8/8/3K3R w KQ - 0 1").unwrap();
         assert_eq!(board.castling_rights, 0);
     }
 
     #[test]
     fn fen_rejects_side_not_to_move_in_check() {
-        // Black is not to move but is attacked by the rook on e2.
+        // black isn't to move but is attacked by the rook on e2
         assert!(Board::from_fen("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1").is_err());
-        // The side to move is allowed to be in check.
+        // the side to move is allowed to be in check
         assert!(Board::from_fen("4k3/8/8/8/8/8/4R3/4K3 b - - 0 1").is_ok());
     }
 
@@ -1345,7 +1748,7 @@ mod tests {
             play(&mut board, s);
         }
 
-        board.root_ply = board.history.len();
+        board.root_ply = board.hist_len;
         assert!(!board.is_repetition());
 
         board.root_ply = 0;
@@ -1378,8 +1781,7 @@ mod tests {
         let check = |board: &Board, fen: &str| {
             let squares = board.check_squares();
             for &m in pseudo_legal(board).as_slice() {
-                // Castling checks are given by the rook, not the king, so the
-                // per-piece-type table does not cover them.
+                // castling checks come from the rook, skip
                 if m.move_type() == MoveType::Castling {
                     continue;
                 }
@@ -1416,54 +1818,38 @@ mod tests {
     fn debug_game_position() {
         let mut board = Board::default();
         for s in [
-            "e2e4", "g8f6", "e4e5", "b8c6", "e5f6", "e7f6", "d2d4", "d7d5",
-            "f1b5", "f8b4", "c1d2", "e8g8", "d2b4", "c6d4", "d1d4", "c8h3",
-            "g2h3", "f8e8", "b5e8", "c7c5", "d4c5", "d8e8", "g1e2", "e8e6", "b1c3",
+            "e2e4", "g8f6", "e4e5", "b8c6", "e5f6", "e7f6", "d2d4", "d7d5", "f1b5", "f8b4", "c1d2", "e8g8", "d2b4", "c6d4", "d1d4", "c8h3", "g2h3", "f8e8",
+            "b5e8", "c7c5", "d4c5", "d8e8", "g1e2", "e8e6", "b1c3",
         ] {
             play(&mut board, s);
         }
         println!("side_to_move = {:?}", board.side_to_move);
-        println!("eval (side to move) = {}", evaluate(&board));
+        println!("eval (side to move) = {}", evaluate(&mut board));
         println!("is_draw = {}", board.is_draw());
         println!("upcoming_repetition = {}", board.upcoming_repetition());
         println!("is_repetition = {}", board.is_repetition());
         println!("halfmove = {}", board.halfmove_clock);
 
-        let start = Board::default();
-        println!("eval startpos (white to move) = {}", evaluate(&start));
-        let noq = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1").unwrap();
-        println!("eval white-no-queen (white to move) = {}", evaluate(&noq));
+        let mut start = Board::default();
+        println!("eval startpos (white to move) = {}", evaluate(&mut start));
+        let mut noq = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1").unwrap();
+        println!("eval white-no-queen (white to move) = {}", evaluate(&mut noq));
     }
 
-    /// Rebuilds the threat inputs from scratch and compares them with what the
-    /// incremental path holds, both the feature sets and the accumulated rows.
-    fn assert_threat_state(
-        board: &Board,
-        weights: &crate::nnue::ThreatWeights,
-        ply: usize,
-        stage: &str,
-    ) {
+    // compare incremental threats against full rebuild
+    fn assert_threat_state(board: &mut Board, weights: &crate::nnue::ThreatWeights, ply: usize, stage: &str) {
         let mut fresh = crate::nnue::ThreatAccumulator::new();
         for side in 0..2 {
             let mut list = ThreatList::new();
             crate::nnue::collect_threats(board, Color::from_index(side), &mut list);
-            assert_eq!(
-                board.threat_lists[side].as_slice(),
-                list.as_slice(),
-                "{stage}: threat feature set at ply {ply}"
-            );
             fresh.refresh_side(side, &list, weights);
         }
-        assert_eq!(
-            fresh.vals, board.threat.vals,
-            "{stage}: threat accumulator at ply {ply}"
-        );
+        assert_eq!(fresh.vals, board.threat().vals, "{stage}: threat accumulator at ply {ply}");
     }
 
     #[test]
     fn threat_accumulator_roundtrip_random_walk() {
-        // Prefer the active network's threat rows; without a Heimdall network
-        // installed, synthetic weights exercise exactly the same code path.
+        // use active net weights or random ones in tests
         let synthetic;
         let weights: &crate::nnue::ThreatWeights = match crate::nnue::threat_weights() {
             Some(weights) => weights,
@@ -1474,8 +1860,8 @@ mod tests {
         };
 
         let mut board = Board::default();
-        board.sync_threats_with(weights);
-        assert_threat_state(&board, weights, 0, "root");
+        board.refresh_threats();
+        assert_threat_state(&mut board, weights, 0, "root");
 
         let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
         let mut ply = 0;
@@ -1490,15 +1876,12 @@ mod tests {
             let m = moves.get((rng as usize) % moves.count);
 
             let undo = board.make_move(m);
-            board.sync_threats_with(weights);
-            assert_threat_state(&board, weights, ply, "after make");
+            board.ensure_threats_ready();
+            assert_threat_state(&mut board, weights, ply, "after make");
 
-            // This is the child state the undo has to invert, exactly like
-            // `Board::undo_move` captures it before touching the pieces.
-            let child = board.threat_lists;
             board.undo_move(m, undo);
-            board.restore_threats_with(weights, &child);
-            assert_threat_state(&board, weights, ply, "after undo");
+            board.ensure_threats_ready();
+            assert_threat_state(&mut board, weights, ply, "after undo");
             ply += 1;
         }
 
@@ -1516,23 +1899,17 @@ mod tests {
             }
         };
 
-        // The king starts on the mirror line (e1) and then walks across it and
-        // through several buckets, which re-indexes every threat of that side.
+        // walk king across mirror line and bucket boundaries
         let mut board = Board::from_fen("4k3/8/8/3n4/4P3/8/8/4K3 w - - 0 1").unwrap();
-        board.sync_threats_with(weights);
-        assert_threat_state(&board, weights, 0, "root");
+        board.ensure_threats_ready();
+        assert_threat_state(&mut board, weights, 0, "root");
 
-        // Black shuffles its king back and forth while white crosses the mirror
+        // black shuffles its king back and forth while white crosses the mirror
         // line and two bucket boundaries.
-        for (ply, text) in [
-            "e1d1", "e8d8", "d1c1", "d8c8", "c1b1", "c8d8", "b1b2", "d8e8", "b2a2",
-        ]
-        .iter()
-        .enumerate()
-        {
+        for (ply, text) in ["e1d1", "e8d8", "d1c1", "d8c8", "c1b1", "c8d8", "b1b2", "d8e8", "b2a2"].iter().enumerate() {
             play(&mut board, text);
-            board.sync_threats_with(weights);
-            assert_threat_state(&board, weights, ply, text);
+            board.ensure_threats_ready();
+            assert_threat_state(&mut board, weights, ply, text);
         }
     }
 
@@ -1546,13 +1923,16 @@ mod tests {
                 break;
             }
             for &m in moves.as_slice() {
-                let before = board.accumulator.vals;
+                board.ensure_accumulator_ready();
+                let before = board.accumulator().vals;
                 let undo = board.make_move(m);
+                board.ensure_accumulator_ready();
                 let mut check = board.clone();
                 check.refresh_accumulator();
-                assert_eq!(board.accumulator.vals, check.accumulator.vals, "make mismatch on {}", m);
+                assert_eq!(board.accumulator().vals, check.accumulator().vals, "make mismatch on {}", m);
                 board.undo_move(m, undo);
-                assert_eq!(board.accumulator.vals, before, "undo mismatch on {}", m);
+                board.ensure_accumulator_ready();
+                assert_eq!(board.accumulator().vals, before, "undo mismatch on {}", m);
             }
             rng ^= rng << 13;
             rng ^= rng >> 7;
@@ -1584,19 +1964,16 @@ mod tests {
                     break;
                 }
                 for &m in moves.as_slice() {
-                    let before = board.accumulator.vals;
+                    board.ensure_accumulator_ready();
+                    let before = board.accumulator().vals;
                     let undo = board.make_move(m);
+                    board.ensure_accumulator_ready();
                     let mut check = board.clone();
                     check.refresh_accumulator();
-                    assert_eq!(
-                        board.accumulator.vals,
-                        check.accumulator.vals,
-                        "make mismatch on {} in {}",
-                        m,
-                        fen
-                    );
+                    assert_eq!(board.accumulator().vals, check.accumulator().vals, "make mismatch on {} in {}", m, fen);
                     board.undo_move(m, undo);
-                    assert_eq!(board.accumulator.vals, before, "undo mismatch on {}", m);
+                    board.ensure_accumulator_ready();
+                    assert_eq!(board.accumulator().vals, before, "undo mismatch on {}", m);
                 }
 
                 rng ^= rng << 13;

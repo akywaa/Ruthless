@@ -6,8 +6,6 @@ pub const PIECE_NB: usize = 12;
 #[allow(dead_code)]
 pub const PIECE_TYPE_NB: usize = 6;
 pub const COLOR_NB: usize = 2;
-pub const ACC_STACK_SIZE: usize = 256;
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Color {
@@ -141,14 +139,70 @@ impl<T> IndexMut<Piece> for [T] {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[repr(u8)]
 pub enum Square {
-    A1 = 0, B1, C1, D1, E1, F1, G1, H1,
-    A2, B2, C2, D2, E2, F2, G2, H2,
-    A3, B3, C3, D3, E3, F3, G3, H3,
-    A4, B4, C4, D4, E4, F4, G4, H4,
-    A5, B5, C5, D5, E5, F5, G5, H5,
-    A6, B6, C6, D6, E6, F6, G6, H6,
-    A7, B7, C7, D7, E7, F7, G7, H7,
-    A8, B8, C8, D8, E8, F8, G8, H8,
+    A1 = 0,
+    B1,
+    C1,
+    D1,
+    E1,
+    F1,
+    G1,
+    H1,
+    A2,
+    B2,
+    C2,
+    D2,
+    E2,
+    F2,
+    G2,
+    H2,
+    A3,
+    B3,
+    C3,
+    D3,
+    E3,
+    F3,
+    G3,
+    H3,
+    A4,
+    B4,
+    C4,
+    D4,
+    E4,
+    F4,
+    G4,
+    H4,
+    A5,
+    B5,
+    C5,
+    D5,
+    E5,
+    F5,
+    G5,
+    H5,
+    A6,
+    B6,
+    C6,
+    D6,
+    E6,
+    F6,
+    G6,
+    H6,
+    A7,
+    B7,
+    C7,
+    D7,
+    E7,
+    F7,
+    G7,
+    H7,
+    A8,
+    B8,
+    C8,
+    D8,
+    E8,
+    F8,
+    G8,
+    H8,
     #[default]
     None = 64,
 }
@@ -156,11 +210,7 @@ pub enum Square {
 impl Square {
     #[inline(always)]
     pub const fn new(val: u8) -> Self {
-        if val < 64 {
-            unsafe { std::mem::transmute(val) }
-        } else {
-            Square::None
-        }
+        if val < 64 { unsafe { std::mem::transmute(val) } } else { Square::None }
     }
 
     #[inline(always)]
@@ -190,11 +240,7 @@ impl Square {
         }
         let file = b[0].wrapping_sub(b'a');
         let rank = b[1].wrapping_sub(b'1');
-        if file < 8 && rank < 8 {
-            Some(Self::from_coords(file, rank))
-        } else {
-            None
-        }
+        if file < 8 && rank < 8 { Some(Self::from_coords(file, rank)) } else { None }
     }
 }
 
@@ -247,10 +293,7 @@ impl Move {
             PieceType::Queen => 3,
             _ => 0,
         };
-        let val = (from as u16)
-            | ((to as u16) << 6)
-            | ((promo_bits as u16) << 12)
-            | ((move_type as u16) << 14);
+        let val = (from as u16) | ((to as u16) << 6) | ((promo_bits as u16) << 12) | ((move_type as u16) << 14);
         Self(val)
     }
 
@@ -308,8 +351,7 @@ impl std::fmt::Display for Move {
 
 #[derive(Copy, Clone)]
 pub struct MoveList {
-    // Only `0..count` is ever initialized, so the array must not be zeroed up
-    // front: that would mean a 512-byte memset on every move generation.
+    // uninit buffer, only 0..count is used
     moves: [MaybeUninit<Move>; 256],
     pub count: usize,
 }
@@ -342,8 +384,7 @@ impl MoveList {
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[Move] {
-        // `MaybeUninit<Move>` has the layout of `Move`, and `0..count` is fully
-        // initialized, so the prefix is a valid slice of moves.
+        // MaybeUninit<Move> has same layout as Move
         unsafe { std::slice::from_raw_parts(self.moves.as_ptr() as *const Move, self.count) }
     }
 }

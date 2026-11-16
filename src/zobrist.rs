@@ -1,5 +1,8 @@
-use crate::types::{Piece, Square, PIECE_NB, SQUARE_NB};
+use crate::types::{PIECE_NB, Piece, SQUARE_NB, Square};
 use std::sync::OnceLock;
+use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, queen_attacks, rook_attacks};
+use crate::bitboard::Bitboard;
+use crate::types::PieceType;
 
 pub struct ZobristKeys {
     pub pieces: [[u64; SQUARE_NB]; PIECE_NB],
@@ -9,9 +12,7 @@ pub struct ZobristKeys {
     pub fiftymove_clock: [u64; 16],
 }
 
-// The keys only depend on compile-time constants, so they are built during
-// const evaluation instead of behind a OnceLock. That keeps the hot paths
-// (`piece_key` is called several times per move) free of atomic loads.
+// const init avoids OnceLock overhead on hot path
 static ZOBRIST: ZobristKeys = ZobristKeys::init();
 
 #[inline(always)]
@@ -34,9 +35,7 @@ impl ZobristKeys {
     const fn init() -> Self {
         let mut rng = XorShift64(0x18F2_48A7_C593_4B01);
         let mut pieces = [[0u64; SQUARE_NB]; PIECE_NB];
-        // Const evaluation cannot use `for` loops, so the tables are filled by
-        // index with `while` loops. The key sequence is identical to the one the
-        // previous runtime initializer produced.
+        // while loops for const fn
         let mut p = 0;
         while p < PIECE_NB {
             let mut sq = 0;
@@ -128,9 +127,6 @@ pub fn h2(h: u64) -> usize {
     ((h >> 48) & 0x1FFF) as usize
 }
 
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, queen_attacks, rook_attacks};
-use crate::bitboard::Bitboard;
-use crate::types::PieceType;
 
 fn init_cuckoo() -> CuckooTable {
     let mut keys = [0u64; 8192];
@@ -138,8 +134,16 @@ fn init_cuckoo() -> CuckooTable {
     let mut sq_b = [Square::None; 8192];
 
     for piece in [
-        Piece::WhiteKnight, Piece::WhiteBishop, Piece::WhiteRook, Piece::WhiteQueen, Piece::WhiteKing,
-        Piece::BlackKnight, Piece::BlackBishop, Piece::BlackRook, Piece::BlackQueen, Piece::BlackKing,
+        Piece::WhiteKnight,
+        Piece::WhiteBishop,
+        Piece::WhiteRook,
+        Piece::WhiteQueen,
+        Piece::WhiteKing,
+        Piece::BlackKnight,
+        Piece::BlackBishop,
+        Piece::BlackRook,
+        Piece::BlackQueen,
+        Piece::BlackKing,
     ] {
         for a in 0..64 {
             let sq1 = Square::new(a as u8);

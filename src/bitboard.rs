@@ -1,5 +1,5 @@
-use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl, Shr};
 use crate::types::Square;
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl, Shr};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct Bitboard(pub u64);
@@ -55,11 +55,7 @@ impl Iterator for Bitboard {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(self.pop_lsb())
-        }
+        if self.is_empty() { None } else { Some(self.pop_lsb()) }
     }
 }
 

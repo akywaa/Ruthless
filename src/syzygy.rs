@@ -43,7 +43,7 @@ pub fn init(path: &str) {
     let _ = path;
 }
 
-/// Number of pieces covered by the largest loaded tablebase (0 if none).
+// number of pieces covered by the largest loaded tablebase (0 if none)
 #[cfg(feature = "syzygy")]
 pub fn max_pieces() -> u32 {
     unsafe { TB_LARGEST }
@@ -67,17 +67,9 @@ pub fn probe_wdl(board: &Board) -> Option<i32> {
         let knights = board.pieces[Piece::WhiteKnight].0 | board.pieces[Piece::BlackKnight].0;
         let pawns = board.pieces[Piece::WhitePawn].0 | board.pieces[Piece::BlackPawn].0;
 
-        let ep = if board.ep_square.is_valid() {
-            board.ep_square as u32
-        } else {
-            0
-        };
+        let ep = if board.ep_square.is_valid() { board.ep_square as u32 } else { 0 };
 
-        let turn = if board.side_to_move == Color::White {
-            1
-        } else {
-            0
-        };
+        let turn = if board.side_to_move == Color::White { 1 } else { 0 };
 
         let wdl = unsafe {
             tb_probe_wdl(
@@ -101,9 +93,9 @@ pub fn probe_wdl(board: &Board) -> Option<i32> {
         }
 
         match wdl {
-            0 => Some(-20000),    // Loss
-            1 | 2 | 3 => Some(0), // Blessed loss / draw / cursed win
-            4 => Some(20000),     // Win
+            0 => Some(-20000),    // loss
+            1 | 2 | 3 => Some(0), // blessed loss / draw / cursed win
+            4 => Some(20000),     // win
             _ => None,
         }
     }

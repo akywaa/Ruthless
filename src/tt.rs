@@ -1,5 +1,6 @@
+use crate::alloc::HugeBuffer;
 use crate::types::Move;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
@@ -21,6 +22,7 @@ pub struct TTEntry {
 }
 
 pub const RAW_EVAL_NONE: i16 = i16::MIN;
+pub const DEFAULT_HASH_MB: usize = 32;
 
 #[repr(C, align(64))]
 struct Cluster {
@@ -32,28 +34,14 @@ struct CacheEntry {
     data: AtomicU64,
 }
 
-/// Allocates zeroed clusters in one go. Zero is a valid state for every field
-/// (an all-zero key/data pair simply never matches), and allocating with
-/// `alloc_zeroed` lets the OS hand back pre-zeroed pages instead of touching
-/// every byte in user space, which matters for multi-gigabyte hash sizes.
-fn alloc_zeroed_clusters(count: usize) -> Box<[Cluster]> {
-    let layout = std::alloc::Layout::array::<Cluster>(count).expect("TT size overflow");
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout) as *mut Cluster;
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, count))
-    }
+// zeroed tt clusters
+fn alloc_zeroed_clusters(count: usize) -> HugeBuffer<Cluster> {
+    HugeBuffer::zeroed(count)
 }
 
 #[inline(always)]
 fn pack_data(score: i16, raw_eval: i16, depth: u8, gen_bound: u8, mv: u16) -> u64 {
-    (mv as u64)
-        | ((gen_bound as u64) << 16)
-        | ((depth as u64) << 24)
-        | (((score as u16) as u64) << 32)
-        | (((raw_eval as u16) as u64) << 48)
+    (mv as u64) | ((gen_bound as u64) << 16) | ((depth as u64) << 24) | (((score as u16) as u64) << 32) | (((raw_eval as u16) as u64) << 48)
 }
 
 #[inline(always)]
@@ -77,7 +65,7 @@ fn age_of(data: u64) -> u8 {
 }
 
 pub struct TranspositionTable {
-    clusters: Box<[Cluster]>,
+    clusters: HugeBuffer<Cluster>,
     len: usize,
     generation: AtomicU8,
 }
@@ -97,22 +85,18 @@ impl TranspositionTable {
         }
     }
 
-    /// Multiply-shift indexing: maps the full 64-bit key onto `0..len` and
-    /// honours exactly the requested size instead of rounding down to a power
-    /// of two (Hash 24000 no longer silently becomes 16384).
+    // fastrange indexing for arbitrary hash sizes
     #[inline(always)]
     fn index(&self, key: u64) -> usize {
         ((key as u128 * self.len as u128) >> 64) as usize
     }
 
-    /// Pulls the cluster that `probe(key)` will touch into L1. Call it right
-    /// after a move is made, so the load overlaps with the check, LMR and
-    /// repetition work done before the child node probes the table.
+    // prefetch tt cluster
     #[inline(always)]
     pub fn prefetch(&self, key: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             let idx = self.index(key);
             let ptr = self.clusters.as_ptr().add(idx) as *const i8;
             _mm_prefetch(ptr, _MM_HINT_T0);
@@ -135,26 +119,19 @@ impl TranspositionTable {
         let cluster = &self.clusters[idx];
 
         for entry in &cluster.entries {
-            // Load data first, then the xored key. If a concurrent store
-            // races between the two loads, the xor check simply fails
-            // instead of returning garbage.
             let data = entry.data.load(Ordering::Relaxed);
             let stored_key = entry.key.load(Ordering::Relaxed);
 
             if stored_key ^ data == key {
                 let gen_bound = ((data >> 16) & 0xFF) as u8;
-                let flag = bound_of(gen_bound);
-
-                if flag != TTFlag::None {
-                    return Some(TTEntry {
-                        best_move: Move((data & 0xFFFF) as u16),
-                        depth: ((data >> 24) & 0xFF) as u8,
-                        score: (((data >> 32) & 0xFFFF) as u16 as i16) as i32,
-                        raw_eval: ((data >> 48) & 0xFFFF) as u16 as i16,
-                        flag,
-                        is_pv: is_pv_of(gen_bound),
-                    });
-                }
+                return Some(TTEntry {
+                    best_move: Move((data & 0xFFFF) as u16),
+                    depth: ((data >> 24) & 0xFF) as u8,
+                    score: (((data >> 32) & 0xFFFF) as u16 as i16) as i32,
+                    raw_eval: ((data >> 48) & 0xFFFF) as u16 as i16,
+                    flag: bound_of(gen_bound),
+                    is_pv: is_pv_of(gen_bound),
+                });
             }
         }
 
@@ -162,16 +139,7 @@ impl TranspositionTable {
     }
 
     #[inline(always)]
-    pub fn store(
-        &self,
-        key: u64,
-        score: i32,
-        depth: u8,
-        flag: TTFlag,
-        best_move: Move,
-        raw_eval: i16,
-        is_pv: bool,
-    ) {
+    pub fn store(&self, key: u64, score: i32, depth: u8, flag: TTFlag, best_move: Move, raw_eval: i16, is_pv: bool) {
         let idx = self.index(key);
         let cluster = &self.clusters[idx];
         let curr_gen = self.generation.load(Ordering::Relaxed) & 0x1F;
@@ -185,7 +153,7 @@ impl TranspositionTable {
             let data = cluster.entries[i].data.load(Ordering::Relaxed);
             let stored_key = cluster.entries[i].key.load(Ordering::Relaxed);
 
-            // A race with a concurrent store makes this xor check fail.
+            // a race with a concurrent store makes this xor check fail
             if stored_key ^ data == key {
                 replace_idx = i;
                 found_match = true;
@@ -216,10 +184,7 @@ impl TranspositionTable {
             let old_depth = ((old_data >> 24) & 0xFF) as i32;
             let old_age_diff = (32 + curr_gen - age_of(old_data)) & 0x1F;
             if flag != TTFlag::Exact && old_age_diff == 0 && (depth as i32) + 4 <= old_depth {
-                // The entry comes from a much deeper search, so keep its score
-                // and depth. Only fill in a move when it has none: a move from
-                // this shallow node would otherwise replace a better one and
-                // corrupt move ordering on later visits.
+                // keep deeper entry, only fill missing best move
                 if best_move != Move::NULL && (old_data & 0xFFFF) == 0 {
                     let updated = (old_data & !0xFFFF) | best_move.0 as u64;
                     let entry = &cluster.entries[replace_idx];
@@ -230,6 +195,10 @@ impl TranspositionTable {
             }
         }
 
+        if found_match && depth == 0 && ((old_data >> 24) & 0xFF) > 0 {
+            return;
+        }
+
         let target_entry = &cluster.entries[replace_idx];
 
         let mv = if best_move == Move::NULL && found_match {
@@ -238,29 +207,60 @@ impl TranspositionTable {
             best_move.0
         };
 
-        // A node that has ever been part of the PV keeps that flag, so later
-        // non-PV probes can still treat it as critical.
+        // keep pv flag sticky
         let old_is_pv = found_match && is_pv_of(((old_data >> 16) & 0xFF) as u8);
         let store_is_pv = is_pv || old_is_pv;
+
+        let raw_eval = if raw_eval == crate::tt::RAW_EVAL_NONE && found_match {
+            ((old_data >> 48) & 0xFFFF) as u16 as i16
+        } else {
+            raw_eval
+        };
 
         let entry_score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         let gen_bound = ((curr_gen & 0x1F) << 3) | ((store_is_pv as u8) << 2) | (flag as u8);
         let new_data = pack_data(entry_score, raw_eval, depth, gen_bound, mv);
 
-        // Write plain data first, then the xored key so a racing reader
-        // either sees a consistent pair or fails the xor check.
+        // lockless xor store
         target_entry.data.store(new_data, Ordering::Relaxed);
         target_entry.key.store(key ^ new_data, Ordering::Relaxed);
     }
 
-    /// Permille of the table that is in use, sampled over the first 1000
-    /// clusters. This is the usual UCI `hashfull` estimate, so a GUI sees the
-    /// same numbers it sees from other engines.
+    // store static eval without overwriting real entry
+    #[inline(always)]
+    pub fn store_eval(&self, key: u64, raw_eval: i16) {
+        let idx = self.index(key);
+        let cluster = &self.clusters[idx];
+
+        for entry in &cluster.entries {
+            let data = entry.data.load(Ordering::Relaxed);
+            if entry.key.load(Ordering::Relaxed) ^ data == key {
+                let new = (data & !(0xFFFFu64 << 48)) | (((raw_eval as u16) as u64) << 48);
+                entry.data.store(new, Ordering::Relaxed);
+                entry.key.store(key ^ new, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        let Some(slot) = cluster
+            .entries
+            .iter()
+            .find(|e| bound_of(((e.data.load(Ordering::Relaxed) >> 16) & 0xFF) as u8) == TTFlag::None)
+        else {
+            return;
+        };
+        let curr_gen = self.generation.load(Ordering::Relaxed) & 0x1F;
+        let new = pack_data(0, raw_eval, 0, (curr_gen & 0x1F) << 3, 0);
+        slot.data.store(new, Ordering::Relaxed);
+        slot.key.store(key ^ new, Ordering::Relaxed);
+    }
+
+    // uci hashfull permille
     pub fn hashfull(&self) -> usize {
         let sample = self.len.min(1000);
         let mut used = 0usize;
 
-        for cluster in self.clusters.iter().take(sample) {
+        for cluster in self.clusters.as_slice().iter().take(sample) {
             for entry in &cluster.entries {
                 let data = entry.data.load(Ordering::Relaxed);
                 if bound_of(((data >> 16) & 0xFF) as u8) != TTFlag::None {
@@ -273,7 +273,7 @@ impl TranspositionTable {
     }
 
     pub fn clear(&self) {
-        for cluster in &self.clusters {
+        for cluster in self.clusters.as_slice() {
             for entry in &cluster.entries {
                 entry.key.store(0, Ordering::Relaxed);
                 entry.data.store(0, Ordering::Relaxed);
@@ -297,7 +297,7 @@ mod tests {
         let entry = tt.probe(42).unwrap();
         assert_eq!(entry.depth, 8);
         assert!(entry.best_move == Move(1));
-        // The shallow non-PV store must not clear the existing PV flag.
+        // shallow non-pv store shouldn't clear pv flag
         assert!(entry.is_pv);
     }
 

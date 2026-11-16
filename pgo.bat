@@ -1,10 +1,7 @@
 @echo off
 setlocal
 
-rem Build a profile-guided optimized engine.
-rem Works from any directory: every path is resolved relative to this script.
-rem Pass any argument (e.g. "pgo.bat ci") to skip the final pause.
-
+rem pgo build script (pass any arg to skip pause)
 cd /d "%~dp0"
 
 echo [1/3] Building the instrumented engine...

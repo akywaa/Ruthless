@@ -4,12 +4,7 @@ use crate::board::Board;
 use crate::eval::PIECE_VALUES;
 use crate::types::{Color, Move, MoveType, Piece, PieceType, Square};
 
-/// Static exchange evaluation: does the exchange on `to` win at least
-/// `threshold` for the side to move?
-///
-/// `threshold` is compared against the value of the victim minus everything the
-/// exchange costs us, so `see(board, m, 0)` asks whether the capture is not
-/// losing material.
+// static exchange eval >= threshold
 pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
     if m == Move::NULL {
         return 0 >= threshold;
@@ -23,7 +18,7 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
         return 0 >= threshold;
     }
 
-    // Invalid move for SEE if there is no piece on the origin square
+    // invalid move for SEE if there is no piece on the origin square
     if board.piece_on[from] == Piece::None {
         return 0 >= threshold;
     }
@@ -39,11 +34,7 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
         board.piece_on[to].piece_type()
     };
 
-    gain[0] = if target_pt != PieceType::None {
-        PIECE_VALUES[target_pt as usize]
-    } else {
-        0
-    };
+    gain[0] = if target_pt != PieceType::None { PIECE_VALUES[target_pt as usize] } else { 0 };
 
     if move_type == MoveType::Promotion {
         gain[0] += PIECE_VALUES[m.promo_type() as usize] - PIECE_VALUES[PieceType::Pawn as usize];
@@ -55,13 +46,7 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
         board.piece_on[from].piece_type()
     };
 
-    // Early exits before the attacker chain is even looked up. Both follow from
-    // how the resolution below behaves: it only ever subtracts from `gain[0]`,
-    // so a victim that does not cover the threshold can never reach it, and if
-    // the victim still covers our attacker plus the threshold the exchange is
-    // already won even when that attacker is lost - recapturing is the best the
-    // opponent can do, and every deeper exchange only makes that capture worth
-    // less, which can only raise our result.
+    // early exit if victim < threshold or winning even if attacker is lost
     let swap = gain[0] - threshold;
     if swap < 0 {
         return false;
@@ -77,14 +62,8 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
         occ.clear(cap_sq);
     }
 
-    let bishops = board.pieces[Piece::WhiteBishop]
-        | board.pieces[Piece::BlackBishop]
-        | board.pieces[Piece::WhiteQueen]
-        | board.pieces[Piece::BlackQueen];
-    let rooks = board.pieces[Piece::WhiteRook]
-        | board.pieces[Piece::BlackRook]
-        | board.pieces[Piece::WhiteQueen]
-        | board.pieces[Piece::BlackQueen];
+    let bishops = board.pieces[Piece::WhiteBishop] | board.pieces[Piece::BlackBishop] | board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen];
+    let rooks = board.pieces[Piece::WhiteRook] | board.pieces[Piece::BlackRook] | board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen];
 
     let mut attackers = all_attackers(board, to, occ);
     let mut side = !board.side_to_move;
@@ -100,8 +79,12 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
         pt = next_pt;
         occ.clear(next_sq);
 
-        attackers |= bishop_attacks(to, occ) & bishops;
-        attackers |= rook_attacks(to, occ) & rooks;
+        if matches!(pt, PieceType::Pawn | PieceType::Bishop | PieceType::Queen) {
+            attackers |= bishop_attacks(to, occ) & bishops;
+        }
+        if matches!(pt, PieceType::Rook | PieceType::Queen) {
+            attackers |= rook_attacks(to, occ) & rooks;
+        }
 
         let opp_attackers = attackers & occ & board.occupied_co[!side];
         if pt == PieceType::King && !opp_attackers.is_empty() {
@@ -121,20 +104,13 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
 }
 
 fn all_attackers(board: &Board, sq: Square, occ: Bitboard) -> Bitboard {
-    let p_attacks = (pawn_attacks(Color::Black, sq) & board.pieces[Piece::WhitePawn])
-        | (pawn_attacks(Color::White, sq) & board.pieces[Piece::BlackPawn]);
+    let p_attacks = (pawn_attacks(Color::Black, sq) & board.pieces[Piece::WhitePawn]) | (pawn_attacks(Color::White, sq) & board.pieces[Piece::BlackPawn]);
     let n_attacks = knight_attacks(sq) & (board.pieces[Piece::WhiteKnight] | board.pieces[Piece::BlackKnight]);
     let k_attacks = king_attacks(sq) & (board.pieces[Piece::WhiteKing] | board.pieces[Piece::BlackKing]);
     let b_attacks = bishop_attacks(sq, occ)
-        & (board.pieces[Piece::WhiteBishop]
-            | board.pieces[Piece::BlackBishop]
-            | board.pieces[Piece::WhiteQueen]
-            | board.pieces[Piece::BlackQueen]);
+        & (board.pieces[Piece::WhiteBishop] | board.pieces[Piece::BlackBishop] | board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen]);
     let r_attacks = rook_attacks(sq, occ)
-        & (board.pieces[Piece::WhiteRook]
-            | board.pieces[Piece::BlackRook]
-            | board.pieces[Piece::WhiteQueen]
-            | board.pieces[Piece::BlackQueen]);
+        & (board.pieces[Piece::WhiteRook] | board.pieces[Piece::BlackRook] | board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen]);
 
     p_attacks | n_attacks | k_attacks | b_attacks | r_attacks
 }
@@ -162,4 +138,3 @@ fn least_valuable_attacker(board: &Board, attackers: Bitboard, side: Color) -> (
 
     (PieceType::None, Square::None)
 }
-

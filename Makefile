@@ -9,8 +9,7 @@ EXE := $(if $(filter Windows_NT,$(OS)),.exe,)
 all:
 	cargo build --release
 
-# One binary per x86-64 microarchitecture level so a release never crashes with
-# "illegal instruction" on older CPUs.
+# explicit x86-64 levels for portable builds
 release-v2:
 	RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
 

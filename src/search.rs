@@ -1,3 +1,4 @@
+use crate::alloc::HugeBox;
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::evaluate;
@@ -6,9 +7,18 @@ use crate::movepick::MovePicker;
 use crate::see::see;
 use crate::tt::{TTFlag, TranspositionTable};
 use crate::types::{Move, MoveType, Piece, PieceType};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Instant;
+
+#[inline(always)]
+fn gives_check_after_move(board: &Board, m: Move, direct_check: bool, discovered_candidates: Bitboard, their_king: crate::types::Square) -> bool {
+    let gives = direct_check
+        || (discovered_candidates.contains(m.from()) && !crate::attacks::aligned(m.from(), m.to(), their_king))
+        || (m.move_type() == MoveType::EnPassant && board.in_check());
+    debug_assert_eq!(gives, board.in_check(), "gives_check mismatch on {m}");
+    gives
+}
 
 pub const INFINITY: i32 = 32_500;
 pub const MATE_SCORE: i32 = 32_000;
@@ -16,39 +26,40 @@ pub const MAX_PLY: usize = 128;
 pub const CORR_ENTRIES: usize = 16384;
 pub const CORR_BUCKETS: usize = 8;
 
-/// SPSA tuning: parameters identified through hyperbullet game analysis
-/// - 20000 games: RFP_BASE, RFP_IMPROVING, FUTILITY_BASE, FUTILITY_MARGIN, NMP_BASE, NMP_EVAL_DIV
-/// - 4000 games: CORR_WEIGHT, CORR_LIMIT
+// spsa tuned params
 pub static RFP_BASE: AtomicI32 = AtomicI32::new(80);
+
+// instrumentation counters for evaluate calls
+pub static EVAL_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static EVAL_NEGAMAX: AtomicU64 = AtomicU64::new(0);
+pub static EVAL_QSEARCH: AtomicU64 = AtomicU64::new(0);
+pub static RFP_CUTOFFS: AtomicU64 = AtomicU64::new(0);
+pub static STANDPAT_CUTOFFS: AtomicU64 = AtomicU64::new(0);
+pub static EVAL_RFP_CUTOFF_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static EVAL_STANDPAT_CUTOFF_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static QSEARCH_NODES: AtomicU64 = AtomicU64::new(0);
+pub static QSEARCH_TT_HITS: AtomicU64 = AtomicU64::new(0);
+pub static QSEARCH_TT_RAW_HITS: AtomicU64 = AtomicU64::new(0);
 pub static RFP_IMPROVING: AtomicI32 = AtomicI32::new(20);
 pub static FUTILITY_BASE: AtomicI32 = AtomicI32::new(70);
 pub static FUTILITY_MARGIN: AtomicI32 = AtomicI32::new(75);
-// Tried 3 -> 4 and reverted: strength was neutral (50.0% over 150 games) while
-// nodes at fixed depth rose ~5.5% (a deeper reduction makes the null move fail
-// to cut off more often, so the tree grows instead of shrinking).
+// tried 3 -> 4 and reverted, strength was neutral and nodes went up
 pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
 pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(200);
 pub static CORR_WEIGHT: AtomicI32 = AtomicI32::new(153);
 pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(13);
-pub static LMR_BASE: AtomicI32 = AtomicI32::new(30);
-pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(225);
+pub const DEFAULT_LMR_BASE: i32 = 30;
+pub const DEFAULT_LMR_DIVISOR: i32 = 225;
+pub static LMR_BASE: AtomicI32 = AtomicI32::new(DEFAULT_LMR_BASE);
+pub static LMR_DIVISOR: AtomicI32 = AtomicI32::new(DEFAULT_LMR_DIVISOR);
 
-/// Continuation history indexed by
-/// `[layer][previous piece][previous to][current piece][current to]`.
-/// The current piece is part of the key: a knight and a queen landing on the
-/// same square must not share statistics. Values are i16 because i32 for the
-/// full layout would cost ~19 MB per searcher.
+// conthist[layer][prev_pc][prev_to][cur_pc][cur_to], i16 to save memory
 pub type ContHist = [[[[[i16; 64]; 12]; 64]; 12]; 4];
 
-/// Butterfly history split by whether the source and destination squares are
-/// attacked by enemy pawns: `[side][from_threat][to_threat][from][to]`.
+// history[side][from_threat][to_threat][from][to]
 pub type MainHistory = [[[[[i32; 64]; 64]; 2]; 2]; 2];
 
-/// One move of the root position together with the score and node count it got
-/// in the last iteration. The list is sorted by score for time management only.
-///
-/// Feeding it to the root `MovePicker` was tested (400 games, 5000 nodes/move)
-/// and lost 40 +/- 17 Elo (LOS 1.1%), so the picker keeps its own ordering.
+// root move stats for time management (using this for ordering lost elo)
 #[derive(Clone, Copy)]
 pub struct RootMove {
     pub mv: Move,
@@ -57,8 +68,7 @@ pub struct RootMove {
     pub bound: TTFlag,
 }
 
-// LMR reduction table. Rebuilt whenever the LMR tunables change so the hot
-// path is a single relaxed load instead of two atomic loads plus a float divide.
+// precomputed lmr table
 const LMR_TABLE_LEN: usize = 64 * 64;
 static LMR_TABLE: [AtomicI32; LMR_TABLE_LEN] = [const { AtomicI32::new(1) }; LMR_TABLE_LEN];
 
@@ -90,52 +100,50 @@ pub struct Searcher {
     start_time: Instant,
     soft_time_ms: Option<u128>,
     hard_time_ms: Option<u128>,
-    // True when the budget came from `go movetime`, where dynamic scaling of
-    // the soft limit must not be applied.
+    // true for fixed movetime
     pub fixed_time: bool,
-    // Node budget from `go nodes`; `None` means the search is time limited.
+    // node limit from go nodes
     pub node_limit: Option<u64>,
+    // snapshot of tunable search parameters (read from atomics at search start)
+    pub rfp_base: i32,
+    pub rfp_improving: i32,
+    pub futility_base: i32,
+    pub futility_margin: i32,
+    pub nmp_base: i32,
+    pub nmp_eval_div: i32,
+    pub corr_weight: i32,
+    pub corr_limit: i32,
     killers: [[Move; 2]; MAX_PLY],
-    history: Box<MainHistory>,
-    pawn_history: Box<[[[i32; 64]; 12]; 512]>,
-    noisy_history: Box<[[[[i32; 2]; 6]; 64]; 12]>,
+    history: HugeBox<MainHistory>,
+    pawn_history: HugeBox<[[[i32; 64]; 12]; 512]>,
+    noisy_history: HugeBox<[[[[i32; 2]; 6]; 64]; 12]>,
     counter_moves: [[Move; 64]; 64],
-    conthist: Box<ContHist>,
-    pawn_corr: Box<[[[i16; CORR_ENTRIES]; 2]; CORR_BUCKETS]>,
-    non_pawn_corr: Box<[[[[i16; CORR_ENTRIES]; 2]; 2]; CORR_BUCKETS]>,
-    cont_corr: Box<[[[[i16; 64]; 12]; 64]; 12]>,
+    conthist: HugeBox<ContHist>,
+    pawn_corr: HugeBox<[[[i16; CORR_ENTRIES]; 2]; CORR_BUCKETS]>,
+    non_pawn_corr: HugeBox<[[[[i16; CORR_ENTRIES]; 2]; 2]; CORR_BUCKETS]>,
+    cont_corr: HugeBox<[[[[i16; 64]; 12]; 64]; 12]>,
     played_moves: [Move; MAX_PLY],
     played_pieces: [Piece; MAX_PLY],
     prev_is_capture: [bool; MAX_PLY],
     played_threat_state: [u8; MAX_PLY],
     eval_stack: [i32; MAX_PLY],
-    // Reduction (in plies) applied to the move that reached each ply. Only set
-    // around a reduced search and reset right after it, so a child node can
-    // tell how much its parent move was reduced.
+    // reduction applied to reach each ply (for hindsight check)
     reduction_stack: [u8; MAX_PLY],
-    // Per-move scores and node counts of the root position, sorted after every
-    // completed iteration for the time manager. Do not use this list for root
-    // move ordering: see `RootMove` for the measured result.
+    // root move scores/nodes for time management, don't use for move ordering
     root_moves: Vec<RootMove>,
-    // Best root move of the iteration currently in progress. It is promoted to
-    // root_best_move only once the whole depth iteration finishes, so an
-    // interrupted search can never commit a move from a half-searched iteration.
+    // pending best move, committed only when iteration finishes
     root_best_move_pending: Move,
     pub root_best_move: Move,
     pub root_score: i32,
     pub completed_depth: u8,
-    /// Deepest ply any node (qsearch included) reached in the current search.
-    /// Reported as `seldepth`; the nominal depth hides how far the search went
-    /// through extensions and quiescence.
+    // max ply reached (for seldepth)
     pub seldepth: u8,
 }
 
-// Mate scores carry the distance to the root in their low bits, so the
-// threshold has to cover every ply the search can reach.
+// mate score threshold
 const MATE_WINDOW: i32 = MATE_SCORE - MAX_PLY as i32;
 
-/// Marks an `eval_stack` slot whose stored value (a position in check) cannot
-/// be compared with a normal static evaluation.
+// sentinel for eval_stack when in check
 const EVAL_SENTINEL: i32 = i32::MIN;
 
 fn score_to_tt(score: i32, ply: u8) -> i32 {
@@ -175,25 +183,12 @@ fn update_corr(val: &mut i16, bonus: i32) {
     *val += (bonus - (*val as i32 * bonus.abs()) / 16384) as i16;
 }
 
-fn alloc_box_zeroed<T>() -> Box<T> {
-    unsafe {
-        let layout = std::alloc::Layout::new::<T>();
-        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        Box::from_raw(ptr)
-    }
+fn alloc_box_zeroed<T>() -> HugeBox<T> {
+    HugeBox::zeroed()
 }
 
 impl Searcher {
-    pub fn new(
-        tt: Arc<TranspositionTable>,
-        stop: Arc<AtomicBool>,
-        thread_id: usize,
-        num_threads: usize,
-        shared_nodes: Arc<AtomicU64>,
-    ) -> Self {
+    pub fn new(tt: Arc<TranspositionTable>, stop: Arc<AtomicBool>, thread_id: usize, num_threads: usize, shared_nodes: Arc<AtomicU64>) -> Self {
         rebuild_lmr_table();
         Self {
             tt,
@@ -208,15 +203,23 @@ impl Searcher {
             hard_time_ms: None,
             fixed_time: false,
             node_limit: None,
+            rfp_base: crate::search::RFP_BASE.load(Ordering::Relaxed),
+            rfp_improving: crate::search::RFP_IMPROVING.load(Ordering::Relaxed),
+            futility_base: crate::search::FUTILITY_BASE.load(Ordering::Relaxed),
+            futility_margin: crate::search::FUTILITY_MARGIN.load(Ordering::Relaxed),
+            nmp_base: crate::search::NMP_BASE.load(Ordering::Relaxed),
+            nmp_eval_div: crate::search::NMP_EVAL_DIV.load(Ordering::Relaxed),
+            corr_weight: crate::search::CORR_WEIGHT.load(Ordering::Relaxed),
+            corr_limit: crate::search::CORR_LIMIT.load(Ordering::Relaxed),
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: alloc_box_zeroed(),
             pawn_history: alloc_box_zeroed(),
-noisy_history: alloc_box_zeroed(),
-counter_moves: [[Move::NULL; 64]; 64],
-conthist: alloc_box_zeroed(),
-pawn_corr: alloc_box_zeroed(),
-non_pawn_corr: alloc_box_zeroed(),
-cont_corr: alloc_box_zeroed(),
+            noisy_history: alloc_box_zeroed(),
+            counter_moves: [[Move::NULL; 64]; 64],
+            conthist: alloc_box_zeroed(),
+            pawn_corr: alloc_box_zeroed(),
+            non_pawn_corr: alloc_box_zeroed(),
+            cont_corr: alloc_box_zeroed(),
             played_moves: [Move::NULL; MAX_PLY],
             played_pieces: [Piece::None; MAX_PLY],
             prev_is_capture: [false; MAX_PLY],
@@ -240,15 +243,15 @@ cont_corr: alloc_box_zeroed(),
     pub fn clear_histories(&mut self) {
         self.killers = [[Move::NULL; 2]; MAX_PLY];
         self.counter_moves = [[Move::NULL; 64]; 64];
-unsafe {
-    std::ptr::write_bytes(self.history.as_mut(), 0, 1);
-    std::ptr::write_bytes(self.pawn_history.as_mut(), 0, 1);
-    std::ptr::write_bytes(self.noisy_history.as_mut(), 0, 1);
-    std::ptr::write_bytes(self.conthist.as_mut(), 0, 1);
-    std::ptr::write_bytes(self.pawn_corr.as_mut(), 0, 1);
-    std::ptr::write_bytes(self.non_pawn_corr.as_mut(), 0, 1);
-    std::ptr::write_bytes(self.cont_corr.as_mut(), 0, 1);
-}
+        unsafe {
+            std::ptr::write_bytes(self.history.as_mut(), 0, 1);
+            std::ptr::write_bytes(self.pawn_history.as_mut(), 0, 1);
+            std::ptr::write_bytes(self.noisy_history.as_mut(), 0, 1);
+            std::ptr::write_bytes(self.conthist.as_mut(), 0, 1);
+            std::ptr::write_bytes(self.pawn_corr.as_mut(), 0, 1);
+            std::ptr::write_bytes(self.non_pawn_corr.as_mut(), 0, 1);
+            std::ptr::write_bytes(self.cont_corr.as_mut(), 0, 1);
+        }
         self.played_moves = [Move::NULL; MAX_PLY];
         self.played_pieces = [Piece::None; MAX_PLY];
         self.prev_is_capture = [false; MAX_PLY];
@@ -264,13 +267,16 @@ unsafe {
     }
 
     #[inline(always)]
-    fn raw_eval(&self, board: &Board) -> i32 {
+    fn raw_eval(&self, board: &mut Board) -> i32 {
         if let Some(entry) = self.tt.probe(board.tt_hash) {
             if entry.raw_eval != crate::tt::RAW_EVAL_NONE {
                 return entry.raw_eval as i32;
             }
         }
-        evaluate(board)
+        let e = evaluate(board);
+        crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
+        crate::search::EVAL_QSEARCH.fetch_add(1, Ordering::Relaxed);
+        e
     }
 
     #[inline(always)]
@@ -283,8 +289,7 @@ unsafe {
         let b_np_idx = (board.non_pawn_hash[1] as usize) & (CORR_ENTRIES - 1);
 
         let pawn_term = self.pawn_corr[bucket][side][p_idx] as i32;
-        let np_term = self.non_pawn_corr[bucket][0][side][w_np_idx] as i32
-            + self.non_pawn_corr[bucket][1][side][b_np_idx] as i32;
+        let np_term = self.non_pawn_corr[bucket][0][side][w_np_idx] as i32 + self.non_pawn_corr[bucket][1][side][b_np_idx] as i32;
 
         let mut cont_term = 0i32;
         let ply_idx = ply as usize;
@@ -297,25 +302,23 @@ unsafe {
                     let p2_piece = self.played_pieces[ply_idx - 2];
                     let p2_move = self.played_moves[ply_idx - 2];
                     if p2_piece != Piece::None && p2_move != Move::NULL {
-                        cont_term += self.cont_corr[p2_piece as usize][p2_move.to() as usize]
-                            [p1_piece as usize][p1_move.to() as usize] as i32;
+                        cont_term += self.cont_corr[p2_piece as usize][p2_move.to() as usize][p1_piece as usize][p1_move.to() as usize] as i32;
                     }
                 }
                 if ply_idx >= 4 {
                     let p4_piece = self.played_pieces[ply_idx - 4];
                     let p4_move = self.played_moves[ply_idx - 4];
                     if p4_piece != Piece::None && p4_move != Move::NULL {
-                        cont_term += self.cont_corr[p4_piece as usize][p4_move.to() as usize]
-                            [p1_piece as usize][p1_move.to() as usize] as i32;
+                        cont_term += self.cont_corr[p4_piece as usize][p4_move.to() as usize][p1_piece as usize][p1_move.to() as usize] as i32;
                     }
                 }
             }
         }
         let total_bonus = pawn_term + np_term + cont_term;
-        let limit = CORR_LIMIT.load(Ordering::Relaxed);
+        let limit = self.corr_limit;
         let mut eval = raw + (total_bonus / 256).clamp(-limit, limit);
 
-        // Scale evaluation towards draw near 50-move rule
+        // scale evaluation towards draw near 50-move rule
         eval = eval * (200 - board.halfmove_clock as i32) / 200;
 
         eval.clamp(-MATE_SCORE + 100, MATE_SCORE - 100)
@@ -338,8 +341,7 @@ unsafe {
                 let prev_piece = self.played_pieces[prev_idx];
                 let prev_move = self.played_moves[prev_idx];
                 if prev_piece != Piece::None && prev_move != Move::NULL {
-                    score += self.conthist[layer][prev_piece as usize][prev_move.to() as usize]
-                        [cur_piece][cur_to] as i32;
+                    score += self.conthist[layer][prev_piece as usize][prev_move.to() as usize][cur_piece][cur_to] as i32;
                 }
             }
         }
@@ -365,14 +367,14 @@ unsafe {
     }
 
     #[inline(always)]
-    fn noisy_history_score(&self, board: &Board, m: Move, threats: Bitboard) -> i32 {
+    fn noisy_history_score(&self, board: &Board, m: Move, pawn_threats: Bitboard) -> i32 {
         let moving_pc = board.piece_on[m.from()];
         let victim_pt = match m.move_type() {
             MoveType::EnPassant => PieceType::Pawn,
             MoveType::Promotion => m.promo_type(),
             _ => board.piece_on[m.to()].piece_type(),
         };
-        let to_threatened = threats.contains(m.to()) as usize;
+        let to_threatened = pawn_threats.contains(m.to()) as usize;
 
         self.noisy_history[moving_pc as usize][m.to() as usize][victim_pt as usize][to_threatened]
     }
@@ -391,8 +393,7 @@ unsafe {
                 let prev_move = self.played_moves[prev_idx];
                 if prev_piece != Piece::None && prev_move != Move::NULL {
                     update_history_i16(
-                        &mut self.conthist[layer][prev_piece as usize][prev_move.to() as usize]
-                            [cur_piece][cur_to],
+                        &mut self.conthist[layer][prev_piece as usize][prev_move.to() as usize][cur_piece][cur_to],
                         bonus,
                     );
                 }
@@ -400,13 +401,7 @@ unsafe {
         }
     }
 
-    pub fn search(
-        &mut self,
-        board: &mut Board,
-        max_depth: u8,
-        soft_time: Option<u128>,
-        hard_time: Option<u128>,
-    ) -> Move {
+    pub fn search(&mut self, board: &mut Board, max_depth: u8, soft_time: Option<u128>, hard_time: Option<u128>) -> Move {
         self.root_best_move = Move::NULL;
         self.root_score = 0;
         self.completed_depth = 0;
@@ -425,13 +420,19 @@ unsafe {
         self.nodes_at_last_check = 0;
         self.start_time = Instant::now();
         self.tt.new_search();
+        self.rfp_base = crate::search::RFP_BASE.load(Ordering::Relaxed);
+        self.rfp_improving = crate::search::RFP_IMPROVING.load(Ordering::Relaxed);
+        self.futility_base = crate::search::FUTILITY_BASE.load(Ordering::Relaxed);
+        self.futility_margin = crate::search::FUTILITY_MARGIN.load(Ordering::Relaxed);
+        self.nmp_base = crate::search::NMP_BASE.load(Ordering::Relaxed);
+        self.nmp_eval_div = crate::search::NMP_EVAL_DIV.load(Ordering::Relaxed);
+        self.corr_weight = crate::search::CORR_WEIGHT.load(Ordering::Relaxed);
+        self.corr_limit = crate::search::CORR_LIMIT.load(Ordering::Relaxed);
         self.soft_time_ms = soft_time;
         self.hard_time_ms = hard_time;
-        board.root_ply = board.history.len();
+        board.root_ply = board.hist_len;
 
-        // If the search is interrupted before the first iteration finishes, a
-        // legal TT move is a much better fallback than whichever move the
-        // generator happened to emit first.
+        // fallback to tt move if interrupted on depth 1
         let mut best_move = self
             .tt
             .probe(board.tt_hash)
@@ -453,8 +454,7 @@ unsafe {
             });
         }
 
-        // The root position does not change between iterations, so its check
-        // state is computed once and handed to every negamax call below.
+        // root check state doesn't change between iterations
         let root_in_check = board.in_check();
 
         for depth in 1..=max_depth {
@@ -474,7 +474,9 @@ unsafe {
                     }
 
                     if score <= alpha {
-                        if full_window { break; }
+                        if full_window {
+                            break;
+                        }
                         beta = (alpha + beta) / 2;
                         alpha = (alpha - delta).max(-INFINITY);
                         delta = delta.saturating_add(delta * 2 / 3);
@@ -484,7 +486,9 @@ unsafe {
                             full_window = true;
                         }
                     } else if score >= beta {
-                        if full_window { break; }
+                        if full_window {
+                            break;
+                        }
                         beta = (beta + delta).min(INFINITY);
                         delta = delta.saturating_add(delta * 2 / 3);
                         if beta >= MATE_SCORE {
@@ -504,13 +508,12 @@ unsafe {
                 break;
             }
 
-            // Only commit the new root move once the iteration finished without interruption
+            // only commit the new root move once the iteration finished without interruption
             if self.root_best_move_pending != Move::NULL {
                 best_move = self.root_best_move_pending;
             }
 
-            // Rank the root moves by score so the time manager can tell how
-            // much of the iteration went into the current best move.
+            // sort root moves for time management
             self.root_moves.sort_by_key(|rm| std::cmp::Reverse(rm.score));
 
             let elapsed = self.start_time.elapsed().as_millis().max(1);
@@ -562,9 +565,7 @@ unsafe {
 
             if let Some(soft_limit) = self.soft_time_ms {
                 if self.fixed_time {
-                    // `go movetime` is a hard budget: scaling the soft limit by
-                    // the stability factors below would regularly spend only a
-                    // fraction of it. The hard limit check stops us instead.
+                    // fixed movetime shouldn't get scaled down
                     prev_best_move = best_move;
                     prev_score = score;
                     continue;
@@ -589,11 +590,9 @@ unsafe {
                     1.0
                 };
 
-                // Cap the soft-limit extension: the factors above can compound to
-                // more than 2x, which would let a single iteration burn the bank.
+                // cap soft time extension
                 let max_multiplier = 1.5;
-                let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor)
-                    .min(soft_limit as f32 * max_multiplier) as u128;
+                let dynamic_soft = ((soft_limit as f32) * score_trend * pv_factor * eval_factor * node_factor).min(soft_limit as f32 * max_multiplier) as u128;
 
                 let past_hard = elapsed >= self.hard_time_ms.unwrap_or(u128::MAX);
                 let past_soft = depth >= 3 && elapsed >= dynamic_soft;
@@ -612,8 +611,16 @@ unsafe {
     }
 
     pub fn search_helper(&mut self, board: &mut Board, max_depth: u8, soft_time: Option<u128>) {
-        board.root_ply = board.history.len();
+        board.root_ply = board.hist_len;
         self.nodes = 0;
+        self.rfp_base = crate::search::RFP_BASE.load(Ordering::Relaxed);
+        self.rfp_improving = crate::search::RFP_IMPROVING.load(Ordering::Relaxed);
+        self.futility_base = crate::search::FUTILITY_BASE.load(Ordering::Relaxed);
+        self.futility_margin = crate::search::FUTILITY_MARGIN.load(Ordering::Relaxed);
+        self.nmp_base = crate::search::NMP_BASE.load(Ordering::Relaxed);
+        self.nmp_eval_div = crate::search::NMP_EVAL_DIV.load(Ordering::Relaxed);
+        self.corr_weight = crate::search::CORR_WEIGHT.load(Ordering::Relaxed);
+        self.corr_limit = crate::search::CORR_LIMIT.load(Ordering::Relaxed);
         self.nodes_at_last_check = 0;
         self.start_time = Instant::now();
         self.soft_time_ms = soft_time;
@@ -647,7 +654,9 @@ unsafe {
                     }
 
                     if score <= alpha {
-                        if full_window { break; }
+                        if full_window {
+                            break;
+                        }
                         beta = (alpha + beta) / 2;
                         alpha = (alpha - delta).max(-INFINITY);
                         delta = delta.saturating_add(delta * 2 / 3);
@@ -657,7 +666,9 @@ unsafe {
                             full_window = true;
                         }
                     } else if score >= beta {
-                        if full_window { break; }
+                        if full_window {
+                            break;
+                        }
                         beta = (beta + delta).min(INFINITY);
                         delta = delta.saturating_add(delta * 2 / 3);
                         if beta >= MATE_SCORE {
@@ -714,24 +725,24 @@ unsafe {
     }
 
     fn check_time(&mut self) {
-    if let Some(limit) = self.node_limit {
-        if self.nodes >= limit {
-            self.stop.store(true, Ordering::Relaxed);
-            return;
-        }
-    }
-    if self.nodes >= self.nodes_at_last_check + 1024 {
-        self.nodes_at_last_check += 1024;
-        self.shared_nodes.fetch_add(1024, Ordering::Relaxed);
-        let elapsed = self.start_time.elapsed().as_millis();
-
-        if let Some(hard_limit) = self.hard_time_ms {
-            if elapsed >= hard_limit {
+        if let Some(limit) = self.node_limit {
+            if self.nodes >= limit {
                 self.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+        if self.nodes >= self.nodes_at_last_check + 1024 {
+            self.nodes_at_last_check += 1024;
+            self.shared_nodes.fetch_add(1024, Ordering::Relaxed);
+            let elapsed = self.start_time.elapsed().as_millis();
+
+            if let Some(hard_limit) = self.hard_time_ms {
+                if elapsed >= hard_limit {
+                    self.stop.store(true, Ordering::Relaxed);
+                }
             }
         }
     }
-}
 
     fn negamax(
         &mut self,
@@ -745,7 +756,6 @@ unsafe {
         cut_node: bool,
         in_check: bool,
     ) -> i32 {
-        self.check_time();
         if self.stop.load(Ordering::Relaxed) {
             return 0;
         }
@@ -757,8 +767,7 @@ unsafe {
             }
         }
 
-        // If the side to move can force a repetition, the position is worth at
-        // least a draw. Raise alpha before TT or pruning code can undervalue it.
+        // cuckoo repetition check before pruning
         if ply > 0 && board.halfmove_clock >= 3 && alpha < draw_score && board.upcoming_repetition() {
             alpha = draw_score;
             if alpha >= beta {
@@ -767,34 +776,35 @@ unsafe {
         }
 
         if (ply as usize) >= MAX_PLY {
+            crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::search::EVAL_NEGAMAX.fetch_add(1, Ordering::Relaxed);
             return evaluate(board);
         }
 
-        // Mate-distance pruning. A mate found closer to the root already
-        // dominates anything this subtree can return.
+        // mate distance pruning
         alpha = alpha.max(-MATE_SCORE + ply as i32);
         let beta = beta.min(MATE_SCORE - ply as i32 - 1);
         if alpha >= beta {
             return alpha;
         }
 
-        // Killers two plies below belong to grandchildren of this node and
-        // may be stale leftovers from a previously searched branch.
+        // clear grandchild killers
         if (ply as usize) + 2 < MAX_PLY {
             self.killers[(ply + 2) as usize] = [Move::NULL; 2];
         }
 
-        // Bounded in-check extension (commit fe01c69). Do not remove it or
-        // limit it to the first check of a series: extending only the first
-        // check was tested and reverted (+15.8% nodes at fixed depth = worse
-        // selectivity, match only drew level). The extension helps the search
-        // reach cutoffs, so it stays unconditional.
+        // check extension (limiting to first check only was worse)
         if in_check && (ply as usize) < MAX_PLY - 1 && excluded_move == Move::NULL {
             depth = depth.saturating_add(1);
         }
 
         if depth == 0 {
             return self.quiescence(board, alpha, beta, ply, 0, in_check);
+        }
+
+        self.check_time();
+        if self.stop.load(Ordering::Relaxed) {
+            return 0;
         }
 
         self.nodes += 1;
@@ -821,23 +831,33 @@ unsafe {
             tt_is_pv = entry.is_pv;
         }
 
-        // Nodes that were on a PV before are still treated as critical when
-        // they are re-visited with a null window.
+        // keep pv flag for nodes that were on pv before
         let tt_pv = is_pv || (has_tt && tt_is_pv);
 
-        // An in-check node has no use for a static eval: the improving chain,
-        // the pruning/futility decisions and the correction-history update are
-        // all guarded by `!in_check`, and the eval stack slot is written as a
-        // sentinel below. Skipping the NNUE call here and storing
-        // `RAW_EVAL_NONE` saves the most expensive single call in the node for
-        // every check node and keeps meaningless evals out of the table.
+        let prior_reduction = if ply > 0 && !in_check { self.reduction_stack[(ply - 1) as usize] } else { 0 };
+        if has_tt && excluded_move == Move::NULL && ply > 0 && !is_pv && tt_depth >= depth.saturating_add(u8::from(prior_reduction >= 3)) {
+            match tt_flag {
+                TTFlag::Exact => return tt_score,
+                TTFlag::LowerBound if tt_score >= beta => return tt_score,
+                TTFlag::UpperBound if tt_score <= alpha => return tt_score,
+                _ => {}
+            }
+        }
+
+        // skip eval when in check
+        let mut evaluated_this_node = false;
         let (static_eval, raw_eval_to_store) = if in_check {
             (0, crate::tt::RAW_EVAL_NONE)
         } else {
             let raw_eval = if has_tt && tt_raw_eval != crate::tt::RAW_EVAL_NONE {
                 tt_raw_eval as i32
             } else {
-                evaluate(board)
+                evaluated_this_node = true;
+                let e = evaluate(board);
+                crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
+                crate::search::EVAL_NEGAMAX.fetch_add(1, Ordering::Relaxed);
+                self.tt.store_eval(board.tt_hash, e.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16);
+                e
             };
             (
                 self.corrected_eval(board, ply, raw_eval),
@@ -846,17 +866,11 @@ unsafe {
         };
 
         if (ply as usize) < MAX_PLY {
-            // An in-check eval is not comparable with a quiet one, so mark it as
-            // unusable instead of letting it poison the improving comparison two
-            // plies later.
+            // don't let in-check evals mess up improving
             self.eval_stack[ply as usize] = if in_check { EVAL_SENTINEL } else { static_eval };
         }
 
-        // Hindsight reduction adjustment. If the move that reached this node was
-        // reduced hard and the static evaluation did not get better for us, the
-        // reduction may have been too aggressive, so hand the depth back. A
-        // heavily reduced move that improved our standing a lot confirms the
-        // reduction and lets the node be searched one ply shallower.
+        // adjust depth if parent lmr was too aggressive or spot on
         if ply > 0 && !in_check {
             let prev_idx = (ply - 1) as usize;
             let prior_reduction = self.reduction_stack[prev_idx];
@@ -875,8 +889,7 @@ unsafe {
             }
         }
 
-        // A TT score backed by the right bound is usually a sharper position
-        // estimate than the raw eval, so use it for pruning decisions.
+        // refine eval with tt score
         let mut eval = static_eval;
         if has_tt {
             let refines_eval = match tt_flag {
@@ -899,8 +912,7 @@ unsafe {
             }
         }
 
-        // Syzygy tablebase WDL probe. Only meaningful without castling rights,
-        // out of check and outside a singular-extension verification search.
+        // syzygy wdl probe
         if ply > 0 && !in_check && excluded_move == Move::NULL && board.castling_rights == 0 {
             if let Some(wdl) = crate::syzygy::probe_wdl(board) {
                 let tb_value = if wdl > 0 {
@@ -919,12 +931,8 @@ unsafe {
                     TTFlag::Exact
                 };
 
-                // A draw is exact, so return immediately; a win/loss only cuts
-                // off when it beats the current window.
-                if bound == TTFlag::Exact
-                    || (bound == TTFlag::LowerBound && tb_value >= beta)
-                    || (bound == TTFlag::UpperBound && tb_value <= alpha)
-                {
+                // return draw immediately, wins/losses must beat window
+                if bound == TTFlag::Exact || (bound == TTFlag::LowerBound && tb_value >= beta) || (bound == TTFlag::UpperBound && tb_value <= alpha) {
                     self.tt.store(
                         board.tt_hash,
                         score_to_tt(tb_value, ply),
@@ -967,19 +975,22 @@ unsafe {
         };
 
         if !is_pv && !in_check {
-            let base = RFP_BASE.load(Ordering::Relaxed);
-            let imp = RFP_IMPROVING.load(Ordering::Relaxed) * (improving as i32);
+            let base = self.rfp_base;
+            let imp = self.rfp_improving * (improving as i32);
 
             // scale the margin down if our position is improving rapidly
             let rfp_margin = ((base - imp) * (depth as i32) - improvement / 16).max(0);
 
-            // Do not raise this ceiling beyond 6 (e.g. to 8): tested and
-            // reverted, -30 Elo over 150 games with no gain in depth.
+            // tried raising rfp depth to 8, reverted (-elo)
             if depth <= 6 && eval - rfp_margin >= beta {
+                crate::search::RFP_CUTOFFS.fetch_add(1, Ordering::Relaxed);
+                if evaluated_this_node {
+                    crate::search::EVAL_RFP_CUTOFF_CALLS.fetch_add(1, Ordering::Relaxed);
+                }
                 return (eval + beta) / 2;
             }
 
-            // Razoring
+            // razoring
             if depth <= 2 && eval + 200 + 100 * (depth as i32) <= alpha {
                 let qscore = self.quiescence(board, alpha, beta, ply, 0, in_check);
                 if qscore <= alpha {
@@ -987,19 +998,16 @@ unsafe {
                 }
             }
 
-            // Null move pruning
+            // null move pruning
             if excluded_move == Move::NULL
                 && depth >= 3
                 && eval >= beta
                 && board.has_non_pawn_material(board.side_to_move)
                 && (ply == 0 || self.played_moves[(ply - 1) as usize] != Move::NULL)
             {
-                let eval_div = NMP_EVAL_DIV.load(Ordering::Relaxed);
+                let eval_div = self.nmp_eval_div;
 
-                let mut r = NMP_BASE.load(Ordering::Relaxed)
-                    + (depth as i32) / 3
-                    + ((eval - beta) / eval_div).clamp(0, 3)
-                    + (improvement / 128).clamp(-1, 1);
+                let mut r = self.nmp_base + (depth as i32) / 3 + ((eval - beta) / eval_div).clamp(0, 3) + (improvement / 128).clamp(-1, 1);
 
                 if r < 1 {
                     r = 1;
@@ -1012,19 +1020,8 @@ unsafe {
                 }
                 let undo = board.make_null_move();
                 self.tt.prefetch(board.tt_hash);
-                // A null move leaves the enemy king untouched, so the position
-                // after it can never be a check.
-                let score = -self.negamax(
-                    board,
-                    depth.saturating_sub(r),
-                    ply + 1,
-                    -beta,
-                    -beta + 1,
-                    false,
-                    Move::NULL,
-                    !cut_node,
-                    false,
-                );
+                // null move can't give check
+                let score = -self.negamax(board, depth.saturating_sub(r), ply + 1, -beta, -beta + 1, false, Move::NULL, !cut_node, false);
                 board.undo_null_move(undo);
 
                 if score >= beta {
@@ -1033,18 +1030,17 @@ unsafe {
             }
         }
 
-        // ProbCut
+        // probCut
         if !is_pv && !in_check && excluded_move == Move::NULL && depth >= 5 && beta.abs() < MATE_SCORE - 100 {
             let probcut_beta = beta + 200;
 
-            // Skip ProbCut if a deeper TT entry proves we cannot beat probcut_beta
-            let can_probcut = !has_tt
-                || tt_depth < depth - 3
-                || tt_score >= probcut_beta
-                || tt_flag == TTFlag::LowerBound;
+            // skip ProbCut if a deeper TT entry proves we can't beat probcut_beta
+            let can_probcut = !has_tt || tt_depth < depth - 3 || tt_score >= probcut_beta || tt_flag == TTFlag::LowerBound;
 
             if can_probcut {
-                let mut probcut_picker = MovePicker::new_qsearch(tt_move);
+                let mut probcut_picker = MovePicker::new_qsearch(tt_move, in_check);
+                let discovered_candidates = board.discovered_check_candidates();
+                let their_king = board.king_square(!board.side_to_move);
 
                 while let Some(m) = probcut_picker.next(
                     board,
@@ -1063,15 +1059,15 @@ unsafe {
                     if (ply as usize) < MAX_PLY {
                         self.played_moves[ply as usize] = m;
                         self.played_pieces[ply as usize] = board.piece_on[m.from()];
-                        self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
-                            || m.move_type() == MoveType::EnPassant;
+                        self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
                     }
+
+                    let direct_check = probcut_picker.gives_check(board, m);
 
                     let undo = board.make_move(m);
                     self.tt.prefetch(board.tt_hash);
-                    let probcut_check = board.in_check();
-                    let mut score =
-                        -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0, probcut_check);
+                    let probcut_check = gives_check_after_move(board, m, direct_check, discovered_candidates, their_king);
+                    let mut score = -self.quiescence(board, -probcut_beta, -probcut_beta + 1, ply + 1, 0, probcut_check);
 
                     if score >= probcut_beta {
                         score = -self.negamax(
@@ -1113,25 +1109,14 @@ unsafe {
             let singular_beta = tt_score - singular_margin;
             let singular_depth = (depth - 1) / 2;
 
-            let score = self.negamax(
-                board,
-                singular_depth,
-                ply,
-                singular_beta - 1,
-                singular_beta,
-                false,
-                tt_move,
-                cut_node,
-                in_check,
-            );
+            let score = self.negamax(board, singular_depth, ply, singular_beta - 1, singular_beta, false, tt_move, cut_node, in_check);
 
             if self.stop.load(Ordering::Relaxed) {
                 return 0;
             }
 
             if score < singular_beta {
-                // The wider the gap to every alternative, the more this move
-                // deserves extra depth.
+                // extend more if tt move is way better
                 let double_margin = singular_margin * 2;
                 let triple_margin = singular_margin * 3;
                 if !is_pv && score < singular_beta - triple_margin {
@@ -1144,8 +1129,7 @@ unsafe {
             } else if singular_beta >= beta {
                 return singular_beta;
             } else if tt_score >= beta {
-                // Alternatives are just as good, so give the TT move less depth
-                // instead of spending a full search on it.
+                // reduce if alternatives are just as good
                 extension = if !is_pv { -2 } else { -1 };
             } else if cut_node {
                 extension = -1;
@@ -1180,8 +1164,10 @@ unsafe {
             [Move::NULL; 2]
         };
 
-        let mut picker = MovePicker::new(tt_move, killers, counter_move);
+        let mut picker = MovePicker::new(tt_move, killers, counter_move, in_check);
         let mut pawn_threats: Option<Bitboard> = None;
+        let mut discovered_candidates: Option<Bitboard> = None;
+        let their_king = board.king_square(!board.side_to_move);
 
         while let Some(m) = picker.next(
             board,
@@ -1199,16 +1185,17 @@ unsafe {
 
             let is_capture = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
             let is_quiet = !is_capture && m.move_type() != MoveType::Promotion;
-            let hist = if is_quiet {
+            let hist = if moves_searched == 0 {
+                0
+            } else if is_quiet {
                 let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
                 self.quiet_history_score(board, ply, m, pt)
             } else {
-                self.noisy_history_score(board, m, picker.threats(board))
+                let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                self.noisy_history_score(board, m, pt)
             };
 
-            // LMR will search later moves shallower than `depth`, so shallow
-            // pruning decisions are made against that effective depth instead
-            // of the nominal one.
+            // use lmr depth for pruning
             let lmr_depth = if depth >= 3 && moves_searched >= (if tt_pv { 2 } else { 3 }) {
                 let r = lmr(depth as usize, moves_searched);
                 (depth as i32 - 1 - r).max(0)
@@ -1216,29 +1203,17 @@ unsafe {
                 depth as i32 - 1
             };
 
-            // Do not prune while the best score so far is a loss: the remaining
-            // moves may still hold the only defence.
-            //
-            // HYPOTHESIS: the gate is the node type, not the sticky "was part of
-            // a PV once" flag. A re-searched node whose TT flag says PV but
-            // which is currently searched with a null window is a scout node
-            // like any other, and keeping shallow pruning off there leaves a
-            // large part of the tree unpruned.
+            // don't prune on pv or when already losing
             if !is_pv && !in_check && moves_searched > 0 && best_score > -MATE_SCORE + 100 {
-                // Quiet moves that check the enemy king are never pruned. The
-                // picker's cached check squares make this a single lookup.
+                // never prune quiet checks
                 if is_quiet && !picker.gives_check(board, m) {
                     if moves_searched >= lmp_threshold && hist < 2000 {
                         continue;
                     }
 
-                    // A `!improving` discount here (e.g. -35) was tested and
-                    // reverted: a smaller margin prunes less, so the tree grew
-                    // +27.6% at fixed depth 12 instead of shrinking.
-                    let futility_margin = FUTILITY_BASE.load(Ordering::Relaxed)
-                        + FUTILITY_MARGIN.load(Ordering::Relaxed) * (lmr_depth + 1);
-                    // Do not raise this futility cap from 5 to 7: tested and
-                    // reverted, only -2.7% nodes for -23 Elo.
+                    // tried !improving discount here, reverted (blew up nodes)
+                    let futility_margin = self.futility_base + self.futility_margin * (lmr_depth + 1);
+                    // tried futility cap 7, reverted (-elo)
                     if lmr_depth <= 5
                         && alpha.abs() < MATE_SCORE - 100
                         && eval + futility_margin <= alpha
@@ -1261,17 +1236,14 @@ unsafe {
                     continue;
                 }
 
-                // Do not raise this losing-capture SEE cap from 5 to 7 either:
-                // tested together with futility, reverted for -23 Elo.
+                // tried raising see cap to 7 too, reverted
                 if !is_quiet && lmr_depth <= 5 {
-                    // A move handed out by the picker's good-noisy stage already
-                    // has SEE >= 0, which always clears the negative threshold
-                    // used here, so its SEE call can be skipped.
+                    // good_noisy already passed see >= 0
                     if !picker.last_good_noisy && !see(board, m, -100 * (lmr_depth + 1)) {
                         continue;
                     }
 
-                    // Prune captures with terrible history at low depths
+                    // prune captures with terrible history at low depths
                     let is_queen_promo = m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Queen;
                     if lmr_depth <= 4 && !is_queen_promo && !picker.last_see_ge_zero && hist < -2500 * (lmr_depth + 1) {
                         continue;
@@ -1291,20 +1263,39 @@ unsafe {
                 self.played_moves[ply as usize] = m;
                 self.played_pieces[ply as usize] = board.piece_on[m.from()];
                 self.prev_is_capture[ply as usize] = is_capture;
-                let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
-                self.played_threat_state[ply as usize] = ((pt.contains(m.from()) as u8) << 1)
-                    | (pt.contains(m.to()) as u8);
+                if !is_capture {
+                    let pt = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                    self.played_threat_state[ply as usize] = ((pt.contains(m.from()) as u8) << 1) | (pt.contains(m.to()) as u8);
+                }
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
             let lmr_depth_threshold = if tt_pv { 2 } else { 3 };
             let lmr_applies = depth >= 3 && moves_searched >= lmr_depth_threshold && (!tt_pv || is_quiet);
-            // The picker already ran SEE on every noisy move it returned.
+            // the picker already ran SEE on every noisy move it returned
             let is_see_ge_zero = lmr_applies && !is_quiet && picker.last_see_ge_zero;
+
+            let direct_check = if moves_searched == 0 {
+                board.gives_direct_check(m)
+            } else {
+                picker.gives_check(board, m)
+            };
+
+            let f = m.from();
+            let may_discover = !direct_check
+                && m.move_type() != MoveType::EnPassant
+                && (f.rank() == their_king.rank()
+                    || f.file() == their_king.file()
+                    || (f.rank() as i32 - their_king.rank() as i32).abs() == (f.file() as i32 - their_king.file() as i32).abs());
+            let is_discovered = may_discover && {
+                let dc = *discovered_candidates.get_or_insert_with(|| board.discovered_check_candidates());
+                dc.contains(f) && !crate::attacks::aligned(f, m.to(), their_king)
+            };
 
             let undo = board.make_move(m);
             self.tt.prefetch(board.tt_hash);
-            let gives_check = board.in_check();
+            let gives_check = direct_check || is_discovered || (m.move_type() == MoveType::EnPassant && board.in_check());
+            debug_assert_eq!(gives_check, board.in_check(), "gives_check mismatch on {m}");
 
             let ext = if m == tt_move { extension } else { 0 };
 
@@ -1356,28 +1347,14 @@ unsafe {
                         r += 1;
                     }
 
-                    // HYPOTHESIS: allow a reduction of zero. The lower bound of
-                    // 1 was kept because a min of 0 measured ~28% more nodes at
-                    // a fixed depth, but a bigger tree at the same depth is not
-                    // a strength argument by itself - two changes rejected on
-                    // exactly that argument (the shallow-pruning gate, qsearch
-                    // TT stores) turned out positive in a match. A zero
-                    // reduction only happens when history, killers or an
-                    // improving position already flagged the move as likely
-                    // best, which is where a full-depth scout search is least
-                    // wasteful. Checks already take this path.
+                    // allow r=0 so good moves aren't reduced
                     r = r.clamp(0, depth as i32 - 2);
-                    // Checks stay at full depth. Softening this into a partial
-                    // reduction was tested and reverted: `r - 1` cost +23.7%
-                    // nodes and `r / 2` +6.2% at fixed depth 12, because check
-                    // cutoffs are worth the full search and a shallower one
-                    // makes the tree grow instead of shrink.
+                    // don't reduce checks (partial reduction blew up nodes)
                     if gives_check {
                         r = 0;
                     }
 
-                    // Winning/equal captures stay shallow, but losing (bad SEE)
-                    // captures may reduce deeper so refuted trades do not waste nodes.
+                    // cap reduction for good captures
                     if !is_quiet && is_see_ge_zero {
                         r = r.min(2);
                     }
@@ -1385,8 +1362,7 @@ unsafe {
 
                 let reduced = (depth as i32 - 1 - r).max(0) as u8;
 
-                // Record the applied reduction for the child node, which uses it
-                // to compensate an over-aggressive reduction (hindsight).
+                // save reduction for child hindsight check
                 if (ply as usize) < MAX_PLY {
                     self.reduction_stack[ply as usize] = r as u8;
                 }
@@ -1434,11 +1410,7 @@ unsafe {
                 }
             }
 
-            // Only a move that actually raised alpha becomes the TT move. A
-            // fail-low move carries a score cut off at alpha and would wreck
-            // move ordering on later visits, and suppressing the internal
-            // iterative reduction it triggers costs far more nodes than the
-            // ordering hint is worth.
+            // only save tt move when alpha raised
             if score > alpha {
                 alpha = score;
                 best_move = m;
@@ -1455,10 +1427,7 @@ unsafe {
                     _ => board.piece_on[m.to()].piece_type(),
                 } as usize;
 
-                // Only the noisy-history updates index by whether the target is
-                // threatened, so the threat map is taken per branch instead of
-                // on every cutoff: a quiet cutoff that was never preceded by a
-                // noisy move does not need it at all.
+                // compute pawn threats only if needed
                 if is_quiet {
                     if (ply as usize) < MAX_PLY {
                         if self.killers[ply as usize][0] != m {
@@ -1477,10 +1446,7 @@ unsafe {
                     let m_from_th = pt.contains(m.from()) as usize;
                     let m_to_th = pt.contains(m.to()) as usize;
 
-                    update_history(
-                        &mut self.history[us][m_from_th][m_to_th][m.from() as usize][m.to() as usize],
-                        bonus,
-                    );
+                    update_history(&mut self.history[us][m_from_th][m_to_th][m.from() as usize][m.to() as usize], bonus);
                     if moving_pc < 12 {
                         update_history(&mut self.pawn_history[p_idx][moving_pc][m.to() as usize], bonus);
                     }
@@ -1488,26 +1454,27 @@ unsafe {
 
                     for j in 0..quiet_count {
                         let qm = quiet_moves[j];
-                        if qm == m || qm == Move::NULL { continue; }
+                        if qm == m || qm == Move::NULL {
+                            continue;
+                        }
 
                         let q_pc = board.piece_on[qm.from()] as usize;
                         if q_pc < 12 {
                             let q_from_th = pt.contains(qm.from()) as usize;
                             let q_to_th = pt.contains(qm.to()) as usize;
-                            update_history(
-                                &mut self.history[us][q_from_th][q_to_th][qm.from() as usize][qm.to() as usize],
-                                -malus,
-                            );
+                            update_history(&mut self.history[us][q_from_th][q_to_th][qm.from() as usize][qm.to() as usize], -malus);
                             update_history(&mut self.pawn_history[p_idx][q_pc][qm.to() as usize], -malus);
                             self.update_conthist(ply, board.piece_on[qm.from()], qm, -malus);
                         }
                     }
 
                     if noisy_count > 0 {
-                        let threats = picker.threats(board);
+                        let pawn_threats = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
                         for j in 0..noisy_count {
                             let nm = noisy_moves[j];
-                            if nm == m || nm == Move::NULL { continue; }
+                            if nm == m || nm == Move::NULL {
+                                continue;
+                            }
 
                             let n_pc = board.piece_on[nm.from()] as usize;
                             let n_victim_pt = match nm.move_type() {
@@ -1517,14 +1484,14 @@ unsafe {
                             } as usize;
 
                             if n_pc < 12 && n_victim_pt < 6 {
-                                let n_to_threatened = threats.contains(nm.to()) as usize;
+                                let n_to_threatened = pawn_threats.contains(nm.to()) as usize;
                                 update_history(&mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt][n_to_threatened], -bonus);
                             }
                         }
                     }
                 } else {
-                    let threats = picker.threats(board);
-                    let to_threatened = threats.contains(m.to()) as usize;
+                    let pawn_threats = *pawn_threats.get_or_insert_with(|| board.opponent_pawn_threats());
+                    let to_threatened = pawn_threats.contains(m.to()) as usize;
 
                     if moving_pc < 12 && victim_pt < 6 {
                         update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt][to_threatened], bonus);
@@ -1532,7 +1499,9 @@ unsafe {
 
                     for j in 0..noisy_count {
                         let nm = noisy_moves[j];
-                        if nm == m || nm == Move::NULL { continue; }
+                        if nm == m || nm == Move::NULL {
+                            continue;
+                        }
 
                         let n_pc = board.piece_on[nm.from()] as usize;
                         let n_victim_pt = match nm.move_type() {
@@ -1542,7 +1511,7 @@ unsafe {
                         } as usize;
 
                         if n_pc < 12 && n_victim_pt < 6 {
-                            let n_to_threatened = threats.contains(nm.to()) as usize;
+                            let n_to_threatened = pawn_threats.contains(nm.to()) as usize;
                             update_history(&mut self.noisy_history[n_pc][nm.to() as usize][n_victim_pt][n_to_threatened], -bonus);
                         }
                     }
@@ -1580,8 +1549,7 @@ unsafe {
                 let prev_from_th = (th >> 1) as usize;
                 let prev_to_th = (th & 1) as usize;
                 update_history(
-                    &mut self.history[opp_color][prev_from_th][prev_to_th][p_move.from() as usize]
-                        [p_move.to() as usize],
+                    &mut self.history[opp_color][prev_from_th][prev_to_th][p_move.from() as usize][p_move.to() as usize],
                     prev_bonus,
                 );
             }
@@ -1610,8 +1578,8 @@ unsafe {
                 && !(flag == TTFlag::UpperBound && best_score >= static_eval)
             {
                 let diff = best_score - static_eval;
-                // Reckless formula for precise eval correction scaling
-                let weight = CORR_WEIGHT.load(Ordering::Relaxed);
+                // update corrhist
+                let weight = self.corr_weight;
                 let bonus = (weight * (depth as i32) * diff / 128).clamp(-1200, 1200);
                 let side = board.side_to_move as usize;
                 let bucket = (board.halfmove_clock as usize / 16).min(CORR_BUCKETS - 1);
@@ -1635,8 +1603,7 @@ unsafe {
                             let p2_move = self.played_moves[ply_idx - 2];
                             if p2_piece != Piece::None && p2_move != Move::NULL {
                                 update_corr(
-                                    &mut self.cont_corr[p2_piece as usize][p2_move.to() as usize]
-                                        [p1_piece as usize][p1_move.to() as usize],
+                                    &mut self.cont_corr[p2_piece as usize][p2_move.to() as usize][p1_piece as usize][p1_move.to() as usize],
                                     bonus,
                                 );
                             }
@@ -1646,8 +1613,7 @@ unsafe {
                             let p4_move = self.played_moves[ply_idx - 4];
                             if p4_piece != Piece::None && p4_move != Move::NULL {
                                 update_corr(
-                                    &mut self.cont_corr[p4_piece as usize][p4_move.to() as usize]
-                                        [p1_piece as usize][p1_move.to() as usize],
+                                    &mut self.cont_corr[p4_piece as usize][p4_move.to() as usize][p1_piece as usize][p1_move.to() as usize],
                                     bonus,
                                 );
                             }
@@ -1659,15 +1625,7 @@ unsafe {
         best_score
     }
 
-    fn quiescence(
-        &mut self,
-        board: &mut Board,
-        mut alpha: i32,
-        beta: i32,
-        ply: u8,
-        qply: u8,
-        in_check: bool,
-    ) -> i32 {
+    fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: u8, qply: u8, in_check: bool) -> i32 {
         self.check_time();
         if self.stop.load(Ordering::Relaxed) {
             return 0;
@@ -1679,16 +1637,23 @@ unsafe {
         }
 
         if (ply as usize) >= MAX_PLY {
+            crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::search::EVAL_QSEARCH.fetch_add(1, Ordering::Relaxed);
             return evaluate(board);
         }
 
         if qply >= 16 && !in_check {
-            return self.corrected_eval(board, ply, self.raw_eval(board));
+            let raw = self.raw_eval(board);
+            return self.corrected_eval(board, ply, raw);
         }
         let mut tt_move = Move::NULL;
         let mut tt_raw_eval = crate::tt::RAW_EVAL_NONE;
 
         if let Some(entry) = self.tt.probe(board.tt_hash) {
+            crate::search::QSEARCH_TT_HITS.fetch_add(1, Ordering::Relaxed);
+            if entry.raw_eval != crate::tt::RAW_EVAL_NONE {
+                crate::search::QSEARCH_TT_RAW_HITS.fetch_add(1, Ordering::Relaxed);
+            }
             tt_move = entry.best_move;
             tt_raw_eval = entry.raw_eval;
 
@@ -1702,6 +1667,7 @@ unsafe {
         }
 
         self.nodes += 1;
+        crate::search::QSEARCH_NODES.fetch_add(1, Ordering::Relaxed);
         if ply > self.seldepth {
             self.seldepth = ply;
         }
@@ -1710,15 +1676,18 @@ unsafe {
         let mut stand_pat = -INFINITY;
         let mut raw_eval = 0;
         if !in_check {
-            // The static eval was already fetched with the TT probe above.
             raw_eval = if tt_raw_eval != crate::tt::RAW_EVAL_NONE {
                 tt_raw_eval as i32
             } else {
-                evaluate(board)
+                let e = evaluate(board);
+                crate::search::EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
+                crate::search::EVAL_QSEARCH.fetch_add(1, Ordering::Relaxed);
+                self.tt.store_eval(board.tt_hash, e.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16);
+                e
             };
             stand_pat = self.corrected_eval(board, ply, raw_eval);
-
             if stand_pat >= beta {
+                crate::search::STANDPAT_CUTOFFS.fetch_add(1, Ordering::Relaxed);
                 return stand_pat;
             }
             alpha = alpha.max(stand_pat);
@@ -1738,10 +1707,8 @@ unsafe {
             let mut best_score = -INFINITY;
             let mut best_move = Move::NULL;
 
-            // Scores are written only for the moves actually generated, so the
-            // array does not need to be zeroed up front.
-            let mut scores: [std::mem::MaybeUninit<i32>; 256] =
-                [const { std::mem::MaybeUninit::uninit() }; 256];
+            // uninit scores array, filled below
+            let mut scores: [std::mem::MaybeUninit<i32>; 256] = [const { std::mem::MaybeUninit::uninit() }; 256];
             let pawn_threats = board.opponent_pawn_threats();
             for i in 0..moves.count {
                 let m = moves.get(i);
@@ -1760,6 +1727,10 @@ unsafe {
                 scores[i].write(score);
             }
 
+            let check_squares = board.check_squares();
+            let discovered_candidates = board.discovered_check_candidates();
+            let their_king = board.king_square(!board.side_to_move);
+
             for i in 0..moves.count {
                 let mut best_idx = i;
                 for j in (i + 1)..moves.count {
@@ -1774,12 +1745,12 @@ unsafe {
                 if (ply as usize) < MAX_PLY {
                     self.played_moves[ply as usize] = m;
                     self.played_pieces[ply as usize] = board.piece_on[m.from()];
-                    self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
-                        || m.move_type() == MoveType::EnPassant;
+                    self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
                 }
+                let direct_check = board.gives_check_with(m, &check_squares);
                 let undo = board.make_move(m);
                 self.tt.prefetch(board.tt_hash);
-                let child_check = board.in_check();
+                let child_check = gives_check_after_move(board, m, direct_check, discovered_candidates, their_king);
                 let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1, child_check);
                 board.undo_move(m, undo);
 
@@ -1792,15 +1763,10 @@ unsafe {
                 }
 
                 if score >= beta {
-                    self.tt.store(
-                    board.tt_hash,
-                    score_to_tt(score, ply),
-                    0,
-                    TTFlag::LowerBound,
-                    m,
-                    raw_eval_to_store,
-                    false,
-                );
+                    if qply == 0 {
+                        self.tt
+                            .store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store, false);
+                    }
                     return score;
                 }
 
@@ -1810,39 +1776,41 @@ unsafe {
                 }
             }
 
-            let flag = if best_score >= beta {
-                TTFlag::LowerBound
-            } else if best_score > alpha_orig {
-                TTFlag::Exact
-            } else {
-                TTFlag::UpperBound
-            };
-            self.tt.store(
-                board.tt_hash,
-                score_to_tt(best_score, ply),
-                0,
-                flag,
-                best_move,
-                raw_eval_to_store,
-                false,
-            );
+            if qply == 0 {
+                let flag = if best_score >= beta {
+                    TTFlag::LowerBound
+                } else if best_score > alpha_orig {
+                    TTFlag::Exact
+                } else {
+                    TTFlag::UpperBound
+                };
+                self.tt
+                    .store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval_to_store, false);
+            }
             return best_score;
         }
 
-        let mut picker = MovePicker::new_qsearch(tt_move);
+        let mut picker = MovePicker::new_qsearch(tt_move, in_check);
         let mut best_score = stand_pat;
         let mut best_move = Move::NULL;
+        let their_king = board.king_square(!board.side_to_move);
+        let mut discovered_candidates: Option<Bitboard> = None;
 
-        while let Some(m) = picker.next(
-            board,
-            &self.history,
-            &self.pawn_history,
-            &self.conthist,
-            &self.noisy_history,
-            ply,
-            &self.played_pieces,
-            &self.played_moves,
-        ) {
+        loop {
+            picker.set_delta_threshold(alpha - stand_pat - 200);
+            let m = match picker.next(
+                board,
+                &self.history,
+                &self.pawn_history,
+                &self.conthist,
+                &self.noisy_history,
+                ply,
+                &self.played_pieces,
+                &self.played_moves,
+            ) {
+                Some(m) => m,
+                None => break,
+            };
             let is_promo = m.move_type() == MoveType::Promotion;
             if !is_promo {
                 let cap_pt = match m.move_type() {
@@ -1861,12 +1829,16 @@ unsafe {
             if (ply as usize) < MAX_PLY {
                 self.played_moves[ply as usize] = m;
                 self.played_pieces[ply as usize] = board.piece_on[m.from()];
-                self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None
-                    || m.move_type() == MoveType::EnPassant;
+                self.prev_is_capture[ply as usize] = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant;
             }
+            let direct_check = picker.gives_check(board, m);
+            if discovered_candidates.is_none() {
+                discovered_candidates = Some(board.discovered_check_candidates());
+            }
+            let dc = discovered_candidates.unwrap();
             let undo = board.make_move(m);
             self.tt.prefetch(board.tt_hash);
-            let child_check = board.in_check();
+            let child_check = gives_check_after_move(board, m, direct_check, dc, their_king);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1, qply + 1, child_check);
             board.undo_move(m, undo);
 
@@ -1887,32 +1859,22 @@ unsafe {
                     _ => board.piece_on[m.to()].piece_type(),
                 } as usize;
                 if moving_pc < 12 && victim_pt < 6 {
-                    let threats = picker.threats(board);
-                    let to_threatened = threats.contains(m.to()) as usize;
+                    let pawn_threats = board.opponent_pawn_threats();
+                    let to_threatened = pawn_threats.contains(m.to()) as usize;
                     update_history(&mut self.noisy_history[moving_pc][m.to() as usize][victim_pt][to_threatened], 100);
                 }
 
-                self.tt.store(
-                    board.tt_hash,
-                    score_to_tt(score, ply),
-                    0,
-                    TTFlag::LowerBound,
-                    m,
-                    raw_eval_to_store,
-                    false,
-                );
+                if qply == 0 {
+                    self.tt
+                        .store(board.tt_hash, score_to_tt(score, ply), 0, TTFlag::LowerBound, m, raw_eval_to_store, false);
+                }
                 return score;
             }
             alpha = alpha.max(score);
         }
 
-        // HYPOTHESIS (was: only store beta cutoffs, to keep shallow upper bounds
-        // out of the table): store the finished node instead. A qsearch node is
-        // entered again and again through transpositions, and without an entry
-        // every visit re-runs the whole capture loop. The flag below is exact
-        // when the node raised alpha, so the entry is a real result, not a
-        // half-searched guess.
-        if !self.stop.load(Ordering::Relaxed) {
+        // store finished qsearch node in tt
+        if !self.stop.load(Ordering::Relaxed) && qply == 0 {
             let flag = if best_score >= beta {
                 TTFlag::LowerBound
             } else if best_score > alpha_orig {
@@ -1920,15 +1882,8 @@ unsafe {
             } else {
                 TTFlag::UpperBound
             };
-            self.tt.store(
-                board.tt_hash,
-                score_to_tt(best_score, ply),
-                0,
-                flag,
-                best_move,
-                raw_eval_to_store,
-                false,
-            );
+            self.tt
+                .store(board.tt_hash, score_to_tt(best_score, ply), 0, flag, best_move, raw_eval_to_store, false);
         }
 
         best_score

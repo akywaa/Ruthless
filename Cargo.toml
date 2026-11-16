@@ -1,6 +1,6 @@
 [package]
 name = "Ruthless"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [profile.release]
@@ -8,6 +8,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = true
 
 [dependencies]
 core_affinity = "0.8"

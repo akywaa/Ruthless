@@ -15,6 +15,7 @@ pub struct SearchParams {
     pub board: Board,
     pub depth: u8,
     pub soft_time: Option<u128>,
+    pub node_limit: Option<u64>,
     pub stop: Arc<AtomicBool>,
     pub clear_histories: bool,
 }
@@ -164,6 +165,7 @@ impl ThreadPool {
                             }
                             let mut board_clone = params.board;
                             helper.stop = Arc::clone(&params.stop);
+                            helper.node_limit = params.node_limit;
                             helper.search_helper(&mut board_clone, params.depth, params.soft_time);
 
                             if helper.completed_depth > 0 && helper.root_best_move != Move::NULL {
@@ -219,8 +221,22 @@ impl ThreadPool {
 
         bind_thread(0);
         self.shared_nodes.store(0, Ordering::Relaxed);
-        let search_start = Instant::now();
+        self.main_searcher.nodes = 0;
 
+        let legal_moves = generate_legal_moves(board);
+        if legal_moves.count == 0 {
+            self.main_searcher.root_best_move = Move::NULL;
+            self.main_searcher.completed_depth = 0;
+            return Move::NULL;
+        }
+        if legal_moves.count == 1 {
+            let only_move = legal_moves.get(0);
+            self.main_searcher.root_best_move = only_move;
+            self.main_searcher.completed_depth = 0;
+            return only_move;
+        }
+
+        let search_start = Instant::now();
         let clear_histories = self.clear_pending;
         self.clear_pending = false;
 
@@ -228,6 +244,7 @@ impl ThreadPool {
             board: board.clone(),
             depth,
             soft_time: limits.soft_limit,
+            node_limit: limits.node_limit,
             stop: Arc::clone(&self.stop_signal),
             clear_histories,
         };
@@ -282,7 +299,6 @@ impl ThreadPool {
             pv: main_pv,
         };
 
-        let legal_moves = generate_legal_moves(board);
         let helpers: Vec<SearchResult> = {
             let results = self.results.lock().unwrap();
             results
@@ -329,7 +345,7 @@ impl ThreadPool {
         let mut votes: Vec<(Move, i64)> = Vec::with_capacity(candidates.len());
 
         for result in &candidates {
-            let weight = i64::from(result.score - min_score) + 14;
+            let weight = (i64::from(result.score - min_score) + 14) * i64::from(result.depth);
             if let Some((_, total)) = votes.iter_mut().find(|(m, _)| *m == result.best_move) {
                 *total += weight;
             } else {

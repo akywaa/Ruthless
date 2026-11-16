@@ -350,7 +350,7 @@ impl Searcher {
 
     #[inline(always)]
     fn draw_score(&self) -> i32 {
-        (self.nodes as i32 & 3) - 2
+        0
     }
 
     #[inline(always)]
@@ -371,7 +371,10 @@ impl Searcher {
         let moving_pc = board.piece_on[m.from()];
         let victim_pt = match m.move_type() {
             MoveType::EnPassant => PieceType::Pawn,
-            MoveType::Promotion => m.promo_type(),
+            MoveType::Promotion => {
+                let cap = board.piece_on[m.to()].piece_type();
+                if cap != PieceType::None { cap } else { PieceType::Pawn }
+            }
             _ => board.piece_on[m.to()].piece_type(),
         };
         let to_threatened = pawn_threats.contains(m.to()) as usize;
@@ -572,7 +575,7 @@ impl Searcher {
                 }
 
                 let score_diff = (prev_score - score).clamp(-100, 100) as f32;
-                let score_trend = if score < -100 { 1.25 } else { (0.85 + 0.03 * score_diff).clamp(0.8, 1.3) };
+                let score_trend = if score < -100 { 1.25 } else { (0.95 + 0.0035 * score_diff).clamp(0.8, 1.3) };
                 let pv_factor = (1.25 - 0.05 * (stable_iterations as f32)).max(0.7);
                 let eval_factor = if eval_stable { 0.85 } else { 1.15 };
 
@@ -733,7 +736,13 @@ impl Searcher {
         }
         if self.nodes >= self.nodes_at_last_check + 1024 {
             self.nodes_at_last_check += 1024;
-            self.shared_nodes.fetch_add(1024, Ordering::Relaxed);
+            let total_nodes = self.shared_nodes.fetch_add(1024, Ordering::Relaxed) + 1024;
+            if let Some(limit) = self.node_limit {
+                if total_nodes >= limit {
+                    self.stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
             let elapsed = self.start_time.elapsed().as_millis();
 
             if let Some(hard_limit) = self.hard_time_ms {

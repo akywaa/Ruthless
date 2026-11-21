@@ -1,67 +1,60 @@
+ <div align="center">
+
 # Ruthless
 
-A UCI chess engine written in Rust. It uses an NNUE evaluation and a fairly standard alpha-beta search.
+*A UCI chess engine written in Rust.*
+
+</div>
 
 ## Features
 
-- Bitboards, magic or PEXT slider attacks (picked at startup)
-- NNUE: 16hm king-bucketed inputs + 60,144 threat features, 512 hidden units, pairwise -> 32 (CReLU/SCReLU) -> 16 -> 1 head (8 output buckets). AVX2, AVX-VNNI and AVX-512 paths
-- PVS with null move pruning, LMR, futility pruning, razoring, ProbCut, singular extensions
-- Quiescence search, SEE, check extensions
-- Quiet, noisy, continuation and correction histories
-- Shared transposition table, multithreaded search
-- Syzygy WDL probing (optional, through Fathom)
+NNUE evaluation with AVX2/AVX-VNNI/AVX-512 support, paired with PVS alpha-beta search, modern pruning and reductions, history heuristics, and multithreaded search. Optional Syzygy tablebase support.
 
 ## Building
 
-You need a recent stable Rust toolchain.
+Requires a recent stable Rust toolchain.
 
-    cargo build --release
+```bash
+cargo build --release
+```
 
-The binary ends up in `target/release/`. By default it is built with
-`target-cpu=native`, so it may not run on older CPUs. For something you want
-to share, pick an x86-64 level explicitly:
+By default, the build targets the native CPU. For portable binaries, choose an x86-64 level explicitly:
 
-    RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+```bash
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+```
 
-Use `x86-64-v2` for the baseline or `x86-64-v4` for AVX-512. `make release-v2`,
-`release-v3` and `release-v4` do the same thing. The NNUE kernels pick AVX2 at
-runtime, so a v2 build still uses the vector paths on AVX2 hardware.
+Use `x86-64-v2` for a wider baseline or `x86-64-v4` for AVX-512. The equivalent Make targets are `release-v2`, `release-v3`, and `release-v4`.
 
-For the last few percent, build with profile-guided optimization:
+For profile-guided optimization:
 
-    cargo pgo instrument
-    cargo pgo run -- bench
-    cargo pgo optimize
+```bash
+cargo pgo instrument
+cargo pgo run -- bench
+cargo pgo optimize
+```
 
-(`make pgo` on Unix, `pgo.bat` on Windows.) This needs `llvm-tools`
-(`rustup component add llvm-tools`) and `cargo-pgo` (`cargo install cargo-pgo`).
-The optimized binary is copied to `target/release/` and kept as
-`Ruthless-pgo` next to it, so a later plain `cargo build --release` cannot
-overwrite the only copy.
+Requires `llvm-tools` and `cargo-pgo`. The optimized binary is saved as `Ruthless-pgo` in `target/release/`.
 
-To enable Syzygy support, put [Fathom](https://github.com/jdart1/Fathom) in
-`deps/Fathom` before building. Without it the engine builds fine, just
-without tablebases.
+To enable Syzygy support, place [Fathom](https://github.com/jdart1/Fathom) in `deps/Fathom` before building.
 
 ## Running
 
-Ruthless only speaks UCI, so use a GUI such as Cute Chess, Nibbler or Banksia.
-You can also talk to it directly:
+Ruthless speaks UCI and can be used with Cute Chess, Nibbler, Banksia, or any other UCI-compatible GUI.
 
-    ./target/release/Ruthless
-    uci
-    position startpos moves e2e4 e7e5
-    go movetime 1000
+```bash
+./target/release/Ruthless
+uci
+position startpos moves e2e4 e7e5
+go movetime 1000
+```
 
-`Ruthless bench` runs a fixed-depth benchmark.
+Run `Ruthless bench` for a fixed-depth benchmark.
 
-Options: `Hash`, `Threads`, `SyzygyPath`, `NumaBind`, `Move Overhead`, plus a
-handful of search parameters (`RfpBase`, `NmpBase`, `LmrDivisor`, ...) that I
-use for tuning.
+Available options include `Hash`, `Threads`, `SyzygyPath`, `NumaBind`, `Move Overhead`, and several search tuning parameters.
 
 ## License
 
 MIT
 
-<sub>net trained on [master-binpacks_relabel](https://huggingface.co/datasets/vondele/master-binpacks_relabel/tree/main) (maybe switch to my own datagen later). inspired by Reckless.</sub>
+<sub>Network trained on [master-binpacks_relabel](https://huggingface.co/datasets/vondele/master-binpacks_relabel/tree/main). Inspired by Reckless.</sub>

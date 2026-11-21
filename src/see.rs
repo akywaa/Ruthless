@@ -1,4 +1,4 @@
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::attacks::{king_attacks, knight_attacks, pawn_attacks};
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::eval::PIECE_VALUES;
@@ -62,7 +62,8 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
     let bishops = board.pieces[Piece::WhiteBishop] | board.pieces[Piece::BlackBishop] | board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen];
     let rooks = board.pieces[Piece::WhiteRook] | board.pieces[Piece::BlackRook] | board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen];
 
-    let mut attackers = all_attackers(board, to, occ);
+    let tables = crate::attacks::slider_tables();
+    let mut attackers = all_attackers(board, to, occ, tables);
     let mut side = !board.side_to_move;
     let mut res = 1;
 
@@ -74,10 +75,10 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
 
         occ.clear(next_sq);
         if matches!(next_pt, PieceType::Pawn | PieceType::Bishop | PieceType::Queen) {
-            attackers |= bishop_attacks(to, occ) & bishops;
+            attackers |= tables.bishop_attacks(to, occ) & bishops;
         }
         if matches!(next_pt, PieceType::Rook | PieceType::Queen) {
-            attackers |= rook_attacks(to, occ) & rooks;
+            attackers |= tables.rook_attacks(to, occ) & rooks;
         }
 
         if next_pt == PieceType::King && !(attackers & occ & board.occupied_co[!side]).is_empty() {
@@ -96,13 +97,13 @@ pub fn see(board: &Board, m: Move, threshold: i32) -> bool {
     res != 0
 }
 
-fn all_attackers(board: &Board, sq: Square, occ: Bitboard) -> Bitboard {
+fn all_attackers(board: &Board, sq: Square, occ: Bitboard, tables: &crate::attacks::SliderTables) -> Bitboard {
     let p_attacks = (pawn_attacks(Color::Black, sq) & board.pieces[Piece::WhitePawn]) | (pawn_attacks(Color::White, sq) & board.pieces[Piece::BlackPawn]);
     let n_attacks = knight_attacks(sq) & (board.pieces[Piece::WhiteKnight] | board.pieces[Piece::BlackKnight]);
     let k_attacks = king_attacks(sq) & (board.pieces[Piece::WhiteKing] | board.pieces[Piece::BlackKing]);
-    let b_attacks = bishop_attacks(sq, occ)
+    let b_attacks = tables.bishop_attacks(sq, occ)
         & (board.pieces[Piece::WhiteBishop] | board.pieces[Piece::BlackBishop] | board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen]);
-    let r_attacks = rook_attacks(sq, occ)
+    let r_attacks = tables.rook_attacks(sq, occ)
         & (board.pieces[Piece::WhiteRook] | board.pieces[Piece::BlackRook] | board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen]);
 
     p_attacks | n_attacks | k_attacks | b_attacks | r_attacks

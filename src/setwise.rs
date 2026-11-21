@@ -1,4 +1,3 @@
-use crate::attacks::{bishop_attacks, rook_attacks};
 use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::types::{Color, Move, MoveList, MoveType, Piece, PieceType, Square};
@@ -80,33 +79,33 @@ pub fn generate_knight_moves(board: &Board, us: Color, target: Bitboard, list: &
 
 #[inline(always)]
 pub fn generate_bishop_moves(board: &Board, us: Color, target: Bitboard, occ: Bitboard, list: &mut MoveList) {
-    let mut bishops = board.pieces[Piece::new(us, PieceType::Bishop)].0;
-    while bishops != 0 {
-        let from = Square::new(bishops.trailing_zeros() as u8);
-        bishops &= bishops - 1;
-        let att = bishop_attacks(from, occ) & target;
+    let tables = crate::attacks::slider_tables();
+    let mut bishops = board.pieces[Piece::new(us, PieceType::Bishop)];
+    while !bishops.is_empty() {
+        let from = bishops.pop_lsb();
+        let att = tables.bishop_attacks(from, occ) & target;
         extract_moves(from, att, list, PieceType::None, MoveType::Normal);
     }
 }
 
 #[inline(always)]
 pub fn generate_rook_moves(board: &Board, us: Color, target: Bitboard, occ: Bitboard, list: &mut MoveList) {
-    let mut rooks = board.pieces[Piece::new(us, PieceType::Rook)].0;
-    while rooks != 0 {
-        let from = Square::new(rooks.trailing_zeros() as u8);
-        rooks &= rooks - 1;
-        let att = rook_attacks(from, occ) & target;
+    let tables = crate::attacks::slider_tables();
+    let mut rooks = board.pieces[Piece::new(us, PieceType::Rook)];
+    while !rooks.is_empty() {
+        let from = rooks.pop_lsb();
+        let att = tables.rook_attacks(from, occ) & target;
         extract_moves(from, att, list, PieceType::None, MoveType::Normal);
     }
 }
 
 #[inline(always)]
 pub fn generate_queen_moves(board: &Board, us: Color, target: Bitboard, occ: Bitboard, list: &mut MoveList) {
-    let mut queens = board.pieces[Piece::new(us, PieceType::Queen)].0;
-    while queens != 0 {
-        let from = Square::new(queens.trailing_zeros() as u8);
-        queens &= queens - 1;
-        let att = (bishop_attacks(from, occ) | rook_attacks(from, occ)) & target;
+    let tables = crate::attacks::slider_tables();
+    let mut queens = board.pieces[Piece::new(us, PieceType::Queen)];
+    while !queens.is_empty() {
+        let from = queens.pop_lsb();
+        let att = (tables.bishop_attacks(from, occ) | tables.rook_attacks(from, occ)) & target;
         extract_moves(from, att, list, PieceType::None, MoveType::Normal);
     }
 }

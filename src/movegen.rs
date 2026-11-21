@@ -69,10 +69,6 @@ const RANK_7: u64 = 0x00FF000000000000;
 
 fn generate_pawn_captures_pseudo(board: &Board, us: Color, their_occ: Bitboard, list: &mut MoveList) {
     let pawns = board.pieces[Piece::new(us, PieceType::Pawn)].0;
-    let promo_rank: u8 = match us {
-        Color::White => 7,
-        Color::Black => 0,
-    };
 
     if board.ep_square.is_valid() {
         let ep = board.ep_square;
@@ -89,16 +85,21 @@ fn generate_pawn_captures_pseudo(board: &Board, us: Color, their_occ: Bitboard, 
         Color::White => {
             for shift in [7u8, 9u8] {
                 let file_mask = if shift == 7 { !FILE_A } else { !FILE_H };
-                let mut bb = Bitboard(((pawns & file_mask) << shift) & their_occ.0);
-                while !bb.is_empty() {
-                    let to = bb.pop_lsb();
+                let captures = Bitboard(((pawns & file_mask) << shift) & their_occ.0);
+                // promo targets are the highest ranks, so they come last in
+                // ascending square order
+                let mut normal = Bitboard(captures.0 & !RANK_8);
+                while !normal.is_empty() {
+                    let to = normal.pop_lsb();
                     let from = Square::new(to as u8 - shift);
-                    if to.rank() == promo_rank {
-                        for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
-                            list.push(Move::new(from, to, pt, MoveType::Promotion));
-                        }
-                    } else {
-                        list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+                    list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+                }
+                let mut promo = Bitboard(captures.0 & RANK_8);
+                while !promo.is_empty() {
+                    let to = promo.pop_lsb();
+                    let from = Square::new(to as u8 - shift);
+                    for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
+                        list.push(Move::new(from, to, pt, MoveType::Promotion));
                     }
                 }
             }
@@ -106,17 +107,22 @@ fn generate_pawn_captures_pseudo(board: &Board, us: Color, their_occ: Bitboard, 
         Color::Black => {
             for shift in [7u8, 9u8] {
                 let file_mask = if shift == 7 { !FILE_H } else { !FILE_A };
-                let mut bb = Bitboard(((pawns & file_mask) >> shift) & their_occ.0);
-                while !bb.is_empty() {
-                    let to = bb.pop_lsb();
+                let captures = Bitboard(((pawns & file_mask) >> shift) & their_occ.0);
+                // promo targets are the lowest ranks, so they come first in
+                // ascending square order
+                let mut promo = Bitboard(captures.0 & RANK_1);
+                while !promo.is_empty() {
+                    let to = promo.pop_lsb();
                     let from = Square::new(to as u8 + shift);
-                    if to.rank() == promo_rank {
-                        for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
-                            list.push(Move::new(from, to, pt, MoveType::Promotion));
-                        }
-                    } else {
-                        list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
+                    for pt in [PieceType::Queen, PieceType::Knight, PieceType::Rook, PieceType::Bishop] {
+                        list.push(Move::new(from, to, pt, MoveType::Promotion));
                     }
+                }
+                let mut normal = Bitboard(captures.0 & !RANK_1);
+                while !normal.is_empty() {
+                    let to = normal.pop_lsb();
+                    let from = Square::new(to as u8 + shift);
+                    list.push(Move::new(from, to, PieceType::None, MoveType::Normal));
                 }
             }
         }

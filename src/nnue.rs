@@ -93,6 +93,16 @@ fn init_network_cold() -> &'static Network {
     net
 }
 
+// Eagerly build every lazily-initialised table. Without this the first
+// Board::from_fen pays for the 40+ MB network copy and the threat table
+// construction, which shows up as a large one-off cost in the first bench
+// position (and as a hiccup on the first real search).
+pub fn warmup() {
+    let _ = network();
+    let _ = threat_tables();
+    let _ = threat_weights();
+}
+
 // copies one 512-lane weight row out of the little-endian network image
 #[inline(always)]
 fn read_row(src: &[u8], dst: &mut [i16; HIDDEN_SIZE]) {
@@ -277,6 +287,7 @@ fn load_multilayer_bytes(bytes: &[u8], net: &mut Network) -> Result<(), String> 
             }
         }
     }
+    rebuild_l1_transposed(&mut head);
     for bucket in 0..NUM_OUTPUT_BUCKETS {
         for output in 0..L1_SIZE {
             head.l1_bias[bucket][output] = reader.i32()?;
@@ -393,6 +404,15 @@ impl Accumulator {
     #[inline(always)]
     pub fn apply_delta_from_side(&mut self, src: &Accumulator, side: usize, delta: &FeatureDelta) {
         let net = network();
+        // the second perspective is applied right after this one, so warm its
+        // weight rows while the first one is being computed
+        #[cfg(target_arch = "x86_64")]
+        if side == 0 && has_avx2() {
+            unsafe {
+                prefetch_psq_list(net, &delta.adds[1][..delta.add_count[1] as usize]);
+                prefetch_psq_list(net, &delta.subs[1][..delta.sub_count[1] as usize]);
+            }
+        }
         let adds = &delta.adds[side];
         let subs = &delta.subs[side];
         let add_count = delta.add_count[side];
@@ -655,6 +675,9 @@ unsafe fn vec_delta_avx2_11_from(dst: &mut [i16; HIDDEN_SIZE], src: &[i16; HIDDE
 
 #[inline(always)]
 pub fn king_bucket(sq: Square) -> usize {
+    if !sq.is_valid() {
+        return 0; // fallback for invalid squares (e.g., missing king in test positions)
+    }
     let file = sq.file();
     let rank = sq.rank();
     let mirrored_file = if file > 3 { 7 - file } else { file };
@@ -664,6 +687,9 @@ pub fn king_bucket(sq: Square) -> usize {
 // legacy 10-bucket lookup for tests
 #[cfg(test)]
 pub fn legacy_king_bucket(sq: Square) -> usize {
+    if !sq.is_valid() {
+        return 0;
+    }
     let file = sq.file();
     let rank = sq.rank();
     let mirrored_file = if file > 3 { 7 - file } else { file };
@@ -671,6 +697,7 @@ pub fn legacy_king_bucket(sq: Square) -> usize {
 }
 
 // need full refresh when king changes bucket or crosses mirror
+#[allow(dead_code)]
 #[inline(always)]
 pub fn needs_accumulator_refresh(from: Square, to: Square, color: Color) -> bool {
     let (o_from, o_to) = if color == Color::White {
@@ -705,25 +732,67 @@ pub fn feature_index_side(piece: Piece, sq: Square, ksq: Square, view: Color) ->
 }
 
 #[inline(always)]
-pub fn king_bucket_view(ksq: Square, view: Color) -> usize {
+pub fn king_bucket_flip(ksq: Square, view: Color) -> (usize, u8) {
     let oriented_ksq = if view == Color::White { ksq } else { Square::new((ksq as u8) ^ 56) };
-    king_bucket(oriented_ksq)
+    let flip = if oriented_ksq.file() > 3 { 7 } else { 0 };
+    (king_bucket(oriented_ksq), flip)
+}
+// king-dependent feature bases, cached per accumulator frame.
+// feature index = base[view] + oriented_piece * 64 + (square ^ mask[view])
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FeatureBases {
+    // king bucket * 768
+    pub base: [usize; 2],
+    // vertical flip for the black view (56) xor the horizontal mirror (0 or 7)
+    pub mask: [u8; 2],
 }
 
-#[inline(always)]
-pub fn is_mirrored_view(ksq: Square, view: Color) -> bool {
-    let oriented_ksq = if view == Color::White { ksq } else { Square::new((ksq as u8) ^ 56) };
-    oriented_ksq.file() > 3
+impl FeatureBases {
+    #[inline(always)]
+    pub fn from_kings(w_ksq: Square, b_ksq: Square) -> Self {
+        let (w_bucket, w_flip) = king_bucket_flip(w_ksq, Color::White);
+        let (b_bucket, b_flip) = king_bucket_flip(b_ksq, Color::Black);
+        Self {
+            base: [w_bucket * 768, b_bucket * 768],
+            mask: [w_flip, 56 ^ b_flip],
+        }
+    }
+
+    // set one perspective from its king square
+    #[inline(always)]
+    pub fn set_king(&mut self, ksq: Square, view: usize) {
+        let color = Color::from_index(view);
+        let (bucket, flip) = king_bucket_flip(ksq, color);
+        self.base[view] = bucket * 768;
+        self.mask[view] = if color == Color::White { flip } else { 56 ^ flip };
+    }
+
+    #[inline(always)]
+    pub fn bucket(&self, view: usize) -> usize {
+        self.base[view] / 768
+    }
+
+    #[inline(always)]
+    pub fn mirrored(&self, view: usize) -> bool {
+        self.mask[view] & 7 != 0
+    }
+
+    #[inline(always)]
+    pub fn index(&self, piece: Piece, sq: Square, view: usize) -> usize {
+        self.base[view]
+            + oriented_piece(piece, Color::from_index(view)) * 64
+            + ((sq as u8 ^ self.mask[view]) as usize)
+    }
 }
 
 
 
 #[inline(always)]
-fn apply_psq_lists(vals: &mut [i16; HIDDEN_SIZE], net: &'static Network, adds: &[u16], subs: &[u16]) {
+fn apply_psq_lists(vals: &mut [i16; HIDDEN_SIZE], dst: &mut [i16; HIDDEN_SIZE], net: &'static Network, adds: &[u16], subs: &[u16]) {
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            unsafe { apply_psq_lists_avx2(vals, net, adds, subs) };
+            unsafe { apply_psq_lists_avx2(vals, dst, net, adds, subs) };
             return;
         }
     }
@@ -739,57 +808,218 @@ fn apply_psq_lists(vals: &mut [i16; HIDDEN_SIZE], net: &'static Network, adds: &
             vals[i] = vals[i].wrapping_sub(w[i]);
         }
     }
+    *dst = *vals;
+}
+
+// prefetch one chunk of a feature row: `lanes` i16 starting at `base`
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn prefetch_psq_chunk(net: &'static Network, index: u16, base: usize, lines: usize) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let chunk = (net.feature_weights.as_ptr().add(index as usize) as *const i8).add(base * 2);
+        let mut line = 0;
+        while line < lines {
+            _mm_prefetch(chunk.add(line * 64), _MM_HINT_T0);
+            line += 1;
+        }
+    }
+}
+
+// 192 hidden lanes (12 YMM accumulators)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_psq_chunk_12(
+    vals: &mut [i16; HIDDEN_SIZE],
+    dst: &mut [i16; HIDDEN_SIZE],
+    net: &'static Network,
+    adds: &[u16],
+    subs: &[u16],
+    base: usize,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let s = vals.as_ptr().add(base) as *const __m256i;
+        let mut a0 = _mm256_load_si256(s);
+        let mut a1 = _mm256_load_si256(s.add(1));
+        let mut a2 = _mm256_load_si256(s.add(2));
+        let mut a3 = _mm256_load_si256(s.add(3));
+        let mut a4 = _mm256_load_si256(s.add(4));
+        let mut a5 = _mm256_load_si256(s.add(5));
+        let mut a6 = _mm256_load_si256(s.add(6));
+        let mut a7 = _mm256_load_si256(s.add(7));
+        let mut a8 = _mm256_load_si256(s.add(8));
+        let mut a9 = _mm256_load_si256(s.add(9));
+        let mut a10 = _mm256_load_si256(s.add(10));
+        let mut a11 = _mm256_load_si256(s.add(11));
+
+        // one prefetch per row, a few rows ahead (see apply_threat_chunk_12)
+        const PREFETCH_AHEAD: usize = 4;
+        let rows = net.feature_weights.as_ptr() as *const i16;
+        for (n, &idx) in subs.iter().enumerate() {
+            if let Some(&ahead) = subs.get(n + PREFETCH_AHEAD) {
+                _mm_prefetch(rows.add(ahead as usize * HIDDEN_SIZE + base) as *const i8, _MM_HINT_T0);
+            }
+            let r = rows.add(idx as usize * HIDDEN_SIZE + base) as *const __m256i;
+            a0 = _mm256_sub_epi16(a0, _mm256_load_si256(r));
+            a1 = _mm256_sub_epi16(a1, _mm256_load_si256(r.add(1)));
+            a2 = _mm256_sub_epi16(a2, _mm256_load_si256(r.add(2)));
+            a3 = _mm256_sub_epi16(a3, _mm256_load_si256(r.add(3)));
+            a4 = _mm256_sub_epi16(a4, _mm256_load_si256(r.add(4)));
+            a5 = _mm256_sub_epi16(a5, _mm256_load_si256(r.add(5)));
+            a6 = _mm256_sub_epi16(a6, _mm256_load_si256(r.add(6)));
+            a7 = _mm256_sub_epi16(a7, _mm256_load_si256(r.add(7)));
+            a8 = _mm256_sub_epi16(a8, _mm256_load_si256(r.add(8)));
+            a9 = _mm256_sub_epi16(a9, _mm256_load_si256(r.add(9)));
+            a10 = _mm256_sub_epi16(a10, _mm256_load_si256(r.add(10)));
+            a11 = _mm256_sub_epi16(a11, _mm256_load_si256(r.add(11)));
+        }
+        for (n, &idx) in adds.iter().enumerate() {
+            if let Some(&ahead) = adds.get(n + PREFETCH_AHEAD) {
+                _mm_prefetch(rows.add(ahead as usize * HIDDEN_SIZE + base) as *const i8, _MM_HINT_T0);
+            }
+            let r = rows.add(idx as usize * HIDDEN_SIZE + base) as *const __m256i;
+            a0 = _mm256_add_epi16(a0, _mm256_load_si256(r));
+            a1 = _mm256_add_epi16(a1, _mm256_load_si256(r.add(1)));
+            a2 = _mm256_add_epi16(a2, _mm256_load_si256(r.add(2)));
+            a3 = _mm256_add_epi16(a3, _mm256_load_si256(r.add(3)));
+            a4 = _mm256_add_epi16(a4, _mm256_load_si256(r.add(4)));
+            a5 = _mm256_add_epi16(a5, _mm256_load_si256(r.add(5)));
+            a6 = _mm256_add_epi16(a6, _mm256_load_si256(r.add(6)));
+            a7 = _mm256_add_epi16(a7, _mm256_load_si256(r.add(7)));
+            a8 = _mm256_add_epi16(a8, _mm256_load_si256(r.add(8)));
+            a9 = _mm256_add_epi16(a9, _mm256_load_si256(r.add(9)));
+            a10 = _mm256_add_epi16(a10, _mm256_load_si256(r.add(10)));
+            a11 = _mm256_add_epi16(a11, _mm256_load_si256(r.add(11)));
+        }
+
+        let v = vals.as_mut_ptr().add(base) as *mut __m256i;
+        let d = dst.as_mut_ptr().add(base) as *mut __m256i;
+        _mm256_store_si256(v, a0);
+        _mm256_store_si256(v.add(1), a1);
+        _mm256_store_si256(v.add(2), a2);
+        _mm256_store_si256(v.add(3), a3);
+        _mm256_store_si256(v.add(4), a4);
+        _mm256_store_si256(v.add(5), a5);
+        _mm256_store_si256(v.add(6), a6);
+        _mm256_store_si256(v.add(7), a7);
+        _mm256_store_si256(v.add(8), a8);
+        _mm256_store_si256(v.add(9), a9);
+        _mm256_store_si256(v.add(10), a10);
+        _mm256_store_si256(v.add(11), a11);
+        _mm256_store_si256(d, a0);
+        _mm256_store_si256(d.add(1), a1);
+        _mm256_store_si256(d.add(2), a2);
+        _mm256_store_si256(d.add(3), a3);
+        _mm256_store_si256(d.add(4), a4);
+        _mm256_store_si256(d.add(5), a5);
+        _mm256_store_si256(d.add(6), a6);
+        _mm256_store_si256(d.add(7), a7);
+        _mm256_store_si256(d.add(8), a8);
+        _mm256_store_si256(d.add(9), a9);
+        _mm256_store_si256(d.add(10), a10);
+        _mm256_store_si256(d.add(11), a11);
+    }
+}
+
+// 128 hidden lanes (8 YMM accumulators)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_psq_chunk_8(
+    vals: &mut [i16; HIDDEN_SIZE],
+    dst: &mut [i16; HIDDEN_SIZE],
+    net: &'static Network,
+    adds: &[u16],
+    subs: &[u16],
+    base: usize,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let s = vals.as_ptr().add(base) as *const __m256i;
+        let mut a0 = _mm256_load_si256(s);
+        let mut a1 = _mm256_load_si256(s.add(1));
+        let mut a2 = _mm256_load_si256(s.add(2));
+        let mut a3 = _mm256_load_si256(s.add(3));
+        let mut a4 = _mm256_load_si256(s.add(4));
+        let mut a5 = _mm256_load_si256(s.add(5));
+        let mut a6 = _mm256_load_si256(s.add(6));
+        let mut a7 = _mm256_load_si256(s.add(7));
+
+        let rows = net.feature_weights.as_ptr() as *const i16;
+        for &idx in subs {
+            let r = rows.add(idx as usize * HIDDEN_SIZE + base) as *const __m256i;
+            a0 = _mm256_sub_epi16(a0, _mm256_load_si256(r));
+            a1 = _mm256_sub_epi16(a1, _mm256_load_si256(r.add(1)));
+            a2 = _mm256_sub_epi16(a2, _mm256_load_si256(r.add(2)));
+            a3 = _mm256_sub_epi16(a3, _mm256_load_si256(r.add(3)));
+            a4 = _mm256_sub_epi16(a4, _mm256_load_si256(r.add(4)));
+            a5 = _mm256_sub_epi16(a5, _mm256_load_si256(r.add(5)));
+            a6 = _mm256_sub_epi16(a6, _mm256_load_si256(r.add(6)));
+            a7 = _mm256_sub_epi16(a7, _mm256_load_si256(r.add(7)));
+        }
+        for &idx in adds {
+            let r = rows.add(idx as usize * HIDDEN_SIZE + base) as *const __m256i;
+            a0 = _mm256_add_epi16(a0, _mm256_load_si256(r));
+            a1 = _mm256_add_epi16(a1, _mm256_load_si256(r.add(1)));
+            a2 = _mm256_add_epi16(a2, _mm256_load_si256(r.add(2)));
+            a3 = _mm256_add_epi16(a3, _mm256_load_si256(r.add(3)));
+            a4 = _mm256_add_epi16(a4, _mm256_load_si256(r.add(4)));
+            a5 = _mm256_add_epi16(a5, _mm256_load_si256(r.add(5)));
+            a6 = _mm256_add_epi16(a6, _mm256_load_si256(r.add(6)));
+            a7 = _mm256_add_epi16(a7, _mm256_load_si256(r.add(7)));
+        }
+
+        let v = vals.as_mut_ptr().add(base) as *mut __m256i;
+        let d = dst.as_mut_ptr().add(base) as *mut __m256i;
+        _mm256_store_si256(v, a0);
+        _mm256_store_si256(v.add(1), a1);
+        _mm256_store_si256(v.add(2), a2);
+        _mm256_store_si256(v.add(3), a3);
+        _mm256_store_si256(v.add(4), a4);
+        _mm256_store_si256(v.add(5), a5);
+        _mm256_store_si256(v.add(6), a6);
+        _mm256_store_si256(v.add(7), a7);
+        _mm256_store_si256(d, a0);
+        _mm256_store_si256(d.add(1), a1);
+        _mm256_store_si256(d.add(2), a2);
+        _mm256_store_si256(d.add(3), a3);
+        _mm256_store_si256(d.add(4), a4);
+        _mm256_store_si256(d.add(5), a5);
+        _mm256_store_si256(d.add(6), a6);
+        _mm256_store_si256(d.add(7), a7);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn apply_psq_lists_avx2(vals: &mut [i16; HIDDEN_SIZE], net: &'static Network, adds: &[u16], subs: &[u16]) {
-    use std::arch::x86_64::*;
+unsafe fn apply_psq_lists_avx2(vals: &mut [i16; HIDDEN_SIZE], dst: &mut [i16; HIDDEN_SIZE], net: &'static Network, adds: &[u16], subs: &[u16]) {
     unsafe {
-        let mut base = 0usize;
-        while base < HIDDEN_SIZE {
-            let v_ptr = vals.as_mut_ptr().add(base) as *mut __m256i;
-            let mut a0 = _mm256_load_si256(v_ptr);
-            let mut a1 = _mm256_load_si256(v_ptr.add(1));
-            let mut a2 = _mm256_load_si256(v_ptr.add(2));
-            let mut a3 = _mm256_load_si256(v_ptr.add(3));
-            let mut a4 = _mm256_load_si256(v_ptr.add(4));
-            let mut a5 = _mm256_load_si256(v_ptr.add(5));
-            let mut a6 = _mm256_load_si256(v_ptr.add(6));
-            let mut a7 = _mm256_load_si256(v_ptr.add(7));
+        // warm only the first chunk (128 bytes) of the first 1-2 rows
+        // hardware prefetcher will pull the rest
+        const WARM_ROWS: usize = 2;
+        let warm = WARM_ROWS.min(subs.len());
+        for &idx in &subs[..warm] {
+            prefetch_psq_chunk(net, idx, 0, 2);
+        }
+        let warm = WARM_ROWS.min(adds.len());
+        for &idx in &adds[..warm] {
+            prefetch_psq_chunk(net, idx, 0, 2);
+        }
 
-            for &idx in adds {
-                let w = net.feature_weights.get_unchecked(idx as usize).vals.as_ptr().add(base) as *const __m256i;
-                a0 = _mm256_add_epi16(a0, _mm256_load_si256(w));
-                a1 = _mm256_add_epi16(a1, _mm256_load_si256(w.add(1)));
-                a2 = _mm256_add_epi16(a2, _mm256_load_si256(w.add(2)));
-                a3 = _mm256_add_epi16(a3, _mm256_load_si256(w.add(3)));
-                a4 = _mm256_add_epi16(a4, _mm256_load_si256(w.add(4)));
-                a5 = _mm256_add_epi16(a5, _mm256_load_si256(w.add(5)));
-                a6 = _mm256_add_epi16(a6, _mm256_load_si256(w.add(6)));
-                a7 = _mm256_add_epi16(a7, _mm256_load_si256(w.add(7)));
-            }
-            for &idx in subs {
-                let w = net.feature_weights.get_unchecked(idx as usize).vals.as_ptr().add(base) as *const __m256i;
-                a0 = _mm256_sub_epi16(a0, _mm256_load_si256(w));
-                a1 = _mm256_sub_epi16(a1, _mm256_load_si256(w.add(1)));
-                a2 = _mm256_sub_epi16(a2, _mm256_load_si256(w.add(2)));
-                a3 = _mm256_sub_epi16(a3, _mm256_load_si256(w.add(3)));
-                a4 = _mm256_sub_epi16(a4, _mm256_load_si256(w.add(4)));
-                a5 = _mm256_sub_epi16(a5, _mm256_load_si256(w.add(5)));
-                a6 = _mm256_sub_epi16(a6, _mm256_load_si256(w.add(6)));
-                a7 = _mm256_sub_epi16(a7, _mm256_load_si256(w.add(7)));
-            }
+        // 192 + 192 + 128 lanes cover the 512-lane row
+        apply_psq_chunk_12(vals, dst, net, adds, subs, 0);
+        apply_psq_chunk_12(vals, dst, net, adds, subs, 192);
+        apply_psq_chunk_8(vals, dst, net, adds, subs, 384);
+    }
+}
 
-            _mm256_store_si256(v_ptr, a0);
-            _mm256_store_si256(v_ptr.add(1), a1);
-            _mm256_store_si256(v_ptr.add(2), a2);
-            _mm256_store_si256(v_ptr.add(3), a3);
-            _mm256_store_si256(v_ptr.add(4), a4);
-            _mm256_store_si256(v_ptr.add(5), a5);
-            _mm256_store_si256(v_ptr.add(6), a6);
-            _mm256_store_si256(v_ptr.add(7), a7);
-            base += 128;
+// prefetch the first chunk of a small feature list (at most two entries per list)
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn prefetch_psq_list(net: &'static Network, list: &[u16]) {
+    unsafe {
+        for &idx in list {
+            prefetch_psq_chunk(net, idx, 0, 2);
         }
     }
 }
@@ -809,8 +1039,8 @@ pub type FinnyTable = [[[FinnyEntry; 2]; NUM_INPUT_BUCKETS]; 2];
 pub fn refresh_side_with_finny(
     entry: &mut FinnyEntry,
     board_pieces: &[Bitboard; PIECE_NB],
-    ksq: Square,
-    color: Color,
+    bases: &FeatureBases,
+    view: usize,
     dst: &mut [i16; HIDDEN_SIZE],
 ) {
     let net = network();
@@ -825,6 +1055,8 @@ pub fn refresh_side_with_finny(
     let mut add_count = 0usize;
     let mut sub_count = 0usize;
 
+    // the king-dependent part of the index is fixed for the whole refresh
+    let mask = bases.mask[view];
     for p in 0..PIECE_NB {
         let cur = board_pieces[p];
         let prev = entry.pieces[p];
@@ -832,25 +1064,28 @@ pub fn refresh_side_with_finny(
             continue;
         }
         let piece = Piece::from_index(p);
+        // first lane of this piece's 64-square block
+        let piece_base = bases.base[view] + oriented_piece(piece, Color::from_index(view)) * 64;
         let mut added = cur & !prev;
         while !added.is_empty() {
             let sq = added.pop_lsb();
-            adds[add_count] = feature_index_side(piece, sq, ksq, color) as u16;
+            adds[add_count] = (piece_base + ((sq as u8 ^ mask) as usize)) as u16;
             add_count += 1;
         }
         let mut removed = prev & !cur;
         while !removed.is_empty() {
             let sq = removed.pop_lsb();
-            subs[sub_count] = feature_index_side(piece, sq, ksq, color) as u16;
+            subs[sub_count] = (piece_base + ((sq as u8 ^ mask) as usize)) as u16;
             sub_count += 1;
         }
         entry.pieces[p] = cur;
     }
 
     if add_count > 0 || sub_count > 0 {
-        apply_psq_lists(&mut entry.vals, net, &adds[..add_count], &subs[..sub_count]);
+        apply_psq_lists(&mut entry.vals, dst, net, &adds[..add_count], &subs[..sub_count]);
+    } else {
+        *dst = entry.vals;
     }
-    *dst = entry.vals;
 }
 
 // empty slot marker
@@ -877,29 +1112,29 @@ impl FeatureDelta {
     }
 
     #[inline(always)]
-    pub fn add(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square, skip: Option<Color>) {
+    pub fn add(&mut self, piece: Piece, sq: Square, bases: &FeatureBases, skip: Option<Color>) {
         if skip != Some(Color::White) {
             let view = Color::White as usize;
-            self.adds[view][self.add_count[view] as usize] = feature_index_side(piece, sq, w_ksq, Color::White) as u16;
+            self.adds[view][self.add_count[view] as usize] = bases.index(piece, sq, view) as u16;
             self.add_count[view] += 1;
         }
         if skip != Some(Color::Black) {
             let view = Color::Black as usize;
-            self.adds[view][self.add_count[view] as usize] = feature_index_side(piece, sq, b_ksq, Color::Black) as u16;
+            self.adds[view][self.add_count[view] as usize] = bases.index(piece, sq, view) as u16;
             self.add_count[view] += 1;
         }
     }
 
     #[inline(always)]
-    pub fn sub(&mut self, piece: Piece, sq: Square, w_ksq: Square, b_ksq: Square, skip: Option<Color>) {
+    pub fn sub(&mut self, piece: Piece, sq: Square, bases: &FeatureBases, skip: Option<Color>) {
         if skip != Some(Color::White) {
             let view = Color::White as usize;
-            self.subs[view][self.sub_count[view] as usize] = feature_index_side(piece, sq, w_ksq, Color::White) as u16;
+            self.subs[view][self.sub_count[view] as usize] = bases.index(piece, sq, view) as u16;
             self.sub_count[view] += 1;
         }
         if skip != Some(Color::Black) {
             let view = Color::Black as usize;
-            self.subs[view][self.sub_count[view] as usize] = feature_index_side(piece, sq, b_ksq, Color::Black) as u16;
+            self.subs[view][self.sub_count[view] as usize] = bases.index(piece, sq, view) as u16;
             self.sub_count[view] += 1;
         }
     }
@@ -923,7 +1158,7 @@ pub fn output_bucket(board: &Board) -> usize {
 
 #[inline(always)]
 fn screlu(x: i16) -> i32 {
-    let y = i32::from(x).clamp(0, i32::from(QA));
+    let y = i32::from(x).max(0).min(i32::from(QA));
     y * y
 }
 
@@ -958,8 +1193,9 @@ pub fn evaluate(board: &mut Board) -> i32 {
     let us = board.side_to_move as usize;
     let them = us ^ 1;
     if let Some(ml) = net.multilayer.as_deref() {
-        let threat = board.threat_immut();
-        return forward_multilayer(board.accumulator_immut(), threat, us, them, bucket, &ml.head);
+        let threat_us = board.threat_side_immut(us);
+        let threat_them = board.threat_side_immut(them);
+        return forward_multilayer(board.accumulator_immut(), threat_us, threat_them, us, them, bucket, &ml.head);
     }
     evaluate_acc(board.accumulator_immut(), us, them, bucket, net)
 }
@@ -996,6 +1232,26 @@ fn evaluate_acc(acc: &Accumulator, us: usize, them: usize, bucket: usize, net: &
 pub const PAIR_COUNT: usize = HIDDEN_SIZE / 2;
 // l1 width per bucket (takes both sides' pairwise outputs)
 pub const L1_SIZE: usize = 32;
+// the AVX2 kernel consumes the L1 input in blocks of 4 bytes (4 pairwise activations)
+pub const L1_INPUT_BLOCKS: usize = HIDDEN_SIZE / 4;
+// and produces it in blocks of 8 outputs
+pub const L1_OUTPUT_BLOCKS: usize = L1_SIZE / 8;
+// [input_block][output_block] weight blocks of 32 bytes (8 outputs x 4 inputs)
+pub const L1_TRANSPOSED_BLOCKS: usize = L1_INPUT_BLOCKS * L1_OUTPUT_BLOCKS;
+// lane order produced by packus_epi16 on two 16-lane halves (AVX2 lane split);
+// weights are stored in this order so pairwise_side does not need a permute
+const PAIRWISE_PACK_ORDER: [usize; 32] = {
+    let mut order = [0usize; 32];
+    let mut i = 0;
+    while i < 8 {
+        order[i] = i;
+        order[8 + i] = 16 + i;
+        order[16 + i] = 8 + i;
+        order[24 + i] = 24 + i;
+        i += 1;
+    }
+    order
+};
 
 // first layer activated twice (CReLU + SCReLU), so double width
 pub const L2_IN: usize = 2 * L1_SIZE;
@@ -1043,12 +1299,38 @@ impl ThreatWeights {
 pub struct MultilayerHead {
     // [bucket][output][input]
     pub l1_weights: [[[i8; HIDDEN_SIZE]; L1_SIZE]; NUM_OUTPUT_BUCKETS],
+    // AVX2 copy of the first layer: [bucket][input_block * L1_OUTPUT_BLOCKS + output_block][8 * 4]
+    // laid out for maddubs: 32 bytes = 8 outputs, 4 consecutive inputs each
+    pub l1_weights_t: [[[i8; 32]; L1_TRANSPOSED_BLOCKS]; NUM_OUTPUT_BUCKETS],
     pub l1_bias: [[i32; L1_SIZE]; NUM_OUTPUT_BUCKETS],
     // [bucket][output][input]
     pub l2_weights: [[[i16; L2_IN]; L2_SIZE]; NUM_OUTPUT_BUCKETS],
     pub l2_bias: [[i32; L2_SIZE]; NUM_OUTPUT_BUCKETS],
     pub l3_weights: [[[i32; L3_SIZE]; L2_SIZE]; NUM_OUTPUT_BUCKETS],
     pub l3_bias: [[i32; L3_SIZE]; NUM_OUTPUT_BUCKETS],
+}
+
+// build the AVX2-friendly first-layer copy from the logical weights.
+// the input index is also reordered to the pairwise_side output order, which
+// lets that kernel store packed bytes directly (no vpermq).
+fn rebuild_l1_transposed(head: &mut MultilayerHead) {
+    for bucket in 0..NUM_OUTPUT_BUCKETS {
+        for input_block in 0..L1_INPUT_BLOCKS {
+            let chunk = input_block / 8;
+            let pos = (input_block % 8) * 4;
+            for output_block in 0..L1_OUTPUT_BLOCKS {
+                let mut block = [0i8; 32];
+                for jj in 0..8 {
+                    let output = output_block * 8 + jj;
+                    for ii in 0..4 {
+                        let input = chunk * 32 + PAIRWISE_PACK_ORDER[pos + ii];
+                        block[jj * 4 + ii] = head.l1_weights[bucket][output][input];
+                    }
+                }
+                head.l1_weights_t[bucket][input_block * L1_OUTPUT_BLOCKS + output_block] = block;
+            }
+        }
+    }
 }
 
 // threat accumulator
@@ -1065,12 +1347,17 @@ impl ThreatAccumulator {
 }
 
 // pairwise activation: (a * b) >> 16
-fn pairwise_side_scalar(psq: &[i16; HIDDEN_SIZE], threats: &[i16; HIDDEN_SIZE], out: &mut [u8; PAIR_COUNT]) {
+fn pairwise_side_scalar(psq: &[i16; HIDDEN_SIZE], threats: &[i16; HIDDEN_SIZE], out: &mut [u8; PAIR_COUNT]) -> u64 {
+    let mut nnz = 0u64;
     for i in 0..PAIR_COUNT {
-        let a = i32::from(psq[i].wrapping_add(threats[i])).clamp(0, i32::from(QA));
+        let a = i32::from(psq[i].wrapping_add(threats[i])).max(0).min(i32::from(QA));
         let b = i32::from(psq[i + PAIR_COUNT].wrapping_add(threats[i + PAIR_COUNT])).min(i32::from(QA));
-        out[i] = (((a << FT_SCALE_BITS) * b) >> 16).clamp(0, 255) as u8;
+        out[i] = (((a << FT_SCALE_BITS) * b) >> 16).max(0).min(255) as u8;
+        if out[i] != 0 {
+            nnz |= 1u64 << (i / 4);
+        }
     }
+    nnz
 }
 
 // reference first head layer, including requantization and the dual activation
@@ -1083,7 +1370,7 @@ fn l1_forward_scalar(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &[i32; L1_SIZ
         let output = ((sum as i32).wrapping_add(bias[j])) >> L1_SHIFT;
 
         // clamp before squaring for crelu/screlu
-        let clamped = output.clamp(0, QUANT);
+        let clamped = output.max(0).min(QUANT);
         out[j] = (clamped << QUANT_BITS) as i16;
         out[L1_SIZE + j] = (clamped * clamped) as i16;
     }
@@ -1102,7 +1389,7 @@ fn l2_forward_scalar(weights: &[[i16; L2_IN]; L2_SIZE], bias: &[i32; L2_SIZE], i
 fn l3_forward_scalar(weights: &[[i32; L3_SIZE]; L2_SIZE], bias: &[i32; L3_SIZE], input: &[i32; L2_SIZE]) -> i32 {
     let mut result = i64::from(bias[0]);
     for i in 0..L2_SIZE {
-        let activated = input[i].clamp(0, QUANT_CUBED);
+        let activated = input[i].max(0).min(QUANT_CUBED);
         result += i64::from(activated) * i64::from(weights[i][0]);
     }
     (result * i64::from(EVAL_SCALE) / QUANT_FOURTH) as i32
@@ -1124,20 +1411,50 @@ fn forward_scalar(psq: &Accumulator, threats: &ThreatAccumulator, us: usize, the
     l3_forward_scalar(&head.l3_weights[bucket], &head.l3_bias[bucket], &l2)
 }
 
+// the first layer can either consume pairwise bytes in logical order
+// (scalar / AVX-512 kernels) or in the packus lane order (AVX2 kernel)
+#[allow(dead_code)]
 #[inline(always)]
-fn pairwise_side(psq: &[i16; HIDDEN_SIZE], threats: &[i16; HIDDEN_SIZE], out: &mut [u8; PAIR_COUNT]) {
+fn l1_packed_layout() -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+    ))]
+    {
+        return has_avx2();
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx512f", target_feature = "avx512bw"))
+    )))]
+    {
+        false
+    }
+}
+
+#[inline(always)]
+fn pairwise_side(psq: &[i16; HIDDEN_SIZE], threats: &[i16; HIDDEN_SIZE], out: &mut [u8; PAIR_COUNT]) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            unsafe { pairwise_side_avx2(psq, threats, out) };
-            return;
+            if l1_packed_layout() {
+                return unsafe { pairwise_side_avx2::<true>(psq, threats, out) };
+            }
+            return unsafe { pairwise_side_avx2::<false>(psq, threats, out) };
         }
     }
     pairwise_side_scalar(psq, threats, out)
 }
 
 #[inline(always)]
-fn l1_forward(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &[i32; L1_SIZE], input: &[u8; HIDDEN_SIZE], out: &mut [i16; L2_IN]) {
+fn l1_forward(
+    weights: &[[i8; HIDDEN_SIZE]; L1_SIZE],
+    transposed: &[[i8; 32]; L1_TRANSPOSED_BLOCKS],
+    bias: &[i32; L1_SIZE],
+    input: &[u8; HIDDEN_SIZE],
+    nnz: [u64; 2],
+    out: &mut [i16; L2_IN],
+) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
     {
         if has_avx512_vnni() {
@@ -1152,9 +1469,9 @@ fn l1_forward(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &[i32; L1_SIZE], inp
     {
         if has_avx2() {
             if has_avx_vnni() {
-                unsafe { l1_forward_avx2_vnni(weights, bias, input, out) };
+                unsafe { l1_forward_avx2_vnni(transposed, bias, input, nnz, out) };
             } else {
-                unsafe { l1_forward_avx2(weights, bias, input, out) };
+                unsafe { l1_forward_avx2(transposed, bias, input, nnz, out) };
             }
             return;
         }
@@ -1178,13 +1495,21 @@ fn l2_forward(weights: &[[i16; L2_IN]; L2_SIZE], bias: &[i32; L2_SIZE], input: &
 }
 
 // multilayer forward pass
-fn forward_multilayer(psq: &Accumulator, threats: &ThreatAccumulator, us: usize, them: usize, bucket: usize, head: &MultilayerHead) -> i32 {
+fn forward_multilayer(
+    psq: &Accumulator,
+    threat_us: &[i16; HIDDEN_SIZE],
+    threat_them: &[i16; HIDDEN_SIZE],
+    us: usize,
+    them: usize,
+    bucket: usize,
+    head: &MultilayerHead,
+) -> i32 {
     let mut input = [0u8; HIDDEN_SIZE];
-    pairwise_side(&psq.vals[us], &threats.vals[us], (&mut input[..PAIR_COUNT]).try_into().unwrap());
-    pairwise_side(&psq.vals[them], &threats.vals[them], (&mut input[PAIR_COUNT..]).try_into().unwrap());
+    let nnz_us = pairwise_side(&psq.vals[us], threat_us, (&mut input[..PAIR_COUNT]).try_into().unwrap());
+    let nnz_them = pairwise_side(&psq.vals[them], threat_them, (&mut input[PAIR_COUNT..]).try_into().unwrap());
 
     let mut l1 = [0i16; L2_IN];
-    l1_forward(&head.l1_weights[bucket], &head.l1_bias[bucket], &input, &mut l1);
+    l1_forward(&head.l1_weights[bucket], &head.l1_weights_t[bucket], &head.l1_bias[bucket], &input, [nnz_us, nnz_them], &mut l1);
 
     let mut l2 = [0i32; L2_SIZE];
     l2_forward(&head.l2_weights[bucket], &head.l2_bias[bucket], &l1, &mut l2);
@@ -1269,6 +1594,19 @@ fn threat_attacks(piece: Piece, sq: Square, occ: Bitboard) -> Bitboard {
         PieceType::Bishop => crate::attacks::bishop_attacks(sq, occ),
         PieceType::Rook => crate::attacks::rook_attacks(sq, occ),
         PieceType::Queen => crate::attacks::bishop_attacks(sq, occ) | crate::attacks::rook_attacks(sq, occ),
+        PieceType::King => crate::attacks::king_attacks(sq),
+        PieceType::None => Bitboard::EMPTY,
+    }
+}
+
+#[inline(always)]
+fn threat_attacks_with(tables: &crate::attacks::SliderTables, piece: Piece, sq: Square, occ: Bitboard) -> Bitboard {
+    match piece.piece_type() {
+        PieceType::Pawn => crate::attacks::pawn_attacks(piece.color(), sq),
+        PieceType::Knight => crate::attacks::knight_attacks(sq),
+        PieceType::Bishop => tables.bishop_attacks(sq, occ),
+        PieceType::Rook => tables.rook_attacks(sq, occ),
+        PieceType::Queen => tables.bishop_attacks(sq, occ) | tables.rook_attacks(sq, occ),
         PieceType::King => crate::attacks::king_attacks(sq),
         PieceType::None => Bitboard::EMPTY,
     }
@@ -1426,10 +1764,30 @@ impl std::fmt::Debug for ThreatList {
 }
 
 impl ThreatList {
+    #[inline(always)]
     pub fn new() -> Self {
         Self {
             indices: [MaybeUninit::uninit(); MAX_THREATS],
             count: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn init_one(slot: &mut MaybeUninit<Self>) -> &mut Self {
+        unsafe {
+            let p = slot.as_mut_ptr();
+            std::ptr::addr_of_mut!((*p).count).write(0);
+            slot.assume_init_mut()
+        }
+    }
+
+    #[inline(always)]
+    pub fn init_pair(slot: &mut MaybeUninit<[Self; 2]>) -> &mut [Self; 2] {
+        unsafe {
+            let p = slot.as_mut_ptr() as *mut Self;
+            std::ptr::addr_of_mut!((*p).count).write(0);
+            std::ptr::addr_of_mut!((*p.add(1)).count).write(0);
+            slot.assume_init_mut()
         }
     }
 
@@ -1463,6 +1821,7 @@ impl ThreatList {
 // cached board info for threat scan
 struct ThreatScan {
     tables: &'static ThreatTables,
+    slider_tables: &'static crate::attacks::SliderTables,
     mask: u8,
     kings: Bitboard,
     by_type: [Bitboard; 6],
@@ -1493,6 +1852,7 @@ impl ThreatScan {
 
         Self {
             tables: threat_tables(),
+            slider_tables: crate::attacks::slider_tables(),
             mask,
             kings: by_type[PieceType::King as usize],
             by_type,
@@ -1516,7 +1876,7 @@ fn emit_attacker_threats(board: &Board, scan: &ThreatScan, view: Color, from: Sq
         same_type &= board.occupied_co[!attacker.color()];
     }
 
-    let mut targets = threat_attacks(attacker, from, board.occupied) & !scan.kings & scan.victims[akind];
+    let mut targets = threat_attacks_with(scan.slider_tables, attacker, from, board.occupied) & !scan.kings & scan.victims[akind];
     while !targets.is_empty() {
         let to = targets.pop_lsb();
         if same_type.contains(to) && (to as u8 ^ scan.mask) as usize > from_label {
@@ -1543,6 +1903,7 @@ pub fn collect_threats(board: &Board, view: Color, out: &mut ThreatList) {
 
 pub(crate) struct SharedThreatScan {
     tables: &'static ThreatTables,
+    slider_tables: &'static crate::attacks::SliderTables,
     pub(crate) masks: [u8; 2],
     pub(crate) kings: Bitboard,
     pub(crate) by_type: [Bitboard; 6],
@@ -1557,6 +1918,7 @@ impl SharedThreatScan {
         ];
         let mut scan = Self {
             tables: threat_tables(),
+            slider_tables: crate::attacks::slider_tables(),
             masks,
             kings: Bitboard::EMPTY,
             by_type: [Bitboard::EMPTY; 6],
@@ -1574,15 +1936,16 @@ impl SharedThreatScan {
             self.by_type[kind] = w | b;
         }
         self.kings = self.by_type[PieceType::King as usize];
-        for (akind, targets) in PIECE_TARGET_MAP.iter().enumerate() {
-            let mut v = Bitboard::EMPTY;
-            for (vkind, &map) in targets.iter().enumerate() {
-                if map >= 0 {
-                    v |= self.by_type[vkind];
-                }
-            }
-            self.victims[akind] = v;
-        }
+        // PIECE_TARGET_MAP in closed form: pawns/knight/rook/queen/bishop
+        // victims are a few fixed unions, so skip the 6x6 map walk.
+        let b = &self.by_type;
+        let non_king = board.occupied & !self.kings;
+        self.victims[PieceType::Pawn as usize] = b[0] | b[1] | b[3];
+        self.victims[PieceType::Knight as usize] = non_king;
+        self.victims[PieceType::Bishop as usize] = b[0] | b[1] | b[2] | b[3];
+        self.victims[PieceType::Rook as usize] = b[0] | b[1] | b[2] | b[3];
+        self.victims[PieceType::Queen as usize] = non_king;
+        self.victims[PieceType::King as usize] = Bitboard::EMPTY;
     }
 }
 
@@ -1595,7 +1958,7 @@ fn emit_attacker_threats_both(board: &Board, scan: &SharedThreatScan, from: Squa
         same_type &= board.occupied_co[!attacker.color()];
     }
 
-    let mut targets = threat_attacks(attacker, from, board.occupied) & !scan.kings & scan.victims[akind];
+    let mut targets = threat_attacks_with(scan.slider_tables, attacker, from, board.occupied) & !scan.kings & scan.victims[akind];
     while !targets.is_empty() {
         let to = targets.pop_lsb();
         let victim = board.piece_on[to];
@@ -1645,6 +2008,57 @@ fn push_threat_both(scan: &SharedThreatScan, attacker: Piece, from: Square, vict
     }
 }
 
+// Cached per-attacker invariants for the flat threat tables. `attacker` and
+// `from` stay fixed while walking the victims of one square, so the two table
+// rows (pseudo attacks and offsets) are loaded once per attacker instead of
+// once per target square.
+struct ThreatEmitter<'a> {
+    need: [bool; 2],
+    masks: [u8; 2],
+    from_lbl: [usize; 2],
+    attack: [&'a [[u16; 2]; 12]; 2],
+    pseudo: [Bitboard; 2],
+    offset: [u16; 2],
+}
+
+impl<'a> ThreatEmitter<'a> {
+    #[inline(always)]
+    fn new(scan: &'a SharedThreatScan, a: usize, need: [bool; 2], from_lbl_0: usize, from_lbl_1: usize) -> Self {
+        Self {
+            need,
+            masks: scan.masks,
+            from_lbl: [from_lbl_0, from_lbl_1],
+            attack: [&scan.tables.attack_by_piece[0][a], &scan.tables.attack_by_piece[1][a]],
+            pseudo: [scan.tables.pseudo_by_piece[0][a][from_lbl_0], scan.tables.pseudo_by_piece[1][a][from_lbl_1]],
+            offset: [scan.tables.offsets_by_piece[0][a][from_lbl_0], scan.tables.offsets_by_piece[1][a][from_lbl_1]],
+        }
+    }
+
+    #[inline(always)]
+    fn push(&self, victim: Piece, to: Square, out: &mut [ThreatList; 2]) {
+        let v = victim as usize;
+        if v >= 12 {
+            return; // Piece::None or invalid, no threat
+        }
+        if self.need[0] {
+            let to_lbl = (to as u8 ^ self.masks[0]) as usize;
+            let base = unsafe { *self.attack[0].get_unchecked(v).get_unchecked(usize::from(self.from_lbl[0] < to_lbl)) };
+            if base != THREAT_SENTINEL {
+                let below_mask = (1u64 << to_lbl) - 1;
+                out[0].push(base + self.offset[0] + (self.pseudo[0].0 & below_mask).count_ones() as u16);
+            }
+        }
+        if self.need[1] {
+            let to_lbl = (to as u8 ^ self.masks[1]) as usize;
+            let base = unsafe { *self.attack[1].get_unchecked(v).get_unchecked(usize::from(self.from_lbl[1] < to_lbl)) };
+            if base != THREAT_SENTINEL {
+                let below_mask = (1u64 << to_lbl) - 1;
+                out[1].push(base + self.offset[1] + (self.pseudo[1].0 & below_mask).count_ones() as u16);
+            }
+        }
+    }
+}
+
 pub fn append_changed_square_threats_both(board: &Board, scan: &SharedThreatScan, changed: Bitboard, need: [bool; 2], out: &mut [ThreatList; 2]) {
     let non_kings = board.occupied & !scan.kings;
     let mut sqs = changed & non_kings;
@@ -1654,16 +2068,26 @@ pub fn append_changed_square_threats_both(board: &Board, scan: &SharedThreatScan
         let piece = board.piece_on[sq];
         let pkind = piece.piece_type() as usize;
 
-        let mut targets = threat_attacks(piece, sq, board.occupied) & !scan.kings & scan.victims[pkind];
-        while !targets.is_empty() {
-            let to = targets.pop_lsb();
-            push_threat_both(&scan, piece, sq, board.piece_on[to], to, need, out);
+        let sq_lbl_0 = (sq as u8 ^ scan.masks[0]) as usize;
+        let sq_lbl_1 = (sq as u8 ^ scan.masks[1]) as usize;
+
+        let mut targets = threat_attacks_with(scan.slider_tables, piece, sq, board.occupied) & !scan.kings & scan.victims[pkind];
+        if !targets.is_empty() {
+            let emitter = ThreatEmitter::new(scan, piece as usize, need, sq_lbl_0, sq_lbl_1);
+            while !targets.is_empty() {
+                let to = targets.pop_lsb();
+                emitter.push(board.piece_on[to], to, out);
+            }
         }
 
-        let mut attackers = attackers_to_square(&board.pieces, board.occupied, sq) & !changed & !scan.kings;
+        let mut attackers = attackers_to_square(&board.pieces, board.occupied, sq, scan.slider_tables, pkind) & !changed;
         while !attackers.is_empty() {
             let from = attackers.pop_lsb();
-            push_threat_both(&scan, board.piece_on[from], from, piece, sq, need, out);
+            let attacker = board.piece_on[from];
+            let from_lbl_0 = (from as u8 ^ scan.masks[0]) as usize;
+            let from_lbl_1 = (from as u8 ^ scan.masks[1]) as usize;
+            let emitter = ThreatEmitter::new(scan, attacker as usize, need, from_lbl_0, from_lbl_1);
+            emitter.push(piece, sq, out);
         }
     }
 }
@@ -1684,61 +2108,121 @@ pub fn collect_xray_threat_diffs_both(
     }
 
     let non_changed = !changed;
+    let non_changed_victims = non_changed & !scan.kings;
     let queens = board.pieces[Piece::WhiteQueen] | board.pieces[Piece::BlackQueen];
-    let diag_pieces = (board.pieces[Piece::WhiteBishop] | board.pieces[Piece::BlackBishop] | queens) & non_changed;
-    let orth_pieces = (board.pieces[Piece::WhiteRook] | board.pieces[Piece::BlackRook] | queens) & non_changed;
 
-    let mut diag_sliders = Bitboard::EMPTY;
-    let mut orth_sliders = Bitboard::EMPTY;
-    let mut d = occ_delta;
-    while !d.is_empty() {
-        let sq = d.pop_lsb();
-        diag_sliders |= (crate::attacks::bishop_attacks(sq, occ_before) | crate::attacks::bishop_attacks(sq, occ_after)) & diag_pieces;
-        orth_sliders |= (crate::attacks::rook_attacks(sq, occ_before) | crate::attacks::rook_attacks(sq, occ_after)) & orth_pieces;
+    let tables = scan.slider_tables;
+    let diag_pieces = (board.pieces[Piece::WhiteBishop] | board.pieces[Piece::BlackBishop] | queens) & non_changed;
+    if !diag_pieces.is_empty() {
+        let mut diag_sliders = Bitboard::EMPTY;
+        let mut d = occ_delta;
+        while !d.is_empty() {
+            let sq = d.pop_lsb();
+            // only occ_before is needed: the first changed square on a slider's
+            // ray is occupied in occ_before and sees the slider from there
+            diag_sliders |= tables.bishop_attacks(sq, occ_before) & diag_pieces;
+        }
+        while !diag_sliders.is_empty() {
+            let from = diag_sliders.pop_lsb();
+            let attacker = board.piece_on[from];
+            let akind = attacker.piece_type() as usize;
+            let vic_mask = non_changed_victims & scan.victims[akind];
+
+            let att_b = tables.bishop_attacks(from, occ_before) & vic_mask;
+            let att_a = tables.bishop_attacks(from, occ_after) & vic_mask;
+
+            // Precompute invariant values for both sides for this attacker/from
+            let a = attacker as usize;
+            let from_lbl_0 = (from as u8 ^ scan.masks[0]) as usize;
+            let from_lbl_1 = (from as u8 ^ scan.masks[1]) as usize;
+            let emitter = ThreatEmitter::new(scan, a, need, from_lbl_0, from_lbl_1);
+
+            let mut lost = att_b & !att_a;
+            while !lost.is_empty() {
+                let to = lost.pop_lsb();
+                emitter.push(board.piece_on[to], to, subs);
+            }
+
+            let mut gained = att_a & !att_b;
+            while !gained.is_empty() {
+                let to = gained.pop_lsb();
+                emitter.push(board.piece_on[to], to, adds);
+            }
+        }
     }
 
-    let mut sliders = diag_sliders | orth_sliders;
-    let non_changed_victims = non_changed & !scan.kings;
-    while !sliders.is_empty() {
-        let from = sliders.pop_lsb();
-        let attacker = board.piece_on[from];
-        let akind = attacker.piece_type() as usize;
-        let vic_mask = non_changed_victims & scan.victims[akind];
-
-        let att_b = threat_attacks(attacker, from, occ_before) & vic_mask;
-        let att_a = threat_attacks(attacker, from, occ_after) & vic_mask;
-
-        let mut lost = att_b & !att_a;
-        while !lost.is_empty() {
-            let to = lost.pop_lsb();
-            push_threat_both(&scan, attacker, from, board.piece_on[to], to, need, subs);
+    let orth_pieces = (board.pieces[Piece::WhiteRook] | board.pieces[Piece::BlackRook] | queens) & non_changed;
+    if !orth_pieces.is_empty() {
+        let mut orth_sliders = Bitboard::EMPTY;
+        let mut d = occ_delta;
+        while !d.is_empty() {
+            let sq = d.pop_lsb();
+            orth_sliders |= tables.rook_attacks(sq, occ_before) & orth_pieces;
         }
+        while !orth_sliders.is_empty() {
+            let from = orth_sliders.pop_lsb();
+            let attacker = board.piece_on[from];
+            let akind = attacker.piece_type() as usize;
+            let vic_mask = non_changed_victims & scan.victims[akind];
 
-        let mut gained = att_a & !att_b;
-        while !gained.is_empty() {
-            let to = gained.pop_lsb();
-            push_threat_both(&scan, attacker, from, board.piece_on[to], to, need, adds);
+            let att_b = tables.rook_attacks(from, occ_before) & vic_mask;
+            let att_a = tables.rook_attacks(from, occ_after) & vic_mask;
+
+            // Precompute invariant values for both sides for this attacker/from
+            let a = attacker as usize;
+            let from_lbl_0 = (from as u8 ^ scan.masks[0]) as usize;
+            let from_lbl_1 = (from as u8 ^ scan.masks[1]) as usize;
+            let emitter = ThreatEmitter::new(scan, a, need, from_lbl_0, from_lbl_1);
+
+            let mut lost = att_b & !att_a;
+            while !lost.is_empty() {
+                let to = lost.pop_lsb();
+                emitter.push(board.piece_on[to], to, subs);
+            }
+
+            let mut gained = att_a & !att_b;
+            while !gained.is_empty() {
+                let to = gained.pop_lsb();
+                emitter.push(board.piece_on[to], to, adds);
+            }
         }
     }
 }
 
-// every piece of either color that attacks sq under the given occupancy
-fn attackers_to_square(pieces: &[Bitboard; PIECE_NB], occ: Bitboard, sq: Square) -> Bitboard {
-    use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+// every piece of either color that can attack sq under the given occupancy,
+// restricted to the attacker types that may threaten a piece of victim_kind
+#[inline(always)]
+fn attackers_to_square(
+    pieces: &[Bitboard; PIECE_NB],
+    occ: Bitboard,
+    sq: Square,
+    tables: &crate::attacks::SliderTables,
+    victim_kind: usize,
+) -> Bitboard {
+    use crate::attacks::{knight_attacks, pawn_attacks};
 
     let knights = pieces[Piece::WhiteKnight as usize] | pieces[Piece::BlackKnight as usize];
-    let kings = pieces[Piece::WhiteKing as usize] | pieces[Piece::BlackKing as usize];
     let queens = pieces[Piece::WhiteQueen as usize] | pieces[Piece::BlackQueen as usize];
-    let diagonal = pieces[Piece::WhiteBishop as usize] | pieces[Piece::BlackBishop as usize] | queens;
-    let straight = pieces[Piece::WhiteRook as usize] | pieces[Piece::BlackRook as usize] | queens;
+    let mut attackers = knight_attacks(sq) & knights;
 
-    // black pawn on sq attacks squares a white pawn attacks it from
-    pawn_attacks(Color::Black, sq) & pieces[Piece::WhitePawn as usize]
-        | pawn_attacks(Color::White, sq) & pieces[Piece::BlackPawn as usize]
-        | knight_attacks(sq) & knights
-        | king_attacks(sq) & kings
-        | bishop_attacks(sq, occ) & diagonal
-        | rook_attacks(sq, occ) & straight
+    // a queen can only be threatened by knights and queens
+    if victim_kind == PieceType::Queen as usize {
+        return attackers | (tables.bishop_attacks(sq, occ) | tables.rook_attacks(sq, occ)) & queens;
+    }
+
+    let bishops = pieces[Piece::WhiteBishop as usize] | pieces[Piece::BlackBishop as usize];
+    let rooks = pieces[Piece::WhiteRook as usize] | pieces[Piece::BlackRook as usize];
+    attackers |= tables.bishop_attacks(sq, occ) & (bishops | queens);
+    attackers |= tables.rook_attacks(sq, occ) & (rooks | queens);
+
+    // pawns cannot threaten bishops
+    if victim_kind != PieceType::Bishop as usize {
+        // black pawn on sq attacks squares a white pawn attacks it from
+        attackers |= pawn_attacks(Color::Black, sq) & pieces[Piece::WhitePawn as usize]
+            | pawn_attacks(Color::White, sq) & pieces[Piece::BlackPawn as usize];
+    }
+
+    attackers
 }
 
 // applies or removes the rows of a threat index list
@@ -1807,82 +2291,193 @@ pub fn refresh_side(&mut self, side: usize, list: &ThreatList, weights: &ThreatW
     }
 }
 
+// prefetch first chunk of a threat row (128-256 bytes = 2-4 cache lines)
+// let hardware prefetcher pull the rest
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn prefetch_threat_row(weights: &ThreatWeights, index: u16) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let row = weights.rows.as_ptr().add(index as usize * HIDDEN_SIZE) as *const i8;
+        _mm_prefetch(row, _MM_HINT_T0);
+        _mm_prefetch(row.add(64), _MM_HINT_T0);
+        _mm_prefetch(row.add(128), _MM_HINT_T0);
+        _mm_prefetch(row.add(256), _MM_HINT_T0);
+    }
+}
+
+// prefetch one chunk (base..base + lines * 64) of a row
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn prefetch_threat_chunk(weights: &ThreatWeights, index: u16, base: usize, lines: usize) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let chunk = weights.rows.as_ptr().add(index as usize * HIDDEN_SIZE + base) as *const i8;
+        let mut line = 0;
+        while line < lines {
+            _mm_prefetch(chunk.add(line * 64), _MM_HINT_T0);
+            line += 1;
+        }
+    }
+}
+
+// 192 hidden lanes (12 YMM accumulators)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_threat_chunk_12(
+    dst: &mut [i16; HIDDEN_SIZE],
+    src: &[i16; HIDDEN_SIZE],
+    weights: &ThreatWeights,
+    subs: &[u16],
+    adds: &[u16],
+    base: usize,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let s = src.as_ptr().add(base) as *const __m256i;
+        let mut a0 = _mm256_load_si256(s);
+        let mut a1 = _mm256_load_si256(s.add(1));
+        let mut a2 = _mm256_load_si256(s.add(2));
+        let mut a3 = _mm256_load_si256(s.add(3));
+        let mut a4 = _mm256_load_si256(s.add(4));
+        let mut a5 = _mm256_load_si256(s.add(5));
+        let mut a6 = _mm256_load_si256(s.add(6));
+        let mut a7 = _mm256_load_si256(s.add(7));
+        let mut a8 = _mm256_load_si256(s.add(8));
+        let mut a9 = _mm256_load_si256(s.add(9));
+        let mut a10 = _mm256_load_si256(s.add(10));
+        let mut a11 = _mm256_load_si256(s.add(11));
+
+        // One prefetch per row, a few rows ahead. The old code issued one per
+        // cache line of the whole row, which saturated the line fill buffers
+        // and made _mm_prefetch itself a top profiler entry.
+        const PREFETCH_AHEAD: usize = 4;
+        let rows = weights.rows.as_ptr();
+        for (n, &idx) in subs.iter().enumerate() {
+            if let Some(&ahead) = subs.get(n + PREFETCH_AHEAD) {
+                _mm_prefetch(rows.add(ahead as usize * HIDDEN_SIZE + base), _MM_HINT_T0);
+            }
+            let r = rows.add(idx as usize * HIDDEN_SIZE + base);
+            a0 = _mm256_sub_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
+            a1 = _mm256_sub_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
+            a2 = _mm256_sub_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
+            a3 = _mm256_sub_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
+            a4 = _mm256_sub_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
+            a5 = _mm256_sub_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
+            a6 = _mm256_sub_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
+            a7 = _mm256_sub_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+            a8 = _mm256_sub_epi16(a8, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(128) as *const __m128i)));
+            a9 = _mm256_sub_epi16(a9, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(144) as *const __m128i)));
+            a10 = _mm256_sub_epi16(a10, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(160) as *const __m128i)));
+            a11 = _mm256_sub_epi16(a11, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(176) as *const __m128i)));
+        }
+        for (n, &idx) in adds.iter().enumerate() {
+            if let Some(&ahead) = adds.get(n + PREFETCH_AHEAD) {
+                _mm_prefetch(rows.add(ahead as usize * HIDDEN_SIZE + base), _MM_HINT_T0);
+            }
+            let r = rows.add(idx as usize * HIDDEN_SIZE + base);
+            a0 = _mm256_add_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
+            a1 = _mm256_add_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
+            a2 = _mm256_add_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
+            a3 = _mm256_add_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
+            a4 = _mm256_add_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
+            a5 = _mm256_add_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
+            a6 = _mm256_add_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
+            a7 = _mm256_add_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+            a8 = _mm256_add_epi16(a8, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(128) as *const __m128i)));
+            a9 = _mm256_add_epi16(a9, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(144) as *const __m128i)));
+            a10 = _mm256_add_epi16(a10, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(160) as *const __m128i)));
+            a11 = _mm256_add_epi16(a11, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(176) as *const __m128i)));
+        }
+
+        let d = dst.as_mut_ptr().add(base) as *mut __m256i;
+        _mm256_store_si256(d, a0);
+        _mm256_store_si256(d.add(1), a1);
+        _mm256_store_si256(d.add(2), a2);
+        _mm256_store_si256(d.add(3), a3);
+        _mm256_store_si256(d.add(4), a4);
+        _mm256_store_si256(d.add(5), a5);
+        _mm256_store_si256(d.add(6), a6);
+        _mm256_store_si256(d.add(7), a7);
+        _mm256_store_si256(d.add(8), a8);
+        _mm256_store_si256(d.add(9), a9);
+        _mm256_store_si256(d.add(10), a10);
+        _mm256_store_si256(d.add(11), a11);
+    }
+}
+
+// 128 hidden lanes (8 YMM accumulators)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_threat_chunk_8(dst: &mut [i16; HIDDEN_SIZE], src: &[i16; HIDDEN_SIZE], weights: &ThreatWeights, subs: &[u16], adds: &[u16], base: usize) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let s = src.as_ptr().add(base) as *const __m256i;
+        let mut a0 = _mm256_load_si256(s);
+        let mut a1 = _mm256_load_si256(s.add(1));
+        let mut a2 = _mm256_load_si256(s.add(2));
+        let mut a3 = _mm256_load_si256(s.add(3));
+        let mut a4 = _mm256_load_si256(s.add(4));
+        let mut a5 = _mm256_load_si256(s.add(5));
+        let mut a6 = _mm256_load_si256(s.add(6));
+        let mut a7 = _mm256_load_si256(s.add(7));
+
+        let rows = weights.rows.as_ptr();
+        for &idx in subs {
+            let r = rows.add(idx as usize * HIDDEN_SIZE + base);
+            a0 = _mm256_sub_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
+            a1 = _mm256_sub_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
+            a2 = _mm256_sub_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
+            a3 = _mm256_sub_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
+            a4 = _mm256_sub_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
+            a5 = _mm256_sub_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
+            a6 = _mm256_sub_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
+            a7 = _mm256_sub_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+        }
+        for &idx in adds {
+            let r = rows.add(idx as usize * HIDDEN_SIZE + base);
+            a0 = _mm256_add_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
+            a1 = _mm256_add_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
+            a2 = _mm256_add_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
+            a3 = _mm256_add_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
+            a4 = _mm256_add_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
+            a5 = _mm256_add_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
+            a6 = _mm256_add_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
+            a7 = _mm256_add_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+        }
+
+        let d = dst.as_mut_ptr().add(base) as *mut __m256i;
+        _mm256_store_si256(d, a0);
+        _mm256_store_si256(d.add(1), a1);
+        _mm256_store_si256(d.add(2), a2);
+        _mm256_store_si256(d.add(3), a3);
+        _mm256_store_si256(d.add(4), a4);
+        _mm256_store_si256(d.add(5), a5);
+        _mm256_store_si256(d.add(6), a6);
+        _mm256_store_si256(d.add(7), a7);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn apply_threat_delta_from_avx2(dst: &mut [i16; HIDDEN_SIZE], src: &[i16; HIDDEN_SIZE], weights: &ThreatWeights, subs: &[u16], adds: &[u16]) {
-    use std::arch::x86_64::*;
     unsafe {
-        let mut base = 0usize;
-        while base < HIDDEN_SIZE {
-            let s = src.as_ptr().add(base) as *const __m256i;
-            let mut a0 = _mm256_load_si256(s);
-            let mut a1 = _mm256_load_si256(s.add(1));
-            let mut a2 = _mm256_load_si256(s.add(2));
-            let mut a3 = _mm256_load_si256(s.add(3));
-            let mut a4 = _mm256_load_si256(s.add(4));
-            let mut a5 = _mm256_load_si256(s.add(5));
-            let mut a6 = _mm256_load_si256(s.add(6));
-            let mut a7 = _mm256_load_si256(s.add(7));
-
-            for (n, &idx) in subs.iter().enumerate() {
-                if let Some(&ahead) = subs.get(n + 2) {
-                    let p = weights.rows.as_ptr().add(ahead as usize * HIDDEN_SIZE + base) as *const i8;
-                    _mm_prefetch(p, _MM_HINT_T0);
-                    _mm_prefetch(p.add(64), _MM_HINT_T0);
-                }
-                let r = weights.rows.as_ptr().add(idx as usize * HIDDEN_SIZE + base);
-                let w0 = _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i));
-                let w1 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i));
-                let w2 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i));
-                let w3 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i));
-                let w4 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i));
-                let w5 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i));
-                let w6 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i));
-                let w7 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i));
-                a0 = _mm256_sub_epi16(a0, w0);
-                a1 = _mm256_sub_epi16(a1, w1);
-                a2 = _mm256_sub_epi16(a2, w2);
-                a3 = _mm256_sub_epi16(a3, w3);
-                a4 = _mm256_sub_epi16(a4, w4);
-                a5 = _mm256_sub_epi16(a5, w5);
-                a6 = _mm256_sub_epi16(a6, w6);
-                a7 = _mm256_sub_epi16(a7, w7);
-            }
-            for (n, &idx) in adds.iter().enumerate() {
-                if let Some(&ahead) = adds.get(n + 2) {
-                    let p = weights.rows.as_ptr().add(ahead as usize * HIDDEN_SIZE + base) as *const i8;
-                    _mm_prefetch(p, _MM_HINT_T0);
-                    _mm_prefetch(p.add(64), _MM_HINT_T0);
-                }
-                let r = weights.rows.as_ptr().add(idx as usize * HIDDEN_SIZE + base);
-                let w0 = _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i));
-                let w1 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i));
-                let w2 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i));
-                let w3 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i));
-                let w4 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i));
-                let w5 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i));
-                let w6 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i));
-                let w7 = _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i));
-                a0 = _mm256_add_epi16(a0, w0);
-                a1 = _mm256_add_epi16(a1, w1);
-                a2 = _mm256_add_epi16(a2, w2);
-                a3 = _mm256_add_epi16(a3, w3);
-                a4 = _mm256_add_epi16(a4, w4);
-                a5 = _mm256_add_epi16(a5, w5);
-                a6 = _mm256_add_epi16(a6, w6);
-                a7 = _mm256_add_epi16(a7, w7);
-            }
-            let d = dst.as_mut_ptr().add(base) as *mut __m256i;
-            _mm256_store_si256(d, a0);
-            _mm256_store_si256(d.add(1), a1);
-            _mm256_store_si256(d.add(2), a2);
-            _mm256_store_si256(d.add(3), a3);
-            _mm256_store_si256(d.add(4), a4);
-            _mm256_store_si256(d.add(5), a5);
-            _mm256_store_si256(d.add(6), a6);
-            _mm256_store_si256(d.add(7), a7);
-            base += 128;
+        // warm only the first chunk (128 bytes) of the first 1-2 rows
+        // hardware prefetcher will pull the rest
+        const WARM_ROWS: usize = 2;
+        let warm = WARM_ROWS.min(subs.len());
+        for &idx in &subs[..warm] {
+            prefetch_threat_chunk(weights, idx, 0, 2);
         }
+        let warm = WARM_ROWS.min(adds.len());
+        for &idx in &adds[..warm] {
+            prefetch_threat_chunk(weights, idx, 0, 2);
+        }
+
+        // a short list is fully warmed above
+        apply_threat_chunk_12(dst, src, weights, subs, adds, 0);
+        apply_threat_chunk_12(dst, src, weights, subs, adds, 192);
+        apply_threat_chunk_8(dst, src, weights, subs, adds, 384);
     }
 }
 
@@ -1955,45 +2550,146 @@ unsafe fn apply_threat_rows_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &ThreatW
 unsafe fn refresh_threat_side_avx2(dst: &mut [i16; HIDDEN_SIZE], weights: &ThreatWeights, list: &[u16]) {
     use std::arch::x86_64::*;
     unsafe {
-        let mut base = 0usize;
-        while base < HIDDEN_SIZE {
-            let mut a0 = _mm256_setzero_si256();
-            let mut a1 = _mm256_setzero_si256();
-            let mut a2 = _mm256_setzero_si256();
-            let mut a3 = _mm256_setzero_si256();
-            let mut a4 = _mm256_setzero_si256();
-            let mut a5 = _mm256_setzero_si256();
-            let mut a6 = _mm256_setzero_si256();
-            let mut a7 = _mm256_setzero_si256();
+        // 192 lanes (12 YMM) + 192 lanes (12 YMM) + 128 lanes (8 YMM) = 512 lanes
+        // This reduces from 4 passes to 3 passes over the threat list
+        let rows = weights.rows.as_ptr();
+        let len = list.len();
 
-            for (n, &idx) in list.iter().enumerate() {
-                if let Some(&ahead) = list.get(n + 4) {
-                    let p = weights.rows.as_ptr().add(ahead as usize * HIDDEN_SIZE + base) as *const i8;
-                    _mm_prefetch(p, _MM_HINT_T0);
-                    _mm_prefetch(p.add(64), _MM_HINT_T0);
-                }
-                let r = weights.rows.as_ptr().add(idx as usize * HIDDEN_SIZE + base);
-                a0 = _mm256_add_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
-                a1 = _mm256_add_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
-                a2 = _mm256_add_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
-                a3 = _mm256_add_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
-                a4 = _mm256_add_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
-                a5 = _mm256_add_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
-                a6 = _mm256_add_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
-                a7 = _mm256_add_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+        // First 192 lanes (12 YMM = 12 * 16 = 192 i16 = 384 bytes)
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut a2 = _mm256_setzero_si256();
+        let mut a3 = _mm256_setzero_si256();
+        let mut a4 = _mm256_setzero_si256();
+        let mut a5 = _mm256_setzero_si256();
+        let mut a6 = _mm256_setzero_si256();
+        let mut a7 = _mm256_setzero_si256();
+        let mut a8 = _mm256_setzero_si256();
+        let mut a9 = _mm256_setzero_si256();
+        let mut a10 = _mm256_setzero_si256();
+        let mut a11 = _mm256_setzero_si256();
+
+        let main_end = len.saturating_sub(4);
+        for (n, &idx) in list.iter().enumerate() {
+            if n < main_end {
+                let ahead = list[n + 4];
+                let p = rows.add(ahead as usize * HIDDEN_SIZE) as *const i8;
+                _mm_prefetch(p, _MM_HINT_T0);
             }
-
-            let d = dst.as_mut_ptr().add(base) as *mut __m256i;
-            _mm256_store_si256(d, a0);
-            _mm256_store_si256(d.add(1), a1);
-            _mm256_store_si256(d.add(2), a2);
-            _mm256_store_si256(d.add(3), a3);
-            _mm256_store_si256(d.add(4), a4);
-            _mm256_store_si256(d.add(5), a5);
-            _mm256_store_si256(d.add(6), a6);
-            _mm256_store_si256(d.add(7), a7);
-            base += 128;
+            let r = rows.add(idx as usize * HIDDEN_SIZE);
+            a0 = _mm256_add_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
+            a1 = _mm256_add_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
+            a2 = _mm256_add_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
+            a3 = _mm256_add_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
+            a4 = _mm256_add_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
+            a5 = _mm256_add_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
+            a6 = _mm256_add_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
+            a7 = _mm256_add_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+            a8 = _mm256_add_epi16(a8, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(128) as *const __m128i)));
+            a9 = _mm256_add_epi16(a9, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(144) as *const __m128i)));
+            a10 = _mm256_add_epi16(a10, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(160) as *const __m128i)));
+            a11 = _mm256_add_epi16(a11, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(176) as *const __m128i)));
         }
+
+        let d = dst.as_mut_ptr() as *mut __m256i;
+        _mm256_store_si256(d, a0);
+        _mm256_store_si256(d.add(1), a1);
+        _mm256_store_si256(d.add(2), a2);
+        _mm256_store_si256(d.add(3), a3);
+        _mm256_store_si256(d.add(4), a4);
+        _mm256_store_si256(d.add(5), a5);
+        _mm256_store_si256(d.add(6), a6);
+        _mm256_store_si256(d.add(7), a7);
+        _mm256_store_si256(d.add(8), a8);
+        _mm256_store_si256(d.add(9), a9);
+        _mm256_store_si256(d.add(10), a10);
+        _mm256_store_si256(d.add(11), a11);
+
+        // Next 192 lanes (base = 192)
+        a0 = _mm256_setzero_si256();
+        a1 = _mm256_setzero_si256();
+        a2 = _mm256_setzero_si256();
+        a3 = _mm256_setzero_si256();
+        a4 = _mm256_setzero_si256();
+        a5 = _mm256_setzero_si256();
+        a6 = _mm256_setzero_si256();
+        a7 = _mm256_setzero_si256();
+        a8 = _mm256_setzero_si256();
+        a9 = _mm256_setzero_si256();
+        a10 = _mm256_setzero_si256();
+        a11 = _mm256_setzero_si256();
+
+        for (n, &idx) in list.iter().enumerate() {
+            if n < main_end {
+                let ahead = list[n + 4];
+                let p = rows.add(ahead as usize * HIDDEN_SIZE + 192) as *const i8;
+                _mm_prefetch(p, _MM_HINT_T0);
+            }
+            let r = rows.add(idx as usize * HIDDEN_SIZE + 192);
+            a0 = _mm256_add_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
+            a1 = _mm256_add_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
+            a2 = _mm256_add_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
+            a3 = _mm256_add_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
+            a4 = _mm256_add_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
+            a5 = _mm256_add_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
+            a6 = _mm256_add_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
+            a7 = _mm256_add_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+            a8 = _mm256_add_epi16(a8, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(128) as *const __m128i)));
+            a9 = _mm256_add_epi16(a9, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(144) as *const __m128i)));
+            a10 = _mm256_add_epi16(a10, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(160) as *const __m128i)));
+            a11 = _mm256_add_epi16(a11, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(176) as *const __m128i)));
+        }
+
+        let d = dst.as_mut_ptr().add(192) as *mut __m256i;
+        _mm256_store_si256(d, a0);
+        _mm256_store_si256(d.add(1), a1);
+        _mm256_store_si256(d.add(2), a2);
+        _mm256_store_si256(d.add(3), a3);
+        _mm256_store_si256(d.add(4), a4);
+        _mm256_store_si256(d.add(5), a5);
+        _mm256_store_si256(d.add(6), a6);
+        _mm256_store_si256(d.add(7), a7);
+        _mm256_store_si256(d.add(8), a8);
+        _mm256_store_si256(d.add(9), a9);
+        _mm256_store_si256(d.add(10), a10);
+        _mm256_store_si256(d.add(11), a11);
+
+        // Last 128 lanes (base = 384, 8 YMM)
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut a2 = _mm256_setzero_si256();
+        let mut a3 = _mm256_setzero_si256();
+        let mut a4 = _mm256_setzero_si256();
+        let mut a5 = _mm256_setzero_si256();
+        let mut a6 = _mm256_setzero_si256();
+        let mut a7 = _mm256_setzero_si256();
+
+        for (n, &idx) in list.iter().enumerate() {
+            if n < main_end {
+                let ahead = list[n + 4];
+                let p = rows.add(ahead as usize * HIDDEN_SIZE + 384) as *const i8;
+                _mm_prefetch(p, _MM_HINT_T0);
+            }
+            let r = rows.add(idx as usize * HIDDEN_SIZE + 384);
+            a0 = _mm256_add_epi16(a0, _mm256_cvtepi8_epi16(_mm_load_si128(r as *const __m128i)));
+            a1 = _mm256_add_epi16(a1, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(16) as *const __m128i)));
+            a2 = _mm256_add_epi16(a2, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(32) as *const __m128i)));
+            a3 = _mm256_add_epi16(a3, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(48) as *const __m128i)));
+            a4 = _mm256_add_epi16(a4, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(64) as *const __m128i)));
+            a5 = _mm256_add_epi16(a5, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(80) as *const __m128i)));
+            a6 = _mm256_add_epi16(a6, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(96) as *const __m128i)));
+            a7 = _mm256_add_epi16(a7, _mm256_cvtepi8_epi16(_mm_load_si128(r.add(112) as *const __m128i)));
+        }
+
+        let d = dst.as_mut_ptr().add(384) as *mut __m256i;
+        _mm256_store_si256(d, a0);
+        _mm256_store_si256(d.add(1), a1);
+        _mm256_store_si256(d.add(2), a2);
+        _mm256_store_si256(d.add(3), a3);
+        _mm256_store_si256(d.add(4), a4);
+        _mm256_store_si256(d.add(5), a5);
+        _mm256_store_si256(d.add(6), a6);
+        _mm256_store_si256(d.add(7), a7);
     }
 }
 
@@ -2114,6 +2810,7 @@ mod tests {
             }
             head.l3_bias[bucket][0] = rng.centered(4096);
         }
+        rebuild_l1_transposed(&mut net.head);
         net
     }
 
@@ -2140,15 +2837,40 @@ mod tests {
             if !is_x86_feature_detected!("avx2") {
                 return;
             }
+            let check = |packed_layout: bool, psq: &[i16; HIDDEN_SIZE], threat: &[i16; HIDDEN_SIZE], logical: &[u8; PAIR_COUNT]| {
+                let mut expected = *logical;
+                if packed_layout {
+                    for chunk in (0..PAIR_COUNT).step_by(32) {
+                        for p in 0..32 {
+                            expected[chunk + p] = logical[chunk + PAIRWISE_PACK_ORDER[p]];
+                        }
+                    }
+                }
+                let mut actual = [0u8; PAIR_COUNT];
+                let nnz = if packed_layout {
+                    unsafe { pairwise_side_avx2::<true>(psq, threat, &mut actual) }
+                } else {
+                    unsafe { pairwise_side_avx2::<false>(psq, threat, &mut actual) }
+                };
+                assert_eq!(actual, expected, "packed layout: {packed_layout}");
+
+                let mut expected_nnz = 0u64;
+                for block in (0..PAIR_COUNT).step_by(4) {
+                    if expected[block..block + 4].iter().any(|&value| value != 0) {
+                        expected_nnz |= 1u64 << (block / 4);
+                    }
+                }
+                assert_eq!(nnz, expected_nnz, "packed layout: {packed_layout}");
+            };
+
             let mut rng = Rng(0x5EED);
             for _ in 0..64 {
                 let (psq, threat) = random_accumulators(rng.next());
                 for side in 0..2 {
-                    let mut expected = [0u8; PAIR_COUNT];
-                    pairwise_side_scalar(&psq.vals[side], &threat.vals[side], &mut expected);
-                    let mut actual = [0u8; PAIR_COUNT];
-                    unsafe { pairwise_side_avx2(&psq.vals[side], &threat.vals[side], &mut actual) };
-                    assert_eq!(actual, expected);
+                    let mut logical = [0u8; PAIR_COUNT];
+                    pairwise_side_scalar(&psq.vals[side], &threat.vals[side], &mut logical);
+                    check(true, &psq.vals[side], &threat.vals[side], &logical);
+                    check(false, &psq.vals[side], &threat.vals[side], &logical);
                 }
             }
         }
@@ -2168,11 +2890,26 @@ mod tests {
                 let mut input = [0u8; HIDDEN_SIZE];
                 pairwise_side_scalar(&psq.vals[0], &threat.vals[0], (&mut input[..PAIR_COUNT]).try_into().unwrap());
                 pairwise_side_scalar(&psq.vals[1], &threat.vals[1], (&mut input[PAIR_COUNT..]).try_into().unwrap());
+                // the AVX2 first layer consumes the packus lane order
+                let mut packed_input = [0u8; HIDDEN_SIZE];
+                for chunk in (0..HIDDEN_SIZE).step_by(32) {
+                    for p in 0..32 {
+                        packed_input[chunk + p] = input[chunk + PAIRWISE_PACK_ORDER[p]];
+                    }
+                }
                 for bucket in 0..NUM_OUTPUT_BUCKETS {
                     let mut expected = [0i16; L2_IN];
                     l1_forward_scalar(&net.head.l1_weights[bucket], &net.head.l1_bias[bucket], &input, &mut expected);
                     let mut actual = [0i16; L2_IN];
-                    unsafe { l1_forward_avx2(&net.head.l1_weights[bucket], &net.head.l1_bias[bucket], &input, &mut actual) };
+                    unsafe {
+                        l1_forward_avx2(
+                            &net.head.l1_weights_t[bucket],
+                            &net.head.l1_bias[bucket],
+                            &packed_input,
+                            [u64::MAX; 2],
+                            &mut actual,
+                        )
+                    };
                     assert_eq!(actual, expected, "bucket {bucket}");
                 }
             }
@@ -2214,7 +2951,7 @@ mod tests {
             let them = us ^ 1;
             for bucket in 0..NUM_OUTPUT_BUCKETS {
                 let expected = forward_scalar(&psq, &threat, us, them, bucket, &net.head);
-                let actual = forward_multilayer(&psq, &threat, us, them, bucket, &net.head);
+                let actual = forward_multilayer(&psq, &threat.vals[us], &threat.vals[them], us, them, bucket, &net.head);
                 assert_eq!(actual, expected, "bucket {bucket}");
             }
         }
@@ -2586,151 +3323,229 @@ unsafe fn vec_add_avx2(acc: &mut [i16; HIDDEN_SIZE], weights: &[i16; HIDDEN_SIZE
     }
 }
 
-// pairwise activation using mulhi
+// pairwise activation using mulhi; returns a bitmask of nonzero 4-byte blocks.
+// PACKED selects the packus lane order (AVX2 first layer) or logical order.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn pairwise_side_avx2(psq: &[i16; HIDDEN_SIZE], threats: &[i16; HIDDEN_SIZE], out: &mut [u8; PAIR_COUNT]) {
+unsafe fn pairwise_side_avx2<const PACKED: bool>(psq: &[i16; HIDDEN_SIZE], threats: &[i16; HIDDEN_SIZE], out: &mut [u8; PAIR_COUNT]) -> u64 {
     use std::arch::x86_64::*;
     unsafe {
+        // both arrays come from 64-byte aligned accumulators and every load
+        // below is at a multiple of 32 bytes
+        assert_eq!(psq.as_ptr() as usize % 32, 0, "pairwise input must be 32-byte aligned");
+        assert_eq!(threats.as_ptr() as usize % 32, 0, "pairwise input must be 32-byte aligned");
+        let psq_ptr = psq.as_ptr();
+        let threat_ptr = threats.as_ptr();
+
         let zero = _mm256_setzero_si256();
         let qa = _mm256_set1_epi16(QA);
-        let max = _mm256_set1_epi16(255);
 
         let pair = |offset: usize| {
-            let lo = _mm256_loadu_si256(psq.as_ptr().add(offset) as *const __m256i);
-            let lo = _mm256_add_epi16(lo, _mm256_loadu_si256(threats.as_ptr().add(offset) as *const __m256i));
-            let hi = _mm256_loadu_si256(psq.as_ptr().add(offset + PAIR_COUNT) as *const __m256i);
-            let hi = _mm256_add_epi16(hi, _mm256_loadu_si256(threats.as_ptr().add(offset + PAIR_COUNT) as *const __m256i));
+            let lo = _mm256_load_si256(psq_ptr.add(offset) as *const __m256i);
+            let lo = _mm256_add_epi16(lo, _mm256_load_si256(threat_ptr.add(offset) as *const __m256i));
+            let hi = _mm256_load_si256(psq_ptr.add(offset + PAIR_COUNT) as *const __m256i);
+            let hi = _mm256_add_epi16(hi, _mm256_load_si256(threat_ptr.add(offset + PAIR_COUNT) as *const __m256i));
             // clamp a to [0, QA], b only needs min(QA)
             let a = _mm256_min_epi16(_mm256_max_epi16(lo, zero), qa);
             let b = _mm256_min_epi16(hi, qa);
-            let product = _mm256_mulhi_epi16(_mm256_slli_epi16::<{ FT_SCALE_BITS as i32 }>(a), b);
-            _mm256_min_epi16(_mm256_max_epi16(product, zero), max)
+            _mm256_mulhi_epi16(_mm256_slli_epi16::<{ FT_SCALE_BITS as i32 }>(a), b)
         };
 
+        let mut nnz = 0u64;
         let mut i = 0;
         while i < PAIR_COUNT {
             let p0 = pair(i);
             let p1 = pair(i + 16);
-            // fix lane order after packus
-            let packed = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packus_epi16(p0, p1));
+            // PACKED keeps the packus lane order for the AVX2 first layer
+            let packed = _mm256_packus_epi16(p0, p1);
+            let packed = if PACKED {
+                packed
+            } else {
+                _mm256_permute4x64_epi64::<0b11_01_10_00>(packed)
+            };
             _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, packed);
+            // 8 dwords per iteration: set bits mark non-all-zero blocks
+            let zero_dwords = _mm256_castsi256_ps(_mm256_cmpeq_epi32(packed, _mm256_setzero_si256()));
+            let bits = !(_mm256_movemask_ps(zero_dwords) as u64) & 0xFF;
+            nnz |= bits << (i / 4);
             i += 32;
         }
+        nnz
     }
 }
+
+// Unpacks one byte of the nonzero-block mask into its set bit positions.
+// All 8 slots are written so the fill loop stays branchless; callers keep
+// slack at the end of the index buffer.
+const fn build_nnz_table() -> [[u8; 8]; 256] {
+    let mut table = [[0u8; 8]; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut n = 0usize;
+        let mut bit = 0usize;
+        while bit < 8 {
+            if byte & (1 << bit) != 0 {
+                table[byte][n] = bit as u8;
+                n += 1;
+            }
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
+static NNZ_TABLE: [[u8; 8]; 256] = build_nnz_table();
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn l1_forward_avx2(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &[i32; L1_SIZE], input: &[u8; HIDDEN_SIZE], out: &mut [i16; L2_IN]) {
+unsafe fn l1_forward_avx2(
+    weights: &[[i8; 32]; L1_TRANSPOSED_BLOCKS],
+    bias: &[i32; L1_SIZE],
+    input: &[u8; HIDDEN_SIZE],
+    nnz: [u64; 2],
+    out: &mut [i16; L2_IN],
+) {
     use std::arch::x86_64::*;
     unsafe {
         let ones = _mm256_set1_epi16(1);
+        // 32 outputs, 8 lanes each: no horizontal add at the end.
+        // Two blocks are processed per iteration into two independent
+        // accumulator sets, which halves the loop trip count and breaks the
+        // dependency chain on acc0..3.
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut acc2 = _mm256_setzero_si256();
+        let mut acc3 = _mm256_setzero_si256();
+        let mut acc4 = _mm256_setzero_si256();
+        let mut acc5 = _mm256_setzero_si256();
+        let mut acc6 = _mm256_setzero_si256();
+        let mut acc7 = _mm256_setzero_si256();
+
+        // Expand the mask into a dense list of block indices first: 16
+        // branchless table lookups instead of 128 dependent tzcnt steps.
+        let mut idx_buf = [0u16; 128 + 8];
+        let mut count = 0usize;
+        let mut base = 0u16;
+        for chunk in [nnz[0].to_le_bytes(), nnz[1].to_le_bytes()] {
+            for &byte in chunk.iter() {
+                let entry = &NNZ_TABLE[byte as usize];
+                for k in 0..8 {
+                    idx_buf[count + k] = base + entry[k] as u16;
+                }
+                count += byte.count_ones() as usize;
+                base += 8;
+            }
+        }
+
+        macro_rules! block4 {
+            ($index:expr, $a0:ident, $a1:ident, $a2:ident, $a3:ident) => {{
+                let idx = $index as usize;
+                let x = _mm256_set1_epi32(std::ptr::read_unaligned(input.as_ptr().add(idx * 4) as *const i32));
+                let w = weights.as_ptr().add(idx * L1_OUTPUT_BLOCKS) as *const __m256i;
+                $a0 = _mm256_add_epi32($a0, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(w)), ones));
+                $a1 = _mm256_add_epi32($a1, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(w.add(1))), ones));
+                $a2 = _mm256_add_epi32($a2, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(w.add(2))), ones));
+                $a3 = _mm256_add_epi32($a3, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(w.add(3))), ones));
+            }};
+        }
+
+        let mut i = 0usize;
+        while i + 1 < count {
+            block4!(idx_buf[i], acc0, acc1, acc2, acc3);
+            block4!(idx_buf[i + 1], acc4, acc5, acc6, acc7);
+            i += 2;
+        }
+        if i < count {
+            block4!(idx_buf[i], acc0, acc1, acc2, acc3);
+        }
+        acc0 = _mm256_add_epi32(acc0, acc4);
+        acc1 = _mm256_add_epi32(acc1, acc5);
+        acc2 = _mm256_add_epi32(acc2, acc6);
+        acc3 = _mm256_add_epi32(acc3, acc7);
+
         let zero = _mm256_setzero_si256();
         let quant = _mm256_set1_epi32(QUANT);
-
-        let mut j = 0;
-        while j < L1_SIZE {
-            let mut a0 = _mm256_setzero_si256();
-            let mut a1 = _mm256_setzero_si256();
-            let mut a2 = _mm256_setzero_si256();
-            let mut a3 = _mm256_setzero_si256();
-            let mut a4 = _mm256_setzero_si256();
-            let mut a5 = _mm256_setzero_si256();
-            let mut a6 = _mm256_setzero_si256();
-            let mut a7 = _mm256_setzero_si256();
-
-            let r0 = weights[j].as_ptr() as *const __m256i;
-            let r1 = weights[j + 1].as_ptr() as *const __m256i;
-            let r2 = weights[j + 2].as_ptr() as *const __m256i;
-            let r3 = weights[j + 3].as_ptr() as *const __m256i;
-            let r4 = weights[j + 4].as_ptr() as *const __m256i;
-            let r5 = weights[j + 5].as_ptr() as *const __m256i;
-            let r6 = weights[j + 6].as_ptr() as *const __m256i;
-            let r7 = weights[j + 7].as_ptr() as *const __m256i;
-
-            let mut i = 0;
-            while i < HIDDEN_SIZE {
-                let x = _mm256_loadu_si256(input.as_ptr().add(i) as *const __m256i);
-                let idx = i / 32;
-                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(r0.add(idx))), ones));
-                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(r1.add(idx))), ones));
-                a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(r2.add(idx))), ones));
-                a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(r3.add(idx))), ones));
-                a4 = _mm256_add_epi32(a4, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(r4.add(idx))), ones));
-                a5 = _mm256_add_epi32(a5, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(r5.add(idx))), ones));
-                a6 = _mm256_add_epi32(a6, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(r6.add(idx))), ones));
-                a7 = _mm256_add_epi32(a7, _mm256_madd_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(r7.add(idx))), ones));
-                i += 32;
-            }
-
-            let abcd = _mm256_hadd_epi32(_mm256_hadd_epi32(a0, a1), _mm256_hadd_epi32(a2, a3));
-            let efgh = _mm256_hadd_epi32(_mm256_hadd_epi32(a4, a5), _mm256_hadd_epi32(a6, a7));
-            let sum_lo = _mm_add_epi32(_mm256_castsi256_si128(abcd), _mm256_extracti128_si256::<1>(abcd));
-            let sum_hi = _mm_add_epi32(_mm256_castsi256_si128(efgh), _mm256_extracti128_si256::<1>(efgh));
-            let sums = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(sum_lo), sum_hi);
-
-            let b = _mm256_loadu_si256(bias.as_ptr().add(j) as *const __m256i);
-            let shifted = _mm256_srai_epi32::<8>(_mm256_add_epi32(sums, b));
-            let clamped = _mm256_min_epi32(_mm256_max_epi32(shifted, zero), quant);
-            let crelu = _mm256_slli_epi32::<6>(clamped);
-            let screlu = _mm256_mullo_epi32(clamped, clamped);
-
-            let crelu16 = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(crelu, zero));
-            let screlu16 = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(screlu, zero));
-            _mm_storeu_si128(out.as_mut_ptr().add(j) as *mut __m128i, _mm256_castsi256_si128(crelu16));
-            _mm_storeu_si128(out.as_mut_ptr().add(L1_SIZE + j) as *mut __m128i, _mm256_castsi256_si128(screlu16));
-
-            j += 8;
+        macro_rules! finish {
+            ($acc:expr, $group:expr) => {{
+                let biased = _mm256_add_epi32($acc, _mm256_loadu_si256(bias.as_ptr().add(($group) * 8) as *const __m256i));
+                let shifted = _mm256_srai_epi32::<8>(biased);
+                let clamped = _mm256_min_epi32(_mm256_max_epi32(shifted, zero), quant);
+                let crelu = _mm256_slli_epi32::<6>(clamped);
+                let screlu = _mm256_mullo_epi32(clamped, clamped);
+                let crelu16 = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(crelu, zero));
+                let screlu16 = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(screlu, zero));
+                _mm_storeu_si128(out.as_mut_ptr().add(($group) * 8) as *mut __m128i, _mm256_castsi256_si128(crelu16));
+                _mm_storeu_si128(out.as_mut_ptr().add(L1_SIZE + ($group) * 8) as *mut __m128i, _mm256_castsi256_si128(screlu16));
+            }};
         }
+        finish!(acc0, 0);
+        finish!(acc1, 1);
+        finish!(acc2, 2);
+        finish!(acc3, 3);
     }
 }
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
-unsafe fn l1_forward_avx2_vnni(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &[i32; L1_SIZE], input: &[u8; HIDDEN_SIZE], out: &mut [i16; L2_IN]) {
+unsafe fn l1_forward_avx2_vnni(
+    weights: &[[i8; 32]; L1_TRANSPOSED_BLOCKS],
+    bias: &[i32; L1_SIZE],
+    input: &[u8; HIDDEN_SIZE],
+    nnz: [u64; 2],
+    out: &mut [i16; L2_IN],
+) {
     use std::arch::x86_64::*;
     unsafe {
         let ones = _mm256_set1_epi16(1);
-        let mut j = 0;
-        while j < L1_SIZE {
-            let mut a0 = _mm256_setzero_si256();
-            let mut a1 = _mm256_setzero_si256();
-            let mut a2 = _mm256_setzero_si256();
-            let mut a3 = _mm256_setzero_si256();
-            let r0 = weights[j].as_ptr() as *const __m256i;
-            let r1 = weights[j + 1].as_ptr() as *const __m256i;
-            let r2 = weights[j + 2].as_ptr() as *const __m256i;
-            let r3 = weights[j + 3].as_ptr() as *const __m256i;
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut acc2 = _mm256_setzero_si256();
+        let mut acc3 = _mm256_setzero_si256();
 
-            let mut i = 0;
-            while i < HIDDEN_SIZE {
-                let x = _mm256_loadu_si256(input.as_ptr().add(i) as *const __m256i);
-                let p0 = _mm256_maddubs_epi16(x, _mm256_loadu_si256(r0.add(i / 32)));
-                let p1 = _mm256_maddubs_epi16(x, _mm256_loadu_si256(r1.add(i / 32)));
-                let p2 = _mm256_maddubs_epi16(x, _mm256_loadu_si256(r2.add(i / 32)));
-                let p3 = _mm256_maddubs_epi16(x, _mm256_loadu_si256(r3.add(i / 32)));
-                a0 = _mm256_dpwssd_epi32(a0, p0, ones);
-                a1 = _mm256_dpwssd_epi32(a1, p1, ones);
-                a2 = _mm256_dpwssd_epi32(a2, p2, ones);
-                a3 = _mm256_dpwssd_epi32(a3, p3, ones);
-                i += 32;
-            }
-
-            let ab = _mm256_hadd_epi32(a0, a1);
-            let cd = _mm256_hadd_epi32(a2, a3);
-            let merged = _mm256_hadd_epi32(ab, cd);
-            let sums = _mm_add_epi32(_mm256_castsi256_si128(merged), _mm256_extracti128_si256::<1>(merged));
-            let mut lanes = [0i32; 4];
-            _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, sums);
-
-            for (lane, sum) in lanes.iter().enumerate() {
-                let output = sum.wrapping_add(bias[j + lane]) >> L1_SHIFT;
-                let clamped = output.clamp(0, QUANT);
-                out[j + lane] = (clamped << QUANT_BITS) as i16;
-                out[L1_SIZE + j + lane] = (clamped * clamped) as i16;
-            }
-            j += 4;
+        macro_rules! block {
+            ($index:expr) => {{
+                let x = _mm256_set1_epi32(std::ptr::read_unaligned(input.as_ptr().add(($index) * 4) as *const i32));
+                let w = weights.as_ptr().add(($index) * L1_OUTPUT_BLOCKS) as *const __m256i;
+                acc0 = _mm256_dpwssd_epi32(acc0, _mm256_maddubs_epi16(x, _mm256_load_si256(w)), ones);
+                acc1 = _mm256_dpwssd_epi32(acc1, _mm256_maddubs_epi16(x, _mm256_load_si256(w.add(1))), ones);
+                acc2 = _mm256_dpwssd_epi32(acc2, _mm256_maddubs_epi16(x, _mm256_load_si256(w.add(2))), ones);
+                acc3 = _mm256_dpwssd_epi32(acc3, _mm256_maddubs_epi16(x, _mm256_load_si256(w.add(3))), ones);
+            }};
         }
+
+        let mut bits = nnz[0];
+        while bits != 0 {
+            let index = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            block!(index);
+        }
+        let mut bits = nnz[1];
+        while bits != 0 {
+            let index = 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            block!(index);
+        }
+
+        let zero = _mm256_setzero_si256();
+        let quant = _mm256_set1_epi32(QUANT);
+        macro_rules! finish {
+            ($acc:expr, $group:expr) => {{
+                let biased = _mm256_add_epi32($acc, _mm256_loadu_si256(bias.as_ptr().add(($group) * 8) as *const __m256i));
+                let shifted = _mm256_srai_epi32::<8>(biased);
+                let clamped = _mm256_min_epi32(_mm256_max_epi32(shifted, zero), quant);
+                let crelu = _mm256_slli_epi32::<6>(clamped);
+                let screlu = _mm256_mullo_epi32(clamped, clamped);
+                let crelu16 = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(crelu, zero));
+                let screlu16 = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(screlu, zero));
+                _mm_storeu_si128(out.as_mut_ptr().add(($group) * 8) as *mut __m128i, _mm256_castsi256_si128(crelu16));
+                _mm_storeu_si128(out.as_mut_ptr().add(L1_SIZE + ($group) * 8) as *mut __m128i, _mm256_castsi256_si128(screlu16));
+            }};
+        }
+        finish!(acc0, 0);
+        finish!(acc1, 1);
+        finish!(acc2, 2);
+        finish!(acc3, 3);
     }
 }
 
@@ -2777,7 +3592,7 @@ unsafe fn l1_forward_avx512(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &[i32;
 
             for (lane, acc) in [a0, a1, a2, a3, a4, a5, a6, a7].into_iter().enumerate() {
                 let output = _mm512_reduce_add_epi32(acc).wrapping_add(bias[j + lane]) >> L1_SHIFT;
-                let clamped = output.clamp(0, QUANT);
+                let clamped = output.max(0).min(QUANT);
                 out[j + lane] = (clamped << QUANT_BITS) as i16;
                 out[L1_SIZE + j + lane] = (clamped * clamped) as i16;
             }
@@ -2829,7 +3644,7 @@ unsafe fn l1_forward_avx512_vnni(weights: &[[i8; HIDDEN_SIZE]; L1_SIZE], bias: &
 
             for (lane, acc) in [a0, a1, a2, a3, a4, a5, a6, a7].into_iter().enumerate() {
                 let output = _mm512_reduce_add_epi32(acc).wrapping_add(bias[j + lane]) >> L1_SHIFT;
-                let clamped = output.clamp(0, QUANT);
+                let clamped = output.max(0).min(QUANT);
                 out[j + lane] = (clamped << QUANT_BITS) as i16;
                 out[L1_SIZE + j + lane] = (clamped * clamped) as i16;
             }
@@ -2867,11 +3682,8 @@ unsafe fn l2_forward_avx2(weights: &[[i16; L2_IN]; L2_SIZE], bias: &[i32; L2_SIZ
             let cd = _mm256_hadd_epi32(a2, a3);
             let merged = _mm256_hadd_epi32(ab, cd);
             let sums = _mm_add_epi32(_mm256_castsi256_si128(merged), _mm256_extracti128_si256::<1>(merged));
-            let mut lanes = [0i32; 4];
-            _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, sums);
-            for (lane, sum) in lanes.iter().enumerate() {
-                out[j + lane] = sum.wrapping_add(bias[j + lane]);
-            }
+            let bias4 = _mm_loadu_si128(bias.as_ptr().add(j) as *const __m128i);
+            _mm_storeu_si128(out.as_mut_ptr().add(j) as *mut __m128i, _mm_add_epi32(sums, bias4));
             j += 4;
         }
     }

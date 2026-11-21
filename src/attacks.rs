@@ -3,6 +3,20 @@ use crate::types::{Color, SQUARE_NB, Square};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
+// SliderEntry with direct pointers for fast access
+pub struct SliderEntry {
+    pub attacks: *const Bitboard,
+    pub mask: u64,
+    pub shift: u8,
+    pub magic: u64,
+    pub use_pext: bool,
+}
+
+// SAFETY: SliderEntry contains raw pointers to static data in Vec<Bitboard> that are never modified after initialization.
+// The data is effectively immutable after initialization, making it safe to share between threads.
+unsafe impl Sync for SliderEntry {}
+unsafe impl Send for SliderEntry {}
+
 pub struct Magic {
     pub mask: u64,
     pub magic: u64,
@@ -13,8 +27,8 @@ pub struct Magic {
 }
 
 pub struct SliderTables {
-    pub bishop_magics: [Magic; SQUARE_NB],
-    pub rook_magics: [Magic; SQUARE_NB],
+    pub bishop_entries: [SliderEntry; SQUARE_NB],
+    pub rook_entries: [SliderEntry; SQUARE_NB],
     pub slider_magic: Vec<Bitboard>,
     pub slider_pext: Vec<Bitboard>,
     // decided once at init to skip atomic load
@@ -160,24 +174,12 @@ pub fn king_attacks(sq: Square) -> Bitboard {
 
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occ: Bitboard) -> Bitboard {
-    let tables = slider_tables();
-    let m = &tables.bishop_magics[sq as usize];
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    if tables.use_pext {
-        return unsafe { *tables.slider_pext.get_unchecked(m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)) };
-    }
-    unsafe { *tables.slider_magic.get_unchecked(m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)) }
+    slider_tables().bishop_attacks(sq, occ)
 }
 
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occ: Bitboard) -> Bitboard {
-    let tables = slider_tables();
-    let m = &tables.rook_magics[sq as usize];
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    if tables.use_pext {
-        return unsafe { *tables.slider_pext.get_unchecked(m.pext_offset + crate::setwise::pext_index(occ.0, m.mask)) };
-    }
-    unsafe { *tables.slider_magic.get_unchecked(m.magic_offset + crate::setwise::magic_index(occ.0, m.mask, m.shift, m.magic)) }
+    slider_tables().rook_attacks(sq, occ)
 }
 
 #[inline(always)]
@@ -204,16 +206,56 @@ impl SliderTables {
         let bishop_magics = Self::init_slider(true, &mut slider_magic, &mut slider_pext, &mut prng);
         let rook_magics = Self::init_slider(false, &mut slider_magic, &mut slider_pext, &mut prng);
 
+        let make_entries = |magics: &[Magic; SQUARE_NB]| -> [SliderEntry; SQUARE_NB] {
+            std::array::from_fn(|sq| {
+                let m = &magics[sq];
+                let attacks = if use_pext {
+                    unsafe { slider_pext.as_ptr().add(m.pext_offset) }
+                } else {
+                    unsafe { slider_magic.as_ptr().add(m.magic_offset) }
+                };
+                SliderEntry {
+                    attacks,
+                    mask: m.mask,
+                    shift: m.shift,
+                    magic: m.magic,
+                    use_pext,
+                }
+            })
+        };
+
+        let bishop_entries = make_entries(&bishop_magics);
+        let rook_entries = make_entries(&rook_magics);
+
         Self {
-            bishop_magics,
-            rook_magics,
+            bishop_entries,
+            rook_entries,
             slider_magic,
             slider_pext,
             use_pext,
         }
     }
 
-    fn init_slider(is_bishop: bool, magic_table: &mut Vec<Bitboard>, pext_table: &mut Vec<Bitboard>, prng: &mut Prng) -> [Magic; SQUARE_NB] {
+    #[inline(always)]
+    pub fn bishop_attacks(&self, sq: Square, occ: Bitboard) -> Bitboard {
+        let entry = &self.bishop_entries[sq as usize];
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if entry.use_pext {
+            return unsafe { *entry.attacks.add(crate::setwise::pext_index(occ.0, entry.mask)) };
+        }
+        unsafe { *entry.attacks.add(crate::setwise::magic_index(occ.0, entry.mask, entry.shift, entry.magic)) }
+    }
+
+    #[inline(always)]
+    pub fn rook_attacks(&self, sq: Square, occ: Bitboard) -> Bitboard {
+        let entry = &self.rook_entries[sq as usize];
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if entry.use_pext {
+            return unsafe { *entry.attacks.add(crate::setwise::pext_index(occ.0, entry.mask)) };
+        }
+        unsafe { *entry.attacks.add(crate::setwise::magic_index(occ.0, entry.mask, entry.shift, entry.magic)) }
+    }
+fn init_slider(is_bishop: bool, magic_table: &mut Vec<Bitboard>, pext_table: &mut Vec<Bitboard>, prng: &mut Prng) -> [Magic; SQUARE_NB] {
         let mut magics = [const {
             Magic {
                 mask: 0,
@@ -250,8 +292,9 @@ impl SliderTables {
 
             magic_table.resize(magic_offset + size, Bitboard::EMPTY);
 
+            let mut magic = 0;
             loop {
-                let magic = prng.sparse();
+                magic = prng.sparse();
                 if ((mask.wrapping_mul(magic)) >> 56).count_ones() < 6 {
                     continue;
                 }

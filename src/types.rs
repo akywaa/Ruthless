@@ -392,6 +392,12 @@ impl MoveList {
     }
 
     #[inline(always)]
+    pub fn set(&mut self, index: usize, m: Move) {
+        debug_assert!(index < self.count);
+        self.moves[index].write(m);
+    }
+
+    #[inline(always)]
     pub fn as_slice(&self) -> &[Move] {
         // MaybeUninit<Move> has same layout as Move
         unsafe { std::slice::from_raw_parts(self.moves.as_ptr() as *const Move, self.count) }

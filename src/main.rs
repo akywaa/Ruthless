@@ -20,6 +20,7 @@ mod zobrist;
 
 fn main() {
     let _ = attacks::slider_tables();
+    nnue::warmup();
     std::panic::set_hook(Box::new(|info| {
         let bt = std::backtrace::Backtrace::force_capture();
         let mut path = std::env::current_exe().unwrap_or_default();

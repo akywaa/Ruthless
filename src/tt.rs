@@ -232,7 +232,9 @@ impl TranspositionTable {
         let idx = self.index(key);
         let cluster = &self.clusters[idx];
 
-        for entry in &cluster.entries {
+        // one pass: remember the first empty slot while looking for a match
+        let mut empty: Option<usize> = None;
+        for (i, entry) in cluster.entries.iter().enumerate() {
             let data = entry.data.load(Ordering::Relaxed);
             if entry.key.load(Ordering::Relaxed) ^ data == key {
                 let new = (data & !(0xFFFFu64 << 48)) | (((raw_eval as u16) as u64) << 48);
@@ -240,17 +242,17 @@ impl TranspositionTable {
                 entry.key.store(key ^ new, Ordering::Relaxed);
                 return;
             }
+            if empty.is_none() && bound_of(((data >> 16) & 0xFF) as u8) == TTFlag::None {
+                empty = Some(i);
+            }
         }
 
-        let Some(slot) = cluster
-            .entries
-            .iter()
-            .find(|e| bound_of(((e.data.load(Ordering::Relaxed) >> 16) & 0xFF) as u8) == TTFlag::None)
-        else {
+        let Some(i) = empty else {
             return;
         };
         let curr_gen = self.generation.load(Ordering::Relaxed) & 0x1F;
         let new = pack_data(0, raw_eval, 0, (curr_gen & 0x1F) << 3, 0);
+        let slot = &cluster.entries[i];
         slot.data.store(new, Ordering::Relaxed);
         slot.key.store(key ^ new, Ordering::Relaxed);
     }

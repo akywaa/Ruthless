@@ -240,17 +240,16 @@ impl ThreadPool {
         let clear_histories = self.clear_pending;
         self.clear_pending = false;
 
-        let params = SearchParams {
-            board: board.clone(),
-            depth,
-            soft_time: limits.soft_limit,
-            node_limit: limits.node_limit,
-            stop: Arc::clone(&self.stop_signal),
-            clear_histories,
-        };
-
         // arm helper counter before waking them up
         if self.num_threads > 1 {
+            let params = SearchParams {
+                board: board.clone(),
+                depth,
+                soft_time: limits.soft_limit,
+                node_limit: limits.node_limit,
+                stop: Arc::clone(&self.stop_signal),
+                clear_histories,
+            };
             self.active_helpers.store((self.num_threads - 1) as u64, Ordering::Release);
             let (lock, cvar) = &*self.shared_state;
             let mut state = lock.lock().unwrap();

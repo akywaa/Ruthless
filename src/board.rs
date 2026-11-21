@@ -1,7 +1,7 @@
 use crate::alloc::HugeBox;
-use crate::attacks::{between, bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::attacks::{between, king_attacks, knight_attacks, pawn_attacks};
 use crate::bitboard::Bitboard;
-use crate::nnue::{Accumulator, FeatureDelta, ThreatAccumulator, ThreatList};
+use crate::nnue::{Accumulator, FeatureBases, FeatureDelta, ThreatAccumulator};
 use crate::search::MAX_PLY;
 use crate::types::{COLOR_NB, Color, Move, MoveType, PIECE_NB, Piece, PieceType, SQUARE_NB, Square};
 use crate::zobrist::{castling_key, ep_key, fiftymove_key, piece_key, side_key};
@@ -33,6 +33,9 @@ pub struct UndoState {
 // stack size for per-ply frames. MAX_PLY + 4 for safety margin
 const FRAME_STACK_SIZE: usize = MAX_PLY + 4;
 
+// above this many pending incremental steps a full threat refresh is cheaper
+const THREAT_INCREMENTAL_LIMIT: usize = 8;
+
 // per-ply accumulator state for lazy evaluation
 #[repr(C, align(64))]
 #[derive(Clone)]
@@ -41,15 +44,16 @@ struct AccumulatorFrame {
     pub delta: FeatureDelta,
     pub dirty: [bool; 2],
     pub refresh: [bool; 2],
-    pub ksq: [Square; 2],
+    // cached king bucket and mirror for both perspectives
+    pub bases: FeatureBases,
 }
 // per-ply threat state: accumulators, lists, and mirror state for one ply
 #[repr(C, align(64))]
 #[derive(Clone)]
 struct ThreatFrame {
     pub threat: ThreatAccumulator,
-    // index of frame with actual threat data
-    pub threat_base: usize,
+    // index of the frame holding the actual threat data, per perspective
+    pub threat_base: [usize; 2],
     pub threat_king_mirrored: [bool; 2],
     pub dirty: bool,
     pub last_move: Move,
@@ -184,6 +188,8 @@ impl Board {
         self.acc_depth = 0;
         self.acc_frames[0].dirty = [true, true];
         self.acc_frames[0].refresh = [false, false];
+        self.acc_frames[0].bases =
+            FeatureBases::from_kings(self.king_square(Color::White), self.king_square(Color::Black));
         self.threat_frames[0].dirty = true;
     }
 
@@ -207,34 +213,31 @@ impl Board {
         let pieces = self.pieces;
         let d = self.acc_depth;
 
-        let w_bucket = crate::nnue::king_bucket_view(w_ksq, Color::White);
-        let w_mirrored = crate::nnue::is_mirrored_view(w_ksq, Color::White);
-        let b_bucket = crate::nnue::king_bucket_view(b_ksq, Color::Black);
-        let b_mirrored = crate::nnue::is_mirrored_view(b_ksq, Color::Black);
+        let bases = FeatureBases::from_kings(w_ksq, b_ksq);
 
         crate::nnue::refresh_side_with_finny(
-            &mut self.finny[0][w_bucket][w_mirrored as usize],
+            &mut self.finny[0][bases.bucket(0)][bases.mirrored(0) as usize],
             &pieces,
-            w_ksq,
-            Color::White,
+            &bases,
+            0,
             &mut self.acc_frames[d].accumulator.vals[0],
         );
         crate::nnue::refresh_side_with_finny(
-            &mut self.finny[1][b_bucket][b_mirrored as usize],
+            &mut self.finny[1][bases.bucket(1)][bases.mirrored(1) as usize],
             &pieces,
-            b_ksq,
-            Color::Black,
+            &bases,
+            1,
             &mut self.acc_frames[d].accumulator.vals[1],
         );
 
         let frame = self.acc_frame();
         frame.dirty = [false, false];
         frame.refresh = [false, false];
-        frame.ksq = [w_ksq, b_ksq];
+        frame.bases = bases;
 
         let threat_frame = self.threat_frame();
         threat_frame.threat = ThreatAccumulator::new();
-        threat_frame.threat_base = d;
+        threat_frame.threat_base = [d, d];
         threat_frame.dirty = true;
         threat_frame.threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
         threat_frame.last_move = Move::NULL;
@@ -260,16 +263,18 @@ impl Board {
             }
 
             if self.acc_frames[anc].dirty[side] {
-                let color = Color::from_index(side);
-                let ksq = self.king_square(color);
-                let bucket = crate::nnue::king_bucket_view(ksq, color);
-                let mirrored = crate::nnue::is_mirrored_view(ksq, color);
+                // rebuild from the board's king squares; the cached bases may be
+                // stale after a stack reset
+                let bases = FeatureBases::from_kings(self.king_square(Color::White), self.king_square(Color::Black));
+                self.acc_frames[d].bases = bases;
+                let bucket = bases.bucket(side);
+                let mirrored = bases.mirrored(side);
                 let pieces = self.pieces;
                 crate::nnue::refresh_side_with_finny(
                     &mut self.finny[side][bucket][mirrored as usize],
                     &pieces,
-                    ksq,
-                    color,
+                    &bases,
+                    side,
                     &mut self.acc_frames[d].accumulator.vals[side],
                 );
                 self.acc_frames[d].dirty[side] = false;
@@ -294,7 +299,7 @@ impl Board {
             let d = self.acc_depth;
             let frame = self.threat_frame();
             frame.threat = ThreatAccumulator::new();
-            frame.threat_base = d;
+            frame.threat_base = [d, d];
             frame.dirty = false;
             frame.threat_king_mirrored = threat_king_mirrored;
             frame.last_move = Move::NULL;
@@ -306,7 +311,9 @@ impl Board {
             let w_ksq = self.king_square(Color::White);
             let b_ksq = self.king_square(Color::Black);
             let threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
+            let d = self.acc_depth;
             let frame = self.threat_frame();
+            frame.threat_base = [d, d];
             frame.dirty = false;
             frame.threat_king_mirrored = threat_king_mirrored;
             frame.last_move = Move::NULL;
@@ -315,17 +322,18 @@ impl Board {
         };
 
         // collect threat lists for both sides before mutably borrowing the frame
-        let mut lists = [ThreatList::new(), ThreatList::new()];
+        let mut lists_buf = std::mem::MaybeUninit::<[crate::nnue::ThreatList; 2]>::uninit();
+        let mut lists = crate::nnue::ThreatList::init_pair(&mut lists_buf);
         let mut mirrored = [false; 2];
         for side in 0..2 {
             let ksq = self.king_square(Color::from_index(side));
             mirrored[side] = ksq.file() >= 4;
         }
-        crate::nnue::collect_threats_both_unsorted(self, [true, true], &mut lists);
+        crate::nnue::collect_threats_both_unsorted(self, [true, true], lists);
 
         let d = self.acc_depth;
         let frame = self.threat_frame();
-        frame.threat_base = d;
+        frame.threat_base = [d, d];
 
         for side in 0..2 {
             frame.threat.refresh_side(side, &lists[side], weights);
@@ -338,14 +346,19 @@ impl Board {
 
     #[inline(always)]
     fn update_threat_frame_step(&mut self, src_idx: usize, dst_idx: usize, m: Move, captured: Piece, weights: &crate::nnue::ThreatWeights) {
-        self.threat_frames[dst_idx].threat_base = dst_idx;
         let src_base = self.threat_frames[src_idx].threat_base;
         let mirrored = [self.king_square(Color::White).file() >= 4, self.king_square(Color::Black).file() >= 4];
         let prev_mirrored = self.threat_frames[src_idx].threat_king_mirrored;
         let need_inc = [mirrored[0] == prev_mirrored[0], mirrored[1] == prev_mirrored[1]];
 
-        let mut subs = [ThreatList::new(), ThreatList::new()];
-        let mut adds = [ThreatList::new(), ThreatList::new()];
+        let mut subs_buf = std::mem::MaybeUninit::<[crate::nnue::ThreatList; 2]>::uninit();
+        let mut adds_buf = std::mem::MaybeUninit::<[crate::nnue::ThreatList; 2]>::uninit();
+        let mut subs = crate::nnue::ThreatList::init_pair(&mut subs_buf);
+        let mut adds = crate::nnue::ThreatList::init_pair(&mut adds_buf);
+
+        // For quiet normal moves (no capture, no promotion, no en passant, no castling),
+        // the piece types on the board don't change, so we can skip refresh_pieces.
+        let is_quiet_normal = captured == Piece::None && m.move_type() == MoveType::Normal;
 
         if need_inc[0] || need_inc[1] {
             let changed = self.move_changed_squares(m);
@@ -353,33 +366,100 @@ impl Board {
             let occ_before = self.occupancy_before(m, captured);
 
             let mut scan = crate::nnue::SharedThreatScan::new(self);
-            crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, &mut adds);
-            crate::nnue::collect_xray_threat_diffs_both(self, &scan, changed, occ_before, occ_after, need_inc, &mut subs, &mut adds);
+            crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, adds);
+            crate::nnue::collect_xray_threat_diffs_both(self, &scan, changed, occ_before, occ_after, need_inc, subs, adds);
             self.toggle_pieces_backward(m, captured);
-            scan.refresh_pieces(self);
-            crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, &mut subs);
+            // Skip refresh_pieces for quiet normal moves - piece types unchanged
+            if !is_quiet_normal {
+                scan.refresh_pieces(self);
+            }
+            crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, subs);
             self.toggle_pieces_forward(m, captured);
         }
 
-        // Fast path: if both sides need no incremental update, just copy base and mirrored
-        if need_inc[0] && need_inc[1] && subs[0].is_empty() && adds[0].is_empty() && subs[1].is_empty() && adds[1].is_empty() {
-            self.threat_frames[dst_idx].threat_base = src_base;
-            self.threat_frames[dst_idx].threat_king_mirrored = mirrored;
-            self.threat_frames[dst_idx].dirty = false;
-            return;
-        }
-
-        // prefetch removed for benchmark
+        // Each perspective is updated independently: a side with an empty delta
+        // simply inherits the source base instead of copying and rewriting 1 KB.
         for side in 0..2 {
             if need_inc[side] {
-                let (left, right) = self.threat_frames.split_at_mut(dst_idx);
-                right[0]
-                    .threat
-                    .apply_lists_from(&left[src_base].threat, side, weights, subs[side].as_slice(), adds[side].as_slice());
+                if subs[side].is_empty() && adds[side].is_empty() {
+                    self.threat_frames[dst_idx].threat_base[side] = src_base[side];
+                } else {
+                    let (left, right) = self.threat_frames.split_at_mut(dst_idx);
+                    right[0]
+                        .threat
+                        .apply_lists_from(&left[src_base[side]].threat, side, weights, subs[side].as_slice(), adds[side].as_slice());
+                    right[0].threat_base[side] = dst_idx;
+                }
             } else {
-                let mut full = ThreatList::new();
-                crate::nnue::collect_threats(self, Color::from_index(side), &mut full);
-                self.threat_frames[dst_idx].threat.refresh_side(side, &full, weights);
+                let mut full_buf = std::mem::MaybeUninit::<crate::nnue::ThreatList>::uninit();
+                let full = crate::nnue::ThreatList::init_one(&mut full_buf);
+                crate::nnue::collect_threats(self, Color::from_index(side), full);
+                let frame = &mut self.threat_frames[dst_idx];
+                frame.threat.refresh_side(side, full, weights);
+                frame.threat_base[side] = dst_idx;
+            }
+            self.threat_frames[dst_idx].threat_king_mirrored[side] = mirrored[side];
+        }
+        self.threat_frames[dst_idx].dirty = false;
+    }
+
+    // Version assuming board is at position BEFORE the move.
+    // Collects subs (threats lost), toggles forward, collects adds+xrays (threats gained).
+    #[inline(always)]
+    fn update_threat_frame_step_pre(&mut self, src_idx: usize, dst_idx: usize, m: Move, captured: Piece, weights: &crate::nnue::ThreatWeights) {
+        let src_base = self.threat_frames[src_idx].threat_base;
+        let mirrored = [self.king_square(Color::White).file() >= 4, self.king_square(Color::Black).file() >= 4];
+        let prev_mirrored = self.threat_frames[src_idx].threat_king_mirrored;
+        let need_inc = [mirrored[0] == prev_mirrored[0], mirrored[1] == prev_mirrored[1]];
+
+        let mut subs_buf = std::mem::MaybeUninit::<[crate::nnue::ThreatList; 2]>::uninit();
+        let mut adds_buf = std::mem::MaybeUninit::<[crate::nnue::ThreatList; 2]>::uninit();
+        let mut subs = crate::nnue::ThreatList::init_pair(&mut subs_buf);
+        let mut adds = crate::nnue::ThreatList::init_pair(&mut adds_buf);
+
+        let is_quiet_normal = captured == Piece::None && m.move_type() == MoveType::Normal;
+
+        if need_inc[0] || need_inc[1] {
+            let changed = self.move_changed_squares(m);
+            let occ_after = self.occupancy_before(m, captured); // after = current position (before move)
+            let occ_before = self.occupied; // before = current position (after move applied)
+
+            let mut scan = crate::nnue::SharedThreatScan::new(self);
+            // Collect subs at position BEFORE the move (threats that will be lost)
+            crate::nnue::collect_xray_threat_diffs_both(self, &scan, changed, occ_after, occ_before, need_inc, subs, adds);
+            crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, subs);
+
+            // Toggle forward to apply the move
+            self.toggle_pieces_forward(m, captured);
+
+            // Skip refresh_pieces for quiet normal moves
+            if !is_quiet_normal {
+                scan.refresh_pieces(self);
+            }
+
+            // Collect adds+xrays at position AFTER the move
+            crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, adds);
+            crate::nnue::collect_xray_threat_diffs_both(self, &scan, changed, occ_before, occ_after, need_inc, subs, adds);
+        }
+
+        for side in 0..2 {
+            if need_inc[side] {
+                if subs[side].is_empty() && adds[side].is_empty() {
+                    self.threat_frames[dst_idx].threat_base[side] = src_base[side];
+                } else {
+                    let (left, right) = self.threat_frames.split_at_mut(dst_idx);
+                    right[0]
+                        .threat
+                        .apply_lists_from(&left[src_base[side]].threat, side, weights, subs[side].as_slice(), adds[side].as_slice());
+                    right[0].threat_base[side] = dst_idx;
+                }
+            } else {
+                let mut full_buf = std::mem::MaybeUninit::<crate::nnue::ThreatList>::uninit();
+                let full = crate::nnue::ThreatList::init_one(&mut full_buf);
+                crate::nnue::collect_threats(self, Color::from_index(side), full);
+                let frame = &mut self.threat_frames[dst_idx];
+                frame.threat.refresh_side(side, full, weights);
+                frame.threat_base[side] = dst_idx;
             }
             self.threat_frames[dst_idx].threat_king_mirrored[side] = mirrored[side];
         }
@@ -398,7 +478,7 @@ impl Board {
             let b_ksq = self.king_square(Color::Black);
             let frame = &mut self.threat_frames[d];
             frame.threat = ThreatAccumulator::new();
-            frame.threat_base = d;
+            frame.threat_base = [d, d];
             frame.dirty = false;
             frame.threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
             return;
@@ -407,7 +487,7 @@ impl Board {
             let w_ksq = self.king_square(Color::White);
             let b_ksq = self.king_square(Color::Black);
             let frame = &mut self.threat_frames[d];
-            frame.threat_base = d;
+            frame.threat_base = [d, d];
             frame.dirty = false;
             frame.threat_king_mirrored = [w_ksq.file() >= 4, b_ksq.file() >= 4];
             return;
@@ -422,7 +502,7 @@ impl Board {
             anc -= 1;
         }
 
-        if self.threat_frames[anc].dirty || non_null_count >= 6 {
+        if self.threat_frames[anc].dirty || non_null_count >= THREAT_INCREMENTAL_LIMIT {
             self.refresh_threats();
             return;
         }
@@ -444,6 +524,7 @@ impl Board {
             return;
         }
 
+        // Roll back all moves from d down to anc+1
         for k in ((anc + 1)..=d).rev() {
             let m = self.threat_frames[k].last_move;
             if m != Move::NULL {
@@ -452,6 +533,9 @@ impl Board {
             }
         }
 
+        // Now board is at position after anc. For each move from anc+1 to d:
+        // - We're at position BEFORE move k
+        // - Call update_threat_frame_step_pre (collects subs, toggles forward, collects adds)
         for k in (anc + 1)..=d {
             let m = self.threat_frames[k].last_move;
             if m == Move::NULL {
@@ -461,28 +545,17 @@ impl Board {
                 right[0].dirty = false;
             } else {
                 let cap = self.threat_frames[k].last_captured;
-                self.toggle_pieces_forward(m, cap);
-                self.update_threat_frame_step(k - 1, k, m, cap, weights);
+                self.update_threat_frame_step_pre(k - 1, k, m, cap, weights);
             }
         }
     }
 
-    // returns the current threat accumulator for the current ply
+    // returns one perspective of the current threat accumulator
     #[inline(always)]
-#[allow(dead_code)]
-    pub fn threat(&mut self) -> &mut ThreatAccumulator {
-        self.ensure_threats_ready();
+    pub fn threat_side_immut(&self, side: usize) -> &[i16; crate::nnue::HIDDEN_SIZE] {
         let d = self.acc_depth;
-        let base = self.threat_frames[d].threat_base;
-        &mut self.threat_frames[base].threat
-    }
-
-    // returns the current threat accumulator for the current ply (immutable)
-    #[inline(always)]
-    pub fn threat_immut(&self) -> &ThreatAccumulator {
-        let d = self.acc_depth;
-        let base = self.threat_frames[d].threat_base;
-        &self.threat_frames[base].threat
+        let base = self.threat_frames[d].threat_base[side];
+        &self.threat_frames[base].threat.vals[side]
     }
 
     // squares changed by move
@@ -854,12 +927,13 @@ impl Board {
         }
 
         let opp_bishops_queens = self.pieces[Piece::new(by_color, PieceType::Bishop)] | self.pieces[Piece::new(by_color, PieceType::Queen)];
-        if !(bishop_attacks(sq, self.occupied) & opp_bishops_queens).is_empty() {
+        let tables = crate::attacks::slider_tables();
+        if !(tables.bishop_attacks(sq, self.occupied) & opp_bishops_queens).is_empty() {
             return true;
         }
 
         let opp_rooks_queens = self.pieces[Piece::new(by_color, PieceType::Rook)] | self.pieces[Piece::new(by_color, PieceType::Queen)];
-        if !(rook_attacks(sq, self.occupied) & opp_rooks_queens).is_empty() {
+        if !(tables.rook_attacks(sq, self.occupied) & opp_rooks_queens).is_empty() {
             return true;
         }
 
@@ -882,10 +956,11 @@ impl Board {
         let bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
         let rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
         let king = self.pieces[Piece::new(them, PieceType::King)];
+        let tables = crate::attacks::slider_tables();
         (pawn_attacks(self.side_to_move, ksq) & pawns)
             | (knight_attacks(ksq) & knights)
-            | (bishop_attacks(ksq, self.occupied) & bishops_queens)
-            | (rook_attacks(ksq, self.occupied) & rooks_queens)
+            | (tables.bishop_attacks(ksq, self.occupied) & bishops_queens)
+            | (tables.rook_attacks(ksq, self.occupied) & rooks_queens)
             | (king_attacks(ksq) & king)
     }
 
@@ -894,7 +969,8 @@ impl Board {
         let them = !color;
         let bq = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
         let rq = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
-        let mut sliders = (bishop_attacks(ksq, Bitboard::EMPTY) & bq) | (rook_attacks(ksq, Bitboard::EMPTY) & rq);
+        let tables = crate::attacks::slider_tables();
+        let mut sliders = (tables.bishop_attacks(ksq, Bitboard::EMPTY) & bq) | (tables.rook_attacks(ksq, Bitboard::EMPTY) & rq);
         let mut pinned = Bitboard::EMPTY;
         while !sliders.is_empty() {
             let sq = sliders.pop_lsb();
@@ -958,9 +1034,18 @@ impl Board {
                         }
                     }
                     PieceType::Knight => knight_attacks(from).contains(to),
-                    PieceType::Bishop => bishop_attacks(from, self.occupied).contains(to),
-                    PieceType::Rook => rook_attacks(from, self.occupied).contains(to),
-                    PieceType::Queen => (bishop_attacks(from, self.occupied) | rook_attacks(from, self.occupied)).contains(to),
+                    PieceType::Bishop => {
+                        let tables = crate::attacks::slider_tables();
+                        tables.bishop_attacks(from, self.occupied).contains(to)
+                    }
+                    PieceType::Rook => {
+                        let tables = crate::attacks::slider_tables();
+                        tables.rook_attacks(from, self.occupied).contains(to)
+                    }
+                    PieceType::Queen => {
+                        let tables = crate::attacks::slider_tables();
+                        (tables.bishop_attacks(from, self.occupied) | tables.rook_attacks(from, self.occupied)).contains(to)
+                    }
                     PieceType::King => king_attacks(from).contains(to),
                     PieceType::None => false,
                 }
@@ -1045,7 +1130,8 @@ impl Board {
                 _ => return false,
             };
             let rook_occ = (occ ^ Bitboard::from_square(rook_from)) | Bitboard::from_square(rook_to);
-            return rook_attacks(rook_to, rook_occ).contains(ksq);
+            let tables = crate::attacks::slider_tables();
+            return tables.rook_attacks(rook_to, rook_occ).contains(ksq);
         }
 
         let pt = if m.move_type() == MoveType::Promotion {
@@ -1056,9 +1142,18 @@ impl Board {
 
         match pt {
             PieceType::Knight => knight_attacks(to).contains(ksq),
-            PieceType::Bishop => bishop_attacks(to, occ).contains(ksq),
-            PieceType::Rook => rook_attacks(to, occ).contains(ksq),
-            PieceType::Queen => (bishop_attacks(to, occ) | rook_attacks(to, occ)).contains(ksq),
+            PieceType::Bishop => {
+                let tables = crate::attacks::slider_tables();
+                tables.bishop_attacks(to, occ).contains(ksq)
+            }
+            PieceType::Rook => {
+                let tables = crate::attacks::slider_tables();
+                tables.rook_attacks(to, occ).contains(ksq)
+            }
+            PieceType::Queen => {
+                let tables = crate::attacks::slider_tables();
+                (tables.bishop_attacks(to, occ) | tables.rook_attacks(to, occ)).contains(ksq)
+            }
             PieceType::Pawn => pawn_attacks(us, to).contains(ksq),
             _ => false,
         }
@@ -1069,8 +1164,9 @@ impl Board {
     pub fn check_squares(&self) -> [Bitboard; 6] {
         let us = self.side_to_move;
         let ksq = self.king_square(!us);
-        let bishop = bishop_attacks(ksq, self.occupied);
-        let rook = rook_attacks(ksq, self.occupied);
+        let tables = crate::attacks::slider_tables();
+        let bishop = tables.bishop_attacks(ksq, self.occupied);
+        let rook = tables.rook_attacks(ksq, self.occupied);
 
         let mut squares = [Bitboard::EMPTY; 6];
         squares[PieceType::Pawn as usize] = pawn_attacks(!us, ksq);
@@ -1136,8 +1232,11 @@ impl Board {
             let opp_king = self.pieces[Piece::new(them, PieceType::King)];
             return (pawn_attacks(us, to) & opp_pawns).is_empty()
                 && (knight_attacks(to) & opp_knights).is_empty()
-                && (bishop_attacks(to, occ) & opp_bishops_queens).is_empty()
-                && (rook_attacks(to, occ) & opp_rooks_queens).is_empty()
+                && {
+                    let tables = crate::attacks::slider_tables();
+                    (tables.bishop_attacks(to, occ) & opp_bishops_queens).is_empty()
+                        && (tables.rook_attacks(to, occ) & opp_rooks_queens).is_empty()
+                }
                 && (king_attacks(to) & opp_king).is_empty();
         }
 
@@ -1155,7 +1254,10 @@ impl Board {
             let opp_bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
             let opp_rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
 
-            return (bishop_attacks(ksq, occ) & opp_bishops_queens).is_empty() && (rook_attacks(ksq, occ) & opp_rooks_queens).is_empty();
+            return {
+                let tables = crate::attacks::slider_tables();
+                (tables.bishop_attacks(ksq, occ) & opp_bishops_queens).is_empty() && (tables.rook_attacks(ksq, occ) & opp_rooks_queens).is_empty()
+            };
         }
 
         if pinned.contains(from) {
@@ -1240,9 +1342,10 @@ impl Board {
         let them = !us;
         let ksq = self.king_square(them);
         let mut candidates = Bitboard::EMPTY;
+        let tables = crate::attacks::slider_tables();
 
-        let mut snipers = (bishop_attacks(ksq, Bitboard::EMPTY) & (self.pieces[Piece::new(us, PieceType::Bishop)] | self.pieces[Piece::new(us, PieceType::Queen)]))
-            | (rook_attacks(ksq, Bitboard::EMPTY) & (self.pieces[Piece::new(us, PieceType::Rook)] | self.pieces[Piece::new(us, PieceType::Queen)]));
+        let mut snipers = (tables.bishop_attacks(ksq, Bitboard::EMPTY) & (self.pieces[Piece::new(us, PieceType::Bishop)] | self.pieces[Piece::new(us, PieceType::Queen)]))
+            | (tables.rook_attacks(ksq, Bitboard::EMPTY) & (self.pieces[Piece::new(us, PieceType::Rook)] | self.pieces[Piece::new(us, PieceType::Queen)]));
 
         while !snipers.is_empty() {
             let sniper = snipers.pop_lsb();
@@ -1276,14 +1379,15 @@ impl Board {
         }
 
         let occ = self.occupied;
+        let tables = crate::attacks::slider_tables();
         let mut bishops_queens = self.pieces[Piece::new(them, PieceType::Bishop)] | self.pieces[Piece::new(them, PieceType::Queen)];
         while !bishops_queens.is_empty() {
-            threats |= bishop_attacks(bishops_queens.pop_lsb(), occ);
+            threats |= tables.bishop_attacks(bishops_queens.pop_lsb(), occ);
         }
 
         let mut rooks_queens = self.pieces[Piece::new(them, PieceType::Rook)] | self.pieces[Piece::new(them, PieceType::Queen)];
         while !rooks_queens.is_empty() {
-            threats |= rook_attacks(rooks_queens.pop_lsb(), occ);
+            threats |= tables.rook_attacks(rooks_queens.pop_lsb(), occ);
         }
 
         let ksq = self.king_square(them);
@@ -1394,18 +1498,18 @@ impl Board {
 
         // write metadata to next ply frames (no clone needed)
         let next_d = self.acc_depth + 1;
-        let cur_ksq = self.acc_frames[self.acc_depth].ksq;
+        let cur_bases = self.acc_frames[self.acc_depth].bases;
         {
             let af = &mut self.acc_frames[next_d];
             af.delta = FeatureDelta::new();
             af.dirty = [true, true];
             af.refresh = [false, false];
-            af.ksq = cur_ksq;
+            af.bases = cur_bases;
         }
         {
             let tf = &mut self.threat_frames[next_d];
             tf.dirty = true;
-            tf.threat_base = next_d;
+            tf.threat_base = [next_d, next_d];
             tf.last_move = Move::NULL;
             tf.last_captured = Piece::None;
         }
@@ -1445,8 +1549,6 @@ impl Board {
         let them = !us;
         let moving_piece = self.piece_on[from];
         let is_king_move = moving_piece.piece_type() == PieceType::King;
-        let w_ksq = self.king_square(Color::White);
-        let b_ksq = self.king_square(Color::Black);
 
         let undo = UndoState {
             castling_rights: self.castling_rights,
@@ -1460,18 +1562,16 @@ impl Board {
 
         // write metadata to next ply frames (no clone needed)
         let next_d = self.acc_depth + 1;
-        // use current king squares as initial values, will be updated after king move check
-        let cur_ksq = self.acc_frames[self.acc_depth].ksq;
+        let mut bases = self.acc_frames[self.acc_depth].bases;
         {
             let af = &mut self.acc_frames[next_d];
             af.dirty = [true, true];
             af.refresh = [false, false];
-            af.ksq = cur_ksq;
         }
         {
             let tf = &mut self.threat_frames[next_d];
             tf.dirty = true;
-            tf.threat_base = next_d;
+            tf.threat_base = [next_d, next_d];
             tf.last_move = m;
             tf.last_captured = undo.captured;
         }
@@ -1490,35 +1590,31 @@ impl Board {
         self.remove_piece(from);
 
         // refresh on castling or king bucket/mirror cross
-        let refresh_us = is_king_move && (move_type == MoveType::Castling || crate::nnue::needs_accumulator_refresh(from, to, us));
+        let mut refresh_us = false;
+        if is_king_move {
+            let old = bases;
+            bases.set_king(to, us as usize);
+            refresh_us = move_type == MoveType::Castling || bases != old;
+        }
 
-        let (acc_w_ksq, acc_b_ksq) = if is_king_move {
-            match us {
-                Color::White => (to, b_ksq),
-                Color::Black => (w_ksq, to),
-            }
-        } else {
-            (w_ksq, b_ksq)
-        };
-
-        // update the accumulator frame with correct king squares and refresh flag
-        self.acc_frames[next_d].ksq = [acc_w_ksq, acc_b_ksq];
+        // update the accumulator frame with the new king bases and refresh flag
+        self.acc_frames[next_d].bases = bases;
         self.acc_frames[next_d].refresh[us as usize] = refresh_us;
 
         // skip our side if doing full refresh
         let skip = if refresh_us { Some(us) } else { None };
         let mut delta = FeatureDelta::new();
 
-        delta.sub(moving_piece, from, acc_w_ksq, acc_b_ksq, skip);
+        delta.sub(moving_piece, from, &bases, skip);
         if move_type != MoveType::Promotion {
-            delta.add(moving_piece, to, acc_w_ksq, acc_b_ksq, skip);
+            delta.add(moving_piece, to, &bases, skip);
         }
 
         match move_type {
             MoveType::Normal => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
-                    delta.sub(undo.captured, to, acc_w_ksq, acc_b_ksq, skip);
+                    delta.sub(undo.captured, to, &bases, skip);
                 }
                 self.put_piece(moving_piece, to);
 
@@ -1538,24 +1634,24 @@ impl Board {
                 let rook = self.remove_piece(rook_from);
                 self.put_piece(rook, rook_to);
 
-                delta.sub(rook, rook_from, acc_w_ksq, acc_b_ksq, skip);
-                delta.add(rook, rook_to, acc_w_ksq, acc_b_ksq, skip);
+                delta.sub(rook, rook_from, &bases, skip);
+                delta.add(rook, rook_to, &bases, skip);
             }
             MoveType::EnPassant => {
                 let cap_sq = Square::from_coords(to.file(), from.rank());
                 let cap_pawn = self.remove_piece(cap_sq);
-                delta.sub(cap_pawn, cap_sq, acc_w_ksq, acc_b_ksq, skip);
+                delta.sub(cap_pawn, cap_sq, &bases, skip);
 
                 self.put_piece(moving_piece, to);
             }
             MoveType::Promotion => {
                 if undo.captured != Piece::None {
                     self.remove_piece(to);
-                    delta.sub(undo.captured, to, acc_w_ksq, acc_b_ksq, skip);
+                    delta.sub(undo.captured, to, &bases, skip);
                 }
                 let promo_piece = Piece::new(us, m.promo_type());
                 self.put_piece(promo_piece, to);
-                delta.add(promo_piece, to, acc_w_ksq, acc_b_ksq, skip);
+                delta.add(promo_piece, to, &bases, skip);
             }
         }
 
@@ -1832,11 +1928,13 @@ mod tests {
     fn assert_threat_state(board: &mut Board, weights: &crate::nnue::ThreatWeights, ply: usize, stage: &str) {
         let mut fresh = crate::nnue::ThreatAccumulator::new();
         for side in 0..2 {
-            let mut list = ThreatList::new();
+            let mut list = crate::nnue::ThreatList::new();
             crate::nnue::collect_threats(board, Color::from_index(side), &mut list);
             fresh.refresh_side(side, &list, weights);
         }
-        assert_eq!(fresh.vals, board.threat().vals, "{stage}: threat accumulator at ply {ply}");
+        for side in 0..2 {
+            assert_eq!(fresh.vals[side], *board.threat_side_immut(side), "{stage}: threat accumulator at ply {ply}, side {side}");
+        }
     }
 
     #[test]

@@ -408,7 +408,11 @@ impl Board {
     #[inline(always)]
     fn update_threat_frame_step_pre(&mut self, src_idx: usize, dst_idx: usize, m: Move, captured: Piece, weights: &crate::nnue::ThreatWeights) {
         let src_base = self.threat_frames[src_idx].threat_base;
-        let mirrored = [self.king_square(Color::White).file() >= 4, self.king_square(Color::Black).file() >= 4];
+        let moving_piece = self.piece_on[m.from()];
+        let mut mirrored = [self.king_square(Color::White).file() >= 4, self.king_square(Color::Black).file() >= 4];
+        if moving_piece.piece_type() == PieceType::King {
+            mirrored[moving_piece.color() as usize] = m.to().file() >= 4;
+        }
         let prev_mirrored = self.threat_frames[src_idx].threat_king_mirrored;
         let need_inc = [mirrored[0] == prev_mirrored[0], mirrored[1] == prev_mirrored[1]];
 
@@ -421,25 +425,22 @@ impl Board {
 
         if need_inc[0] || need_inc[1] {
             let changed = self.move_changed_squares(m);
-            let occ_after = self.occupancy_before(m, captured); // after = current position (before move)
-            let occ_before = self.occupied; // before = current position (after move applied)
+            let occ_before = self.occupied;
 
             let mut scan = crate::nnue::SharedThreatScan::new(self);
-            // Collect subs at position BEFORE the move (threats that will be lost)
-            crate::nnue::collect_xray_threat_diffs_both(self, &scan, changed, occ_after, occ_before, need_inc, subs, adds);
             crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, subs);
 
-            // Toggle forward to apply the move
             self.toggle_pieces_forward(m, captured);
 
-            // Skip refresh_pieces for quiet normal moves
             if !is_quiet_normal {
                 scan.refresh_pieces(self);
             }
 
-            // Collect adds+xrays at position AFTER the move
             crate::nnue::append_changed_square_threats_both(self, &scan, changed, need_inc, adds);
+            let occ_after = self.occupied;
             crate::nnue::collect_xray_threat_diffs_both(self, &scan, changed, occ_before, occ_after, need_inc, subs, adds);
+        } else {
+            self.toggle_pieces_forward(m, captured);
         }
 
         for side in 0..2 {
@@ -2073,6 +2074,26 @@ mod tests {
                 board.reset_accumulator_stack();
             }
         }
+    }
+
+    #[test]
+    fn threat_accumulator_deferred_king_mirror_cross() {
+        let synthetic;
+        let weights: &crate::nnue::ThreatWeights = match crate::nnue::threat_weights() {
+            Some(weights) => weights,
+            None => {
+                synthetic = crate::nnue::ThreatWeights::random(0xBEEF_CAFE);
+                &synthetic
+            }
+        };
+
+        let mut board = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+        board.refresh_threats();
+
+        play(&mut board, "e1c1");
+        play(&mut board, "a6b5");
+        board.ensure_threats_ready();
+        assert_threat_state(&mut board, weights, 2, "deferred kiwipete castle");
     }
 
     #[test]

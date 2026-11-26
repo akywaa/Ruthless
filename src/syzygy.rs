@@ -10,7 +10,7 @@ use std::ffi::CString;
 unsafe extern "C" {
     pub static mut TB_LARGEST: u32;
     pub fn tb_init(path: *const std::ffi::c_char) -> bool;
-    pub fn tb_probe_wdl(
+    pub fn tb_probe_wdl_wrapper(
         white: u64,
         black: u64,
         kings: u64,
@@ -72,7 +72,7 @@ pub fn probe_wdl(board: &Board) -> Option<i32> {
         let turn = if board.side_to_move == Color::White { 1 } else { 0 };
 
         let wdl = unsafe {
-            tb_probe_wdl(
+            tb_probe_wdl_wrapper(
                 white,
                 black,
                 kings,

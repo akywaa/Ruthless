@@ -53,6 +53,7 @@ pub struct MovePicker {
     pub last_hist: i32,
     pub last_has_hist: bool,
     delta_threshold: i32,
+    skip_quiets: bool,
 }
 
 impl MovePicker {
@@ -83,6 +84,7 @@ impl MovePicker {
             last_hist: 0,
             last_has_hist: false,
             delta_threshold: i32::MIN,
+            skip_quiets: false,
         }
     }
 
@@ -117,6 +119,7 @@ impl MovePicker {
             std::ptr::addr_of_mut!((*p).last_hist).write(0);
             std::ptr::addr_of_mut!((*p).last_has_hist).write(false);
             std::ptr::addr_of_mut!((*p).delta_threshold).write(i32::MIN);
+            std::ptr::addr_of_mut!((*p).skip_quiets).write(false);
             slot.assume_init_mut()
         }
     }
@@ -146,6 +149,7 @@ impl MovePicker {
             std::ptr::addr_of_mut!((*p).last_hist).write(0);
             std::ptr::addr_of_mut!((*p).last_has_hist).write(false);
             std::ptr::addr_of_mut!((*p).delta_threshold).write(i32::MIN);
+            std::ptr::addr_of_mut!((*p).skip_quiets).write(false);
             slot.assume_init_mut()
         }
     }
@@ -191,6 +195,7 @@ impl MovePicker {
             last_hist: 0,
             last_has_hist: false,
             delta_threshold: i32::MIN,
+            skip_quiets: false,
         }
     }
 
@@ -271,6 +276,11 @@ impl MovePicker {
     pub fn set_delta_threshold(&mut self, threshold: i32) {
         self.delta_threshold = threshold;
     }
+
+    #[inline(always)]
+    pub fn skip_quiets(&mut self) {
+        self.skip_quiets = true;
+    }
     pub fn next(
         &mut self,
         board: &Board,
@@ -289,12 +299,26 @@ impl MovePicker {
                 Stage::TTMove => {
                     self.stage = Stage::GenerateNoisy;
                     let m = self.tt_move;
-                    let is_noisy = board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::Promotion || m.move_type() == MoveType::EnPassant;
+                    if m != Move::NULL {
+                        let is_qsearch_ok = if self.qsearch {
+                            if m.move_type() == MoveType::Promotion {
+                                m.promo_type() == PieceType::Queen
+                            } else {
+                                board.piece_on[m.to()] != Piece::None || m.move_type() == MoveType::EnPassant
+                            }
+                        } else {
+                            true
+                        };
 
-                    if (!self.qsearch || is_noisy) && self.is_pseudo_legal_any(board, m) && self.is_legal_tt(board, m) {
-                        // assume good see for tt move
-                        self.last_see_ge_zero = true;
-                        return Some(m);
+                        if is_qsearch_ok
+                            && self.is_pseudo_legal_any(board, m)
+                            && self.is_legal_tt(board, m)
+                            && (!self.qsearch || see(board, m, 0))
+                        {
+                            // assume good see for tt move
+                            self.last_see_ge_zero = true;
+                            return Some(m);
+                        }
                     }
                 }
                 Stage::GenerateNoisy => {
@@ -385,6 +409,25 @@ impl MovePicker {
                     self.stage = Stage::Quiets;
                 }
                 Stage::Quiets => {
+                    if self.skip_quiets {
+                        while self.cur_idx < self.moves.count {
+                            let m = self.moves.get(self.cur_idx);
+                            let hist = unsafe { self.hists[self.cur_idx].assume_init() };
+                            self.cur_idx += 1;
+                            if m == self.tt_move || m == self.killers[0] || m == self.killers[1] || m == self.counter_move {
+                                continue;
+                            }
+                            if self.gives_check(board, m) && self.is_legal(board, m) {
+                                self.last_see_ge_zero = true;
+                                self.last_hist = hist;
+                                self.last_has_hist = true;
+                                return Some(m);
+                            }
+                        }
+                        self.cur_idx = 0;
+                        self.stage = Stage::BadNoisy;
+                        continue;
+                    }
                     while self.cur_idx < self.moves.count {
                         let (m, hist) = self.pick_best();
                         if m == self.tt_move || m == self.killers[0] || m == self.killers[1] || m == self.counter_move {
@@ -510,7 +553,7 @@ impl MovePicker {
             if attacker_idx < 12 && victim_idx < 6 {
                 let mvv_lva = PIECE_VALUES[victim_idx] * 12 - PIECE_VALUES[attacker.piece_type() as usize];
                 let hist = noisy_history[attacker_idx][m.to() as usize][hist_victim][to_threatened] as i32;
-                let mut score = mvv_lva + hist / 32;
+                let mut score = mvv_lva + hist / 4;
 
                 if m.move_type() == MoveType::Promotion && m.promo_type() == PieceType::Queen {
                     score += 3000;

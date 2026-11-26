@@ -1414,6 +1414,7 @@ fn l3_forward_raw(weights: &[[i32; L3_SIZE]; L2_SIZE], bias: &[i32; L3_SIZE], in
     result
 }
 
+#[cfg(test)]
 fn l3_forward_scalar(weights: &[[i32; L3_SIZE]; L2_SIZE], bias: &[i32; L3_SIZE], input: &[i32; L2_SIZE]) -> i32 {
     let result = l3_forward_raw(weights, bias, input);
     (result * i64::from(EVAL_SCALE) / QUANT_FOURTH) as i32

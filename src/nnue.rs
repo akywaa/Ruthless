@@ -1201,6 +1201,24 @@ pub fn evaluate(board: &mut Board) -> i32 {
 }
 
 #[inline(always)]
+pub fn evaluate_scaled(board: &mut Board, mul: i32, div: i32) -> i32 {
+    board.ensure_threats_ready();
+    board.ensure_accumulator_ready();
+    let net = network();
+    let bucket = output_bucket(board);
+    let us = board.side_to_move as usize;
+    let them = us ^ 1;
+    if let Some(ml) = net.multilayer.as_deref() {
+        let threat_us = board.threat_side_immut(us);
+        let threat_them = board.threat_side_immut(them);
+        let raw = forward_multilayer_raw(board.accumulator_immut(), threat_us, threat_them, us, them, bucket, &ml.head);
+        return ((i128::from(raw) * i128::from(EVAL_SCALE) * i128::from(mul))
+            / (i128::from(QUANT_FOURTH) * i128::from(div))) as i32;
+    }
+    evaluate_acc(board.accumulator_immut(), us, them, bucket, net) * mul / div
+}
+
+#[inline(always)]
 fn evaluate_acc(acc: &Accumulator, us: usize, them: usize, bucket: usize, net: &'static Network) -> i32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
     {
@@ -1386,12 +1404,18 @@ fn l2_forward_scalar(weights: &[[i16; L2_IN]; L2_SIZE], bias: &[i32; L2_SIZE], i
     }
 }
 
-fn l3_forward_scalar(weights: &[[i32; L3_SIZE]; L2_SIZE], bias: &[i32; L3_SIZE], input: &[i32; L2_SIZE]) -> i32 {
+#[inline(always)]
+fn l3_forward_raw(weights: &[[i32; L3_SIZE]; L2_SIZE], bias: &[i32; L3_SIZE], input: &[i32; L2_SIZE]) -> i64 {
     let mut result = i64::from(bias[0]);
     for i in 0..L2_SIZE {
         let activated = input[i].max(0).min(QUANT_CUBED);
         result += i64::from(activated) * i64::from(weights[i][0]);
     }
+    result
+}
+
+fn l3_forward_scalar(weights: &[[i32; L3_SIZE]; L2_SIZE], bias: &[i32; L3_SIZE], input: &[i32; L2_SIZE]) -> i32 {
+    let result = l3_forward_raw(weights, bias, input);
     (result * i64::from(EVAL_SCALE) / QUANT_FOURTH) as i32
 }
 
@@ -1495,7 +1519,7 @@ fn l2_forward(weights: &[[i16; L2_IN]; L2_SIZE], bias: &[i32; L2_SIZE], input: &
 }
 
 // multilayer forward pass
-fn forward_multilayer(
+fn forward_multilayer_raw(
     psq: &Accumulator,
     threat_us: &[i16; HIDDEN_SIZE],
     threat_them: &[i16; HIDDEN_SIZE],
@@ -1503,7 +1527,7 @@ fn forward_multilayer(
     them: usize,
     bucket: usize,
     head: &MultilayerHead,
-) -> i32 {
+) -> i64 {
     let mut input = [0u8; HIDDEN_SIZE];
     let nnz_us = pairwise_side(&psq.vals[us], threat_us, (&mut input[..PAIR_COUNT]).try_into().unwrap());
     let nnz_them = pairwise_side(&psq.vals[them], threat_them, (&mut input[PAIR_COUNT..]).try_into().unwrap());
@@ -1514,7 +1538,20 @@ fn forward_multilayer(
     let mut l2 = [0i32; L2_SIZE];
     l2_forward(&head.l2_weights[bucket], &head.l2_bias[bucket], &l1, &mut l2);
 
-    l3_forward_scalar(&head.l3_weights[bucket], &head.l3_bias[bucket], &l2)
+    l3_forward_raw(&head.l3_weights[bucket], &head.l3_bias[bucket], &l2)
+}
+
+fn forward_multilayer(
+    psq: &Accumulator,
+    threat_us: &[i16; HIDDEN_SIZE],
+    threat_them: &[i16; HIDDEN_SIZE],
+    us: usize,
+    them: usize,
+    bucket: usize,
+    head: &MultilayerHead,
+) -> i32 {
+    let raw = forward_multilayer_raw(psq, threat_us, threat_them, us, them, bucket, head);
+    (raw * i64::from(EVAL_SCALE) / QUANT_FOURTH) as i32
 }
 
 // 60144 threat features (piece attacks/defenses, mirror invariant)

@@ -59,7 +59,7 @@ pub fn uci_loop() {
                 println!("option name NmpBase type spin default 3 min 1 max 6");
                 println!("option name NmpEvalDiv type spin default 200 min 50 max 500");
                 println!("option name CorrWeight type spin default 153 min 20 max 400");
-                println!("option name CorrLimit type spin default 13 min 2 max 60");
+                println!("option name CorrLimit type spin default 80 min 2 max 256");
                 println!("option name LmrBase type spin default {} min -100 max 200", crate::search::DEFAULT_LMR_BASE);
                 println!(
                     "option name LmrDivisor type spin default {} min 100 max 400",

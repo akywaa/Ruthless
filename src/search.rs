@@ -35,7 +35,7 @@ pub static FUTILITY_MARGIN: AtomicI32 = AtomicI32::new(75);
 pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
 pub static NMP_EVAL_DIV: AtomicI32 = AtomicI32::new(200);
 pub static CORR_WEIGHT: AtomicI32 = AtomicI32::new(153);
-pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(13);
+pub static CORR_LIMIT: AtomicI32 = AtomicI32::new(80);
 pub const DEFAULT_LMR_BASE: i32 = 30;
 pub const DEFAULT_LMR_DIVISOR: i32 = 225;
 pub static LMR_BASE: AtomicI32 = AtomicI32::new(DEFAULT_LMR_BASE);
@@ -301,7 +301,7 @@ impl Searcher {
         }
         let total_bonus = pawn_term + np_term + cont_term;
         let limit = self.corr_limit;
-        let mut eval = raw + (total_bonus / 256).max(-limit).min(limit);
+        let mut eval = raw + (total_bonus / 512).max(-limit).min(limit);
 
         // scale evaluation towards draw near 50-move rule
         eval = eval * (200 - board.halfmove_clock as i32) / 200;
@@ -873,7 +873,7 @@ impl Searcher {
                 if prior_reduction >= 3 && !opponent_worsening {
                     depth = depth.saturating_add(1);
                 }
-                if prior_reduction >= 2 && depth >= 2 && static_eval + parent_eval > 166 {
+                if prior_reduction >= 2 && depth >= 2 && static_eval + parent_eval > 35 {
                     depth -= 1;
                 }
             }

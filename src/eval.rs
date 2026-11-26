@@ -13,15 +13,14 @@ pub fn evaluate_debug(board: &mut Board) -> (i32, i32) {
     let raw = nnue::evaluate(board);
     let material = board.non_pawn_material();
     let scale = (700 + material / 20).min(1024);
-    let scaled = raw * scale * NORM_NUM / (1024 * NORM_DEN);
+    let scaled = nnue::evaluate_scaled(board, scale * NORM_NUM, 1024 * NORM_DEN);
     (raw, scaled)
 }
 
 #[inline(always)]
 pub fn evaluate(board: &mut Board) -> i32 {
-    let eval = nnue::evaluate(board);
     let material = board.non_pawn_material();
     let scale = (700 + material / 20).min(1024);
 
-    eval * scale * NORM_NUM / (1024 * NORM_DEN)
+    nnue::evaluate_scaled(board, scale * NORM_NUM, 1024 * NORM_DEN)
 }

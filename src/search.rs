@@ -1244,7 +1244,14 @@ impl Searcher {
             };
 
             // use lmr depth for pruning
-            let lmr_depth = if depth >= 2 && moves_searched >= (if tt_pv { 2 } else { 1 }) {
+            // need to tests: aggressive LMR depth/pruning gate
+            // let lmr_depth = if depth >= 2 && moves_searched >= (if tt_pv { 2 } else { 1 }) {
+            //     let r = lmr(depth as usize, moves_searched);
+            //     (depth as i32 - 1 - r).max(0)
+            // } else {
+            //     depth as i32 - 1
+            // };
+            let lmr_depth = if depth >= 3 && moves_searched >= (if tt_pv { 2 } else { 3 }) {
                 let r = lmr(depth as usize, moves_searched);
                 (depth as i32 - 1 - r).max(0)
             } else {
@@ -1327,8 +1334,11 @@ impl Searcher {
             }
 
             let nodes_before = if ply == 0 { self.nodes } else { 0 };
-            let lmr_depth_threshold = if tt_pv { 2 } else { 1 };
-            let lmr_applies = depth >= 2 && moves_searched >= lmr_depth_threshold && (!tt_pv || is_quiet);
+            // need to tests: aggressive LMR applies gate
+            // let lmr_depth_threshold = if tt_pv { 2 } else { 1 };
+            // let lmr_applies = depth >= 2 && moves_searched >= lmr_depth_threshold && (!tt_pv || is_quiet);
+            let lmr_depth_threshold = if tt_pv { 2 } else { 3 };
+            let lmr_applies = depth >= 3 && moves_searched >= lmr_depth_threshold && (!tt_pv || is_quiet);
             // the picker already ran SEE on every noisy move it returned
             let is_see_ge_zero = lmr_applies && !is_quiet && picker.last_see_ge_zero;
 
@@ -1404,8 +1414,10 @@ impl Searcher {
                         r += 1;
                     }
 
-                    // allow r=0 so good moves aren't reduced; allow depth=2 -> 0 (qsearch)
-                    r = r.max(0).min(depth as i32 - 1);
+                    // allow r=0 so good moves aren't reduced
+                    r = r.max(0).min(depth as i32 - 2);
+                    // need to tests: allow depth=2 -> 0 (qsearch)
+                    // r = r.max(0).min(depth as i32 - 1);
                     // don't reduce checks (partial reduction blew up nodes)
                     if gives_check {
                         r = 0;
@@ -1428,20 +1440,28 @@ impl Searcher {
                     self.reduction_stack[ply as usize] = 0;
                 }
 
-                let mut research_depth = depth - 1;
                 if s > alpha && reduced < depth - 1 {
-                    let has_best = best_score > -MATE_SCORE + 100;
-                    if has_best && s > best_score + 30 {
-                        research_depth = research_depth.saturating_add(1);
-                    } else if has_best && s < best_score + 5 && research_depth > reduced + 1 {
-                        research_depth -= 1;
-                    }
-                    s = -self.negamax(board, research_depth, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node, gives_check);
+                    s = -self.negamax(board, depth - 1, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node, gives_check);
                 }
 
                 if s > alpha && s < beta {
-                    s = -self.negamax(board, research_depth, ply + 1, -beta, -alpha, true, Move::NULL, false, gives_check);
+                    s = -self.negamax(board, depth - 1, ply + 1, -beta, -alpha, true, Move::NULL, false, gives_check);
                 }
+                // need to tests: research_depth tuning
+                // let mut research_depth = depth - 1;
+                // if s > alpha && reduced < depth - 1 {
+                //     let has_best = best_score > -MATE_SCORE + 100;
+                //     if has_best && s > best_score + 30 {
+                //         research_depth = research_depth.saturating_add(1);
+                //     } else if has_best && s < best_score + 5 && research_depth > reduced + 1 {
+                //         research_depth -= 1;
+                //     }
+                //     s = -self.negamax(board, research_depth, ply + 1, -alpha - 1, -alpha, false, Move::NULL, !cut_node, gives_check);
+                // }
+                //
+                // if s > alpha && s < beta {
+                //     s = -self.negamax(board, research_depth, ply + 1, -beta, -alpha, true, Move::NULL, false, gives_check);
+                // }
 
                 s
             };
@@ -1879,10 +1899,6 @@ impl Searcher {
             };
 
             let direct_check = picker.gives_check(board, m);
-
-            if moves_searched >= 3 && !direct_check {
-                continue;
-            }
 
             let is_promo = m.move_type() == MoveType::Promotion;
             if !is_promo {
